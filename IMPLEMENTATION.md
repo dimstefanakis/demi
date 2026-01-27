@@ -131,7 +131,7 @@ Stores:
 2. Orchestrator loads memory + context
 3. Claude runs Gemini CLI headlessly with `DESIGN.md`
 4. Claude validates with `bun run build`
-5. Claude redeploys via Vercel CLI and writes `tasks/deploy_url.txt`
+5. Claude redeploys via Vercel CLI, records the URL via `record_deploy`, and sends the link
 6. User receives confirmation + link
 
 ---
@@ -148,9 +148,9 @@ Minimum approach:
 - Ignore duplicates once processed
 
 ## Chatty UX (MVP)
-- Claude writes a context-aware “on it” message as the first line in `tasks/outbox.jsonl`.
-- Claude can queue interim updates by appending JSON lines to `tasks/outbox.jsonl`.
-- Orchestrator streams queued updates during the run, then sends the final response from `tasks/response.json`.
+- Claude sends a context-aware “on it” message via `mcp__claudius-chat__send_message`.
+- Claude can send interim updates using the same tool (after `should_send_message`).
+- Claude sends the final completion + live URL itself (after calling `record_deploy`).
 - Orchestrator maintains `tasks/chat_history.md` (last N messages) and `tasks/chat_summary.md` (compact memory).
 - When logs exceed ~30 entries, it writes `tasks/summary_prompt.md` for the agent to refresh summary and prune logs.
 

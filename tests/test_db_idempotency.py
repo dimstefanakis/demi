@@ -20,11 +20,12 @@ def test_record_message_idempotency(tmp_path):
         raw={},
     )
 
-    inserted_first = db.record_message(tenant.id, msg)
-    inserted_second = db.record_message(tenant.id, msg)
+    first_id, inserted_first = db.record_message(tenant.id, msg)
+    second_id, inserted_second = db.record_message(tenant.id, msg)
 
     assert inserted_first is True
     assert inserted_second is False
+    assert first_id == second_id
 
 
 def test_same_message_id_across_tenants(tmp_path):
@@ -54,5 +55,7 @@ def test_same_message_id_across_tenants(tmp_path):
         raw={},
     )
 
-    assert db.record_message(tenant_a.id, msg_a) is True
-    assert db.record_message(tenant_b.id, msg_b) is True
+    _, inserted_a = db.record_message(tenant_a.id, msg_a)
+    _, inserted_b = db.record_message(tenant_b.id, msg_b)
+    assert inserted_a is True
+    assert inserted_b is True

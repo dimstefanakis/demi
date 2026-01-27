@@ -12,8 +12,9 @@ Use this skill to provide friendly, context-aware updates during work.
 2. When a task has multiple phases (setup, design, build, deploy), send short updates between phases with the same tool.
 3. Keep messages short, casual, and helpful. Avoid over-promising timelines.
 4. Do not include final URLs in interim messages; those are sent separately.
-5. If starting a full site build, you may include a rough time estimate (about 10 minutes).
-6. Read `tasks/chat_history.md` and `tasks/chat_summary.md` before responding to avoid duplicates.
+5. If you say you are doing something, ensure the main agent sends a clear completion message in `response.json`.
+6. If starting a full site build, you may include a rough time estimate (about 10 minutes).
+7. Read `tasks/chat_history.md` and `tasks/chat_summary.md` before responding to avoid duplicates.
 
 ## Tool Usage
 Call the tool with a short message:

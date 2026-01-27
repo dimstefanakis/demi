@@ -124,6 +124,10 @@ vercel domains rm [domain]
 vercel domains buy [domain]
 ```
 
+Notes:
+- `vercel domains rm` supports `--yes` for skipping confirmation; `buy` is interactive.
+- For automation, pipe confirmation: `printf "n\n" | vercel domains buy example.com` (quote) or `printf "y\n" | vercel domains buy example.com` (purchase).
+
 ### env
 ```
 vercel env ls

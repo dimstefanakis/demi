@@ -9,10 +9,20 @@ from claudius.workspace.core import WorkspaceManager
 
 
 class FakeAgentNoDeploy:
-    async def prepare_context(self, workspace, task_path, message, messenger=None, session_id=None):
-        (workspace.tasks_dir / "response.json").write_text(
-            "{\"kind\": \"info\", \"text\": \"It was built with Next.js.\"}"
-        )
+    async def prepare_context(
+        self,
+        workspace,
+        task_path,
+        message,
+        messenger=None,
+        inflight_stream=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+    ):
+        if messenger is not None:
+            await messenger.send_text(message.tenant_external_id, "It was built with Next.js.")
         return type("AgentResult", (), {"session_id": session_id, "summary": "ok"})()
 
 

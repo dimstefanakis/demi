@@ -13,11 +13,23 @@ class FakeAgent:
         self.calls = []
         self.deploy_url = deploy_url
 
-    async def prepare_context(self, workspace, task_path, message, messenger=None, session_id=None):
+    async def prepare_context(
+        self,
+        workspace,
+        task_path,
+        message,
+        messenger=None,
+        inflight_stream=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+    ):
         self.calls.append((workspace.root, task_path, session_id))
-        (workspace.tasks_dir / "response.json").write_text(
-            "{\"kind\": \"deploy\", \"deploy_url\": \"%s\"}" % self.deploy_url
-        )
+        if db is not None and tenant_id is not None:
+            db.update_tenant_deploy_url(tenant_id, self.deploy_url)
+        if messenger is not None:
+            await messenger.send_text(message.tenant_external_id, f"Your site is live: {self.deploy_url}")
         (workspace.tasks_dir / "result_summary.md").write_text("ok")
         return type("AgentResult", (), {"session_id": session_id, "summary": "ok"})()
 
@@ -58,5 +70,4 @@ async def test_orchestrator_new_site_flow(tmp_path):
     assert result.status == "accepted"
     tenant = db.get_or_create_tenant("telegram", "987654")
     assert tenant.last_deploy_url == "https://example.com/site"
-    assert (workspace_manager.root_dir / tenant.key / "tasks" / "response.json").exists()
     assert "https://example.com/site" in orchestrator.messenger.sent[0][1]

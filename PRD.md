@@ -227,9 +227,9 @@ Minimum approach:
 - Store last processed message timestamp or ID
 
 ## Chatty UX (MVP)
-- Agent writes a context-aware “on it” message to `tasks/outbox.jsonl` at the start of each run.
-- Agent may enqueue additional user-facing updates via `tasks/outbox.jsonl`.
-- Orchestrator streams outbox updates during the run, then sends the final response via `tasks/response.json`.
+- Agent sends a context-aware “on it” message via the `mcp__claudius-chat__send_message` tool.
+- Agent may send interim updates using the same tool (after checking `should_send_message`).
+- After deploy, agent records the URL via `record_deploy` and sends the live link itself.
 - Chatty subagent reads `tasks/chat_history.md` and `tasks/chat_summary.md` to avoid duplicate replies.
 - After ~30 messages, a compaction prompt is generated to refresh `tasks/chat_summary.md`.
 

@@ -14,6 +14,7 @@ def test_prompt_includes_bun_commands(tmp_path):
     assert "bunx --bun shadcn@latest init" in prompt
     assert "tasks/app_name.txt" in prompt
     assert "gemini -p" in prompt
-    assert "response.json" in prompt
+    assert "record_deploy" in prompt
+    assert "record_domain_quote" in prompt
     assert "mcp__claudius-chat__send_message" in prompt
     assert "mcp__claudius-unsplash__search_photos" in prompt

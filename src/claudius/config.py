@@ -25,6 +25,11 @@ class Settings(BaseSettings):
     unsplash_access_key: str | None = None
     unsplash_secret_key: str | None = None
 
+    stripe_secret_key: str | None = None
+    stripe_webhook_secret: str | None = None
+    stripe_success_url: str | None = None
+    stripe_cancel_url: str | None = None
+
     def resolved_data_dir(self) -> Path:
         return (self.root_dir / self.data_dir).resolve()
 

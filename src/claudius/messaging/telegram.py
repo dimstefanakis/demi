@@ -41,6 +41,36 @@ class TelegramUpdateParser:
                 )
             )
 
+        animation = message.get("animation")
+        if animation:
+            images.append(
+                Attachment(
+                    provider_file_id=animation.get("file_id"),
+                    width=animation.get("width"),
+                    height=animation.get("height"),
+                )
+            )
+
+        document = message.get("document")
+        if document:
+            images.append(
+                Attachment(
+                    provider_file_id=document.get("file_id"),
+                    width=document.get("width"),
+                    height=document.get("height"),
+                )
+            )
+
+        video = message.get("video")
+        if video:
+            images.append(
+                Attachment(
+                    provider_file_id=video.get("file_id"),
+                    width=video.get("width"),
+                    height=video.get("height"),
+                )
+            )
+
         return NormalizedMessage(
             provider="telegram",
             provider_message_id=str(message_id),

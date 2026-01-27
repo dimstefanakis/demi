@@ -10,6 +10,8 @@ def test_default_allowed_tools():
     assert "Task" in agent.allowed_tools
     assert "Skill" in agent.allowed_tools
     assert "mcp__claudius-chat__send_message" in agent.allowed_tools
+    assert "mcp__claudius-chat__record_deploy" in agent.allowed_tools
+    assert "mcp__claudius-chat__record_domain_quote" in agent.allowed_tools
     assert "mcp__claudius-unsplash__search_photos" in agent.allowed_tools
 
 

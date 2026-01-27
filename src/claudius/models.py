@@ -45,3 +45,20 @@ class Tenant:
 class OrchestratorResult:
     status: str
     detail: str | None = None
+
+
+@dataclass
+class DomainOrder:
+    id: int
+    tenant_id: int
+    domain: str
+    status: str
+    price_usd: float | None
+    currency: str | None
+    quote_json: str | None
+    stripe_session_id: str | None
+    stripe_payment_url: str | None
+    vercel_response_json: str | None
+    error: str | None
+    created_at: str
+    updated_at: str
