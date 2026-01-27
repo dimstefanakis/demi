@@ -1,0 +1,8 @@
+{
+  "name": "claudius-tools",
+  "private": true,
+  "devDependencies": {
+    "@google/gemini-cli": "latest",
+    "vercel": "latest"
+  }
+}
