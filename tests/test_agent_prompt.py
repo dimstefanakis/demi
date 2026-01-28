@@ -16,5 +16,5 @@ def test_prompt_includes_bun_commands(tmp_path):
     assert "gemini -p" in prompt
     assert "record_deploy" in prompt
     assert "record_domain_quote" in prompt
-    assert "mcp__claudius-chat__send_message" in prompt
+    assert "interaction-agent" in prompt
     assert "mcp__claudius-unsplash__search_photos" in prompt

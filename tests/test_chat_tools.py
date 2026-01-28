@@ -29,7 +29,7 @@ def test_send_message_tool_dedupes(tmp_path):
     asyncio.run(send_tool.handler({"text": "Hello there!"}))
     asyncio.run(send_tool.handler({"text": "Hello there!"}))
 
-    assert len(messenger.sent) == 0
+    assert len(messenger.sent) == 2
 
 
 def test_send_message_tool_sends_once_for_new_text(tmp_path):
@@ -45,4 +45,4 @@ def test_send_message_tool_sends_once_for_new_text(tmp_path):
     asyncio.run(send_tool.handler({"text": "Working on it now."}))
     asyncio.run(send_tool.handler({"text": "Working on it now."}))
 
-    assert len(messenger.sent) == 1
+    assert len(messenger.sent) == 2

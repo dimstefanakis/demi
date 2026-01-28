@@ -154,7 +154,7 @@ We can replace the “CC service” with Claude Agent SDK.
 - MCP tools (optional) for deploy or image fetch
 - Hooks for logging, policy enforcement, and approvals
 - Skills loaded from `.claude/skills` (e.g., `vercel-cli`, `bun-next-shadcn`)
-- Subagents used for parallelizable tasks (e.g., chatty UX updates).
+- Subagents used for parallelizable tasks (e.g., interaction UX updates).
 
 ---
 

@@ -10,6 +10,7 @@ import json
 
 from claudius.db.core import Database
 from claudius.memory.logs import append_log, read_logs, write_chat_history
+from claudius.agent.tool_logging import log_tool_run
 
 
 CHAT_SERVER_NAME = "claudius-chat"
@@ -27,21 +28,39 @@ class ChatToolContext:
 
 
 def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
+    import time
+
+    def _log(tool_name: str, args: dict[str, Any], result: Any | None = None, error: str | None = None, start: float | None = None) -> None:
+        duration_ms = None
+        if start is not None:
+            duration_ms = (time.monotonic() - start) * 1000.0
+        log_tool_run(
+            context.tasks_dir,
+            tool_name,
+            args=args,
+            result=result,
+            error=error,
+            duration_ms=duration_ms,
+        )
+
     @tool(
         "should_send_message",
         "Check recent chat history to see if a message would be redundant.",
         {"text": str},
     )
     async def should_send_message(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
         text = str(args.get("text", "")).strip()
         if not text:
             payload = {"send": False, "reason": "empty"}
+            _log("should_send_message", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
             }
         decision = _should_send(text, context.tasks_dir)
         payload = {"send": decision, "reason": "ok" if decision else "duplicate"}
+        _log("should_send_message", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
             "is_error": False,
@@ -53,22 +72,19 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         {"text": str},
     )
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
         text = str(args.get("text", "")).strip()
         if not text:
+            _log("send_message", args, result={"skipped": "empty"}, start=start)
             return {
                 "content": [{"type": "text", "text": "Skipped empty message."}],
-                "is_error": False,
-            }
-
-        if _is_duplicate_message(text, context.tasks_dir):
-            return {
-                "content": [{"type": "text", "text": "Skipped duplicate message."}],
                 "is_error": False,
             }
 
         try:
             await context.messenger.send_text(context.tenant_external_id, text)
         except Exception as exc:  # noqa: BLE001
+            _log("send_message", args, error=str(exc), start=start)
             return {
                 "content": [{"type": "text", "text": f"Send failed: {exc}"}],
                 "is_error": True,
@@ -76,6 +92,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
         append_log(context.tasks_dir, "assistant_message", text)
         write_chat_history(context.tasks_dir)
+        _log("send_message", args, result={"sent": True}, start=start)
         return {
             "content": [{"type": "text", "text": "Sent."}],
             "is_error": False,
@@ -87,9 +104,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         {"deploy_url": str},
     )
     async def record_deploy(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
         deploy_url = str(args.get("deploy_url", "")).strip()
         if not deploy_url:
             payload = {"ok": False, "error": "missing_deploy_url"}
+            _log("record_deploy", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
@@ -101,6 +120,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "deploy_url": deploy_url,
             "message": f"Your site is live: {deploy_url}",
         }
+        _log("record_deploy", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
             "is_error": False,
@@ -123,6 +143,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         },
     )
     async def record_domain_quote(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
         domain = str(args.get("domain", "")).strip().lower()
         available = bool(args.get("available", False))
         currency = str(args.get("currency") or "USD").upper()
@@ -131,6 +152,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
         if not domain:
             payload = {"ok": False, "error": "missing_domain"}
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
@@ -145,6 +167,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
         if context.db is None or context.tenant_id is None:
             payload = {"ok": False, "error": "missing_db_context"}
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
@@ -177,6 +200,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "available": False,
                 "message": message,
             }
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
@@ -191,6 +215,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "available": True,
                 "message": message,
             }
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
@@ -209,6 +234,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "Payments are not configured yet."
                 ),
             }
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
@@ -218,6 +244,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             amount_cents = int(round(price_usd * 100))
         except (TypeError, ValueError):
             payload = {"ok": False, "error": "invalid_price"}
+            _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
@@ -239,6 +266,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "order_id": order_id,
                 "message": "I couldn't create the payment link right now. Try again later.",
             }
+            _log("record_domain_quote", args, result=payload, error=str(exc), start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
@@ -262,6 +290,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 f"Pay here to proceed: {session.url}"
             ),
         }
+        _log("record_domain_quote", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
             "is_error": False,
@@ -279,49 +308,8 @@ def build_chat_server(context: ChatToolContext) -> McpSdkServerConfig:
 
 
 def _is_duplicate_message(text: str, tasks_dir: Path, max_entries: int = 12) -> bool:
-    normalized = _normalize_tokens(text)
-    if not normalized:
-        return True
-
-    context_blob = _load_context_blob(tasks_dir)
-    if context_blob and text.lower() in context_blob:
-        return True
-
-    entries = read_logs(tasks_dir)
-    for entry in reversed(entries[-max_entries:]):
-        if entry.tag != "assistant_message":
-            continue
-        if _similar_tokens(normalized, _normalize_tokens(entry.payload)):
-            return True
     return False
 
 
 def _should_send(text: str, tasks_dir: Path) -> bool:
-    return not _is_duplicate_message(text, tasks_dir)
-
-
-def _load_context_blob(tasks_dir: Path) -> str:
-    parts: list[str] = []
-    history_path = tasks_dir / "chat_history.md"
-    summary_path = tasks_dir / "chat_summary.md"
-    if history_path.exists():
-        parts.append(history_path.read_text(encoding="utf-8").lower())
-    if summary_path.exists():
-        parts.append(summary_path.read_text(encoding="utf-8").lower())
-    return "\n".join(parts).strip()
-
-
-def _normalize_tokens(text: str) -> set[str]:
-    cleaned = []
-    for ch in text.lower():
-        cleaned.append(ch if ch.isalnum() else " ")
-    tokens = [token for token in "".join(cleaned).split() if token]
-    return set(tokens)
-
-
-def _similar_tokens(a: set[str], b: set[str]) -> bool:
-    if not a or not b:
-        return False
-    overlap = len(a & b)
-    union = len(a | b)
-    return (overlap / union) >= 0.6
+    return True

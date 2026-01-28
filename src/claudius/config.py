@@ -16,6 +16,8 @@ class Settings(BaseSettings):
 
     gemini_cmd: str = "gemini"
     design_prompt_path: Path = Path("DESIGN.md")
+    claude_prompt_path: Path = Path("prompts/claude_agent.md")
+    interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
 
     vercel_cmd: str = "vercel"
     vercel_token: str | None = None

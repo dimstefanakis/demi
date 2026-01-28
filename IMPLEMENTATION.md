@@ -81,7 +81,7 @@ Runtime choices:
 - Restrict tools via allowlist + permission mode
 - Load plugins via `CLAUDE_PLUGINS` (comma-separated paths)
 - Use skills from `.claude/skills` (vercel-cli, bun-next-shadcn)
-- Use subagents (Task tool) for chatty UX updates.
+- Use subagents (Task tool) for interaction UX updates.
 
 ---
 

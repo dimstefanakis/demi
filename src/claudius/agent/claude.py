@@ -20,6 +20,7 @@ from claudius.agent.unsplash_tools import (
     UnsplashToolContext,
     build_unsplash_server,
 )
+from claudius.agent.tool_logging import log_agent_event
 from claudius.config import Settings
 from claudius.agent.inflight import InflightTextStream
 from claudius.models import NormalizedMessage
@@ -47,9 +48,9 @@ class ClaudeAgent:
         "AskUserQuestion",
         "Task",
         "Skill",
-        SEND_MESSAGE_TOOL,
         UNSPLASH_SEARCH_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+        SEND_MESSAGE_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__record_deploy",
         f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
     ]
@@ -94,7 +95,10 @@ class ClaudeAgent:
         )
         settings = Settings()
         unsplash_server = build_unsplash_server(
-            UnsplashToolContext(access_key=settings.unsplash_access_key)
+            UnsplashToolContext(
+                access_key=settings.unsplash_access_key,
+                tasks_dir=workspace.tasks_dir,
+            )
         )
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
@@ -114,11 +118,28 @@ class ClaudeAgent:
         await client.connect()
 
         prompt = self._build_prompt(task_path=task_path, memory_path=workspace.memory_path)
+        log_agent_event(
+            workspace.tasks_dir,
+            "run_start",
+            {
+                "task_path": str(task_path),
+                "session_id": session_id,
+                "message": (message.text or "").strip(),
+            },
+        )
         stop_event = None
         if inflight_stream is not None:
             import asyncio
 
             stop_event = asyncio.Event()
+        log_agent_event(
+            workspace.tasks_dir,
+            "query_start",
+            {
+                "session_id": session_id or "default",
+                "task_path": str(task_path),
+            },
+        )
         await client.query(
             self._prompt_stream(
                 prompt, inflight_stream=inflight_stream, stop_event=stop_event
@@ -133,6 +154,15 @@ class ClaudeAgent:
 
         try:
             async for msg in client.receive_messages():
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "sdk_message",
+                    {
+                        "class": msg.__class__.__name__,
+                        "subtype": getattr(msg, "subtype", None),
+                        "repr": repr(msg)[:1000],
+                    },
+                )
                 if isinstance(msg, SystemMessage) and msg.subtype == "init":
                     new_session_id = msg.data.get("session_id", new_session_id)
                 if isinstance(msg, ResultMessage):
@@ -144,6 +174,16 @@ class ClaudeAgent:
                         stop_event.set()
                     break
         finally:
+            log_agent_event(
+                workspace.tasks_dir,
+                "run_end",
+                {
+                    "session_id": new_session_id,
+                    "summary": (summary or "")[:500],
+                    "total_cost_usd": total_cost_usd,
+                    "usage": usage,
+                },
+            )
             await client.disconnect()
 
         return AgentResult(
@@ -155,78 +195,13 @@ class ClaudeAgent:
 
     @staticmethod
     def _build_prompt(task_path: Path, memory_path: Path) -> str:
+        settings = Settings()
+        template = ClaudeAgent._load_prompt_file(settings.claude_prompt_path)
         return (
-            "You are the project agent coordinating a Next.js site build or edit.\n"
-            "Read the task brief and memory file. Update memory.md with stable facts or decisions.\n"
-            "Create a concise design context file at tasks/design_context.md summarizing: business type,\n"
-            "brand tone, key CTAs, required sections, and any constraints.\n"
-            "If no Next.js app exists yet, create it inside the workspace site/ directory using:\n"
-            "1) cd site\n"
-            "2) bun create next-app@latest <app-name> --yes (choose a short, relevant name)\n"
-            "3) cd <app-name>\n"
-            "4) bunx --bun shadcn@latest init\n"
-            "Use bun/bunx only (no npm/yarn/pnpm). Write the chosen app name to tasks/app_name.txt.\n"
-            "Run Gemini CLI headlessly to implement design. The prompt MUST be the exact contents of\n"
-            "DESIGN.md (treat it as the design system for this run), and pass context via stdin (task\n"
-            "brief, memory.md, design_context.md, and current page file if present). If DESIGN.md is\n"
-            "missing or empty, stop and ask for it before running Gemini.\n"
-            "Use the -p/--prompt flag for DESIGN.md, and explicitly set the model to Gemini 3 Pro Preview.\n"
-            "If the command fails due to limits, capacity, or model availability, retry once with Gemini\n"
-            "3 Flash Preview. Example:\n"
-            "(cat tasks/latest.md memory.md tasks/design_context.md; test -f app/page.tsx && cat app/page.tsx) | \\\n"
-            "  gemini -p \"$(cat DESIGN.md)\" --model gemini-3-pro-preview --output-format text --approval-mode yolo \\\n"
-            "  || (cat tasks/latest.md memory.md tasks/design_context.md; test -f app/page.tsx && cat app/page.tsx) | \\\n"
-            "  gemini -p \"$(cat DESIGN.md)\" --model gemini-3-flash-preview --output-format text --approval-mode yolo\n"
-            "After Gemini completes, replace any placeholder images with relevant Unsplash images.\n"
-            "Find placeholder src values (e.g., placehold.co, via.placeholder.com, dummyimage, picsum,\n"
-            "loremflickr, or obvious placeholder filenames). For each, infer a short query from nearby\n"
-            "section text (hero, services, gallery, team) and call the Unsplash tool:\n"
-            "  mcp__claudius-unsplash__search_photos {\"query\": \"barber shop\", \"count\": 1, \"orientation\": \"landscape\"}\n"
-            "Replace the placeholder with the returned URL and set a meaningful alt. If using next/image,\n"
-            "ensure next.config allows images.unsplash.com.\n"
-            "After Gemini completes, run `bun run build` in the app root and fix any build errors.\n"
-            "Deploy using Vercel CLI (prefer ./node_modules/.bin/vercel if available):\n"
-            "  vercel --prod --yes [--token $VERCEL_TOKEN] [--scope $VERCEL_SCOPE]\n"
-            "After deploying, call mcp__claudius-chat__record_deploy with the deploy_url. It does NOT send\n"
-            "messages, so you must send the completion update yourself using should_send_message and\n"
-            "send_message (include the live URL).\n"
-            "If the user asks to buy a domain, do NOT purchase immediately. First quote availability and\n"
-            "price using: printf \"n\\n\" | vercel domains buy <domain> [--token $VERCEL_TOKEN] [--scope $VERCEL_SCOPE].\n"
-            "Parse the output to determine availability and price (e.g., 'Buy now for $1.99'). Then call\n"
-            "mcp__claudius-chat__record_domain_quote with domain, available (true/false), price_usd,\n"
-            "currency (USD), and optional message/raw_output. The tool returns JSON with a message and\n"
-            "optional payment_url. Use mcp__claudius-chat__should_send_message and\n"
-            "mcp__claudius-chat__send_message to deliver that message.\n"
-            "Also write a short internal summary to tasks/result_summary.md.\n"
-            "As your first step, spawn the chatty-agent and send a quick, context-aware acknowledgement\n"
-            "using the mcp__claudius-chat__send_message tool so the user gets immediate feedback.\n"
-            "Keep it short and not redundant. If you want to send more interim updates, use the same tool.\n"
-            "Do NOT include the final deployment URL in interim messages; send it only after deploy.\n"
-            "If you need more details from the user, ask a single clear question via should_send_message\n"
-            "and send_message. No greetings, no internal notes, no technical jargon. Ask only for missing\n"
-            "info; do not ask generic questions that repeat what the user just told you.\n"
-            "Before crafting any user-facing messages, read tasks/chat_history.md and (if present)\n"
-            "tasks/chat_summary.md to avoid repeating recent replies.\n"
-            "If tasks/summary_prompt.md exists, use it to update tasks/chat_summary.md, then trim\n"
-            "tasks/chat_log.jsonl to keep only the most recent 10 entries and delete summary_prompt.md.\n"
-            "If tasks/inflight_updates.jsonl exists, read it before starting heavy steps (Gemini run,\n"
-            "build, deploy). Decide whether to incorporate the updates now or stop and restart. If the\n"
-            "updates materially change the request (e.g., user says \"ignore that\" or sends new assets),\n"
-            "send a short message like \"Got your update—restarting now.\" via should_send_message and\n"
-            "send_message, then exit without running build/deploy. Never interrupt mid-command; only stop\n"
-            "between phases.\n"
-            "You may receive IN-FLIGHT UPDATE messages during a run; treat them as clarifications for the\n"
-            "current task (not new tasks). Incorporate them if safe, and do not send a separate response.\n"
-            "If you tell the user you're doing something (e.g., \"Adding analytics now\"), you MUST\n"
-            "send a completion confirmation when finished using the chat tools. First call\n"
-            "mcp__claudius-chat__should_send_message to check redundancy, then call\n"
-            "mcp__claudius-chat__send_message if appropriate. Do NOT rely on files for completion updates.\n"
-            "Use the chatty-agent subagent via Task to craft all user-facing messages.\n"
-            "Typical first site creation takes about 10 minutes; if you are starting a full build,\n"
-            "you may mention this as a rough estimate (not a guarantee).\n"
-            "Do not delegate deployment or design to other services.\n\n"
-            f"Task brief: {task_path}\n"
-            f"Memory file: {memory_path}\n"
+            template.replace("<<TASK_PATH>>", str(task_path))
+            .replace("<<MEMORY_PATH>>", str(memory_path))
+            .rstrip()
+            + "\n"
         )
 
     @staticmethod
@@ -278,20 +253,12 @@ class ClaudeAgent:
 
     @staticmethod
     def _default_agents() -> dict[str, AgentDefinition]:
+        settings = Settings()
+        interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
         return {
-            "chatty-agent": AgentDefinition(
+            "interaction-agent": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
-                prompt=(
-                    "You are a chat UX subagent. Craft short, friendly, non-technical updates for end users.\n"
-                    "Before sending, call mcp__claudius-chat__should_send_message with the draft text and\n"
-                    "only send if it returns send=true.\n"
-                    "Use the mcp__claudius-chat__send_message tool to send updates.\n"
-                    "Read tasks/chat_history.md and tasks/chat_summary.md (if present) before responding\n"
-                    "so you do not repeat or echo recent replies.\n"
-                    "If you need to ask the user a question, send a single-sentence question.\n"
-                    "Questions must be direct and contain no greeting.\n"
-                    "Avoid internal process details, stack traces, or technical jargon.\n"
-                ),
+                prompt=interaction_prompt,
                 tools=[
                     "Read",
                     "Write",
@@ -303,6 +270,29 @@ class ClaudeAgent:
                 ],
             )
         }
+
+    @staticmethod
+    def _load_prompt_file(path: Path) -> str:
+        settings = Settings()
+        resolved = path
+        if resolved.is_absolute():
+            return resolved.read_text(encoding="utf-8")
+
+        candidate = (settings.root_dir / path).resolve()
+        if candidate.exists():
+            return candidate.read_text(encoding="utf-8")
+
+        base = Path(__file__).resolve()
+        for parent in base.parents:
+            fallback = (parent / path).resolve()
+            if fallback.exists():
+                return fallback.read_text(encoding="utf-8")
+            if (parent / "pyproject.toml").exists():
+                if fallback.exists():
+                    return fallback.read_text(encoding="utf-8")
+                break
+
+        raise FileNotFoundError(f"Prompt file not found: {path}")
 
     @staticmethod
     def _load_plugins_from_env() -> list[dict]:

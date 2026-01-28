@@ -22,4 +22,4 @@ def test_default_setting_sources():
 
 def test_default_subagents_configured():
     agent = ClaudeAgent()
-    assert "chatty-agent" in agent.agents
+    assert "interaction-agent" in agent.agents

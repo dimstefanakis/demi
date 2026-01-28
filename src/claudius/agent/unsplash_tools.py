@@ -4,11 +4,13 @@ from dataclasses import dataclass
 import json
 from typing import Any
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from pathlib import Path
 
 import httpx
 
 from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_server, tool
 
+from claudius.agent.tool_logging import log_tool_run
 
 UNSPLASH_SERVER_NAME = "claudius-unsplash"
 UNSPLASH_SEARCH_TOOL = f"mcp__{UNSPLASH_SERVER_NAME}__search_photos"
@@ -18,21 +20,39 @@ UNSPLASH_SEARCH_TOOL = f"mcp__{UNSPLASH_SERVER_NAME}__search_photos"
 class UnsplashToolContext:
     access_key: str | None
     app_name: str = "claudius"
+    tasks_dir: Path | None = None
 
 
 def build_unsplash_server(context: UnsplashToolContext) -> McpSdkServerConfig:
+    import time
+
     @tool(
         "search_photos",
         "Search Unsplash for photos and return a small list of image URLs.",
         {"query": str, "count": int, "orientation": str},
     )
     async def search_photos(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
         access_key = context.access_key
         if not access_key:
+            log_tool_run(
+                getattr(context, "tasks_dir", Path.cwd()),
+                "search_photos",
+                args=args,
+                result={"ok": False, "error": "UNSPLASH_ACCESS_KEY is not set."},
+                duration_ms=(time.monotonic() - start) * 1000.0,
+            )
             return _error("UNSPLASH_ACCESS_KEY is not set.")
 
         query = str(args.get("query", "")).strip()
         if not query:
+            log_tool_run(
+                getattr(context, "tasks_dir", Path.cwd()),
+                "search_photos",
+                args=args,
+                result={"ok": False, "error": "query is required."},
+                duration_ms=(time.monotonic() - start) * 1000.0,
+            )
             return _error("query is required.")
 
         count = _clamp_int(args.get("count", 3), low=1, high=10)
@@ -60,6 +80,13 @@ def build_unsplash_server(context: UnsplashToolContext) -> McpSdkServerConfig:
                 headers=headers,
             )
         if response.status_code != 200:
+            log_tool_run(
+                getattr(context, "tasks_dir", Path.cwd()),
+                "search_photos",
+                args=args,
+                error=f"Unsplash API error: {response.status_code} {response.text}",
+                duration_ms=(time.monotonic() - start) * 1000.0,
+            )
             return _error(f"Unsplash API error: {response.status_code} {response.text}")
 
         payload = response.json()
@@ -83,6 +110,13 @@ def build_unsplash_server(context: UnsplashToolContext) -> McpSdkServerConfig:
                 }
             )
 
+        log_tool_run(
+            getattr(context, "tasks_dir", Path.cwd()),
+            "search_photos",
+            args=args,
+            result={"ok": True, "count": len(results), "query": query},
+            duration_ms=(time.monotonic() - start) * 1000.0,
+        )
         return {
             "content": [
                 {
