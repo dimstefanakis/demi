@@ -30,6 +30,10 @@ class WorkspaceManager:
 
     def ensure_workspace(self, tenant_key: str) -> Workspace:
         root = self.root_dir / tenant_key
+        return self.ensure_workspace_at_path(root)
+
+    def ensure_workspace_at_path(self, root: Path) -> Workspace:
+        root = Path(root)
         tasks_dir = root / "tasks"
         assets_dir = root / "assets"
         site_dir = root / "site"

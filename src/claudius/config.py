@@ -23,6 +23,26 @@ class Settings(BaseSettings):
     vercel_token: str | None = None
     vercel_scope: str | None = None
 
+    agent_runtime: str = "local"
+    docker_image: str = "claudius-agent:local"
+    docker_pool_size: int = 1
+    docker_pool_root: Path = Path("data/pool")
+    docker_mount_path: str = "/workspace"
+    docker_env_allowlist: str | None = None
+    docker_forward_messages: bool = False
+
+    anthropic_api_key: str | None = None
+    claude_api_key: str | None = None
+    gemini_api_key: str | None = None
+    google_api_key: str | None = None
+
+    events_signing_secret: str | None = None
+    events_require_signature: bool = True
+    events_worker_enabled: bool = True
+    events_worker_poll_interval: float = 1.5
+    events_worker_batch_size: int = 20
+    event_url: str | None = None
+
     unsplash_app_id: str | None = None
     unsplash_access_key: str | None = None
     unsplash_secret_key: str | None = None

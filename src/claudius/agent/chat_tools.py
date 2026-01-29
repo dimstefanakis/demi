@@ -113,6 +113,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
+        try:
+            (context.tasks_dir / "deploy_url.txt").write_text(deploy_url)
+        except OSError:
+            pass
         if context.db and context.tenant_id is not None:
             context.db.update_tenant_deploy_url(context.tenant_id, deploy_url)
         payload = {
@@ -166,11 +170,25 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 price_usd = None
 
         if context.db is None or context.tenant_id is None:
-            payload = {"ok": False, "error": "missing_db_context"}
-            _log("record_domain_quote", args, result=payload, start=start)
+            fallback_payload = {
+                "ok": True,
+                "status": "pending_record",
+                "domain": domain,
+                "available": available,
+                "price_usd": price_usd,
+                "currency": currency,
+                "message": message or None,
+            }
+            try:
+                (context.tasks_dir / "domain_quote.json").write_text(
+                    json.dumps(fallback_payload, indent=2)
+                )
+            except OSError:
+                pass
+            _log("record_domain_quote", args, result=fallback_payload, start=start)
             return {
-                "content": [{"type": "text", "text": json.dumps(payload)}],
-                "is_error": True,
+                "content": [{"type": "text", "text": json.dumps(fallback_payload)}],
+                "is_error": False,
             }
 
         quote_json = {

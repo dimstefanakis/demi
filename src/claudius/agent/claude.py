@@ -36,6 +36,7 @@ class AgentResult:
 
 
 class ClaudeAgent:
+    supports_inflight_stream = True
     DEFAULT_ALLOWED_TOOLS = [
         "Read",
         "Write",
@@ -197,9 +198,11 @@ class ClaudeAgent:
     def _build_prompt(task_path: Path, memory_path: Path) -> str:
         settings = Settings()
         template = ClaudeAgent._load_prompt_file(settings.claude_prompt_path)
+        event_url = settings.event_url or "not configured"
         return (
             template.replace("<<TASK_PATH>>", str(task_path))
             .replace("<<MEMORY_PATH>>", str(memory_path))
+            .replace("<<EVENT_URL>>", event_url)
             .rstrip()
             + "\n"
         )

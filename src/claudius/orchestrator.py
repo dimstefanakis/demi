@@ -7,7 +7,7 @@ import json
 
 from claudius.db.core import Database
 from claudius.models import NormalizedMessage, OrchestratorResult
-from claudius.workspace.core import WorkspaceManager
+from claudius.workspace.core import Workspace, WorkspaceManager
 from claudius.messaging.telegram import TelegramUpdateParser
 from claudius.agent.inflight import InflightTextStream
 from claudius.memory import build_summarization_prompt, read_logs
@@ -22,6 +22,7 @@ class Orchestrator:
     messenger: Any
     payments: Any | None = None
     inflight_text_queues: dict[str, InflightTextStream] | None = None
+    workspace_allocator: Any | None = None
 
     async def handle_message(self, msg: NormalizedMessage) -> OrchestratorResult:
         tenant = self.db.get_or_create_tenant(msg.provider, msg.tenant_external_id)
@@ -33,9 +34,7 @@ class Orchestrator:
         user_payload = (msg.text or "").strip()
         if not user_payload and msg.images:
             user_payload = "(attachment)"
-        workspace = self.workspace_manager.ensure_workspace(tenant.key)
-        if tenant.workspace_path != str(workspace.root):
-            self.db.update_tenant_workspace(tenant.id, str(workspace.root))
+        workspace = await self._resolve_workspace(tenant)
         self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
         write_chat_history(workspace.tasks_dir)
 
@@ -48,21 +47,18 @@ class Orchestrator:
             inflight_run = None
 
         if inflight_run:
-            if msg.images:
-                self.db.update_message_status(message_id, "pending")
-                asset_paths = []
-                if hasattr(self.messenger, "download_images"):
-                    asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
-                self._append_inflight_update(workspace.tasks_dir, msg, asset_paths)
-                return OrchestratorResult(status="busy", detail="tenant already running")
-
+            supports_stream = self._supports_inflight_stream()
             stream = self._get_inflight_stream(tenant.key)
-            if stream is not None and stream.accepting and msg.text:
+            if supports_stream and stream is not None and stream.accepting and msg.text and not msg.images:
                 await stream.queue.put(msg.text)
                 self.db.update_message_status(message_id, "processed")
                 return OrchestratorResult(status="busy", detail="streamed to in-flight run")
 
             self.db.update_message_status(message_id, "pending")
+            asset_paths = []
+            if msg.images and hasattr(self.messenger, "download_images"):
+                asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
+            self._append_inflight_update(workspace.tasks_dir, msg, asset_paths)
             return OrchestratorResult(status="busy", detail="tenant already running")
 
         return await self._run_message(
@@ -72,6 +68,44 @@ class Orchestrator:
             process_pending=True,
         )
 
+    async def handle_event_job(
+        self,
+        tenant_id: int,
+        payload: dict[str, Any],
+        job_id: int,
+    ) -> OrchestratorResult:
+        tenant = self.db.get_tenant_by_id(tenant_id)
+        if tenant is None:
+            return OrchestratorResult(status="invalid", detail="tenant_not_found")
+
+        inflight_run = self.db.get_inflight_run(tenant.id)
+        if inflight_run and not self._is_run_stale(inflight_run, max_age_seconds=900):
+            return OrchestratorResult(status="busy", detail="tenant already running")
+
+        event_type = str(payload.get("event_type") or "event").strip()
+        event_payload = payload.get("payload") or {}
+        intent = payload.get("intent")
+        event_text = self._build_event_text(event_type, event_payload, intent=intent)
+        msg = NormalizedMessage(
+            provider="event",
+            provider_message_id=f"event-{job_id}",
+            tenant_external_id=tenant.external_id,
+            received_at=self._now(),
+            text=event_text,
+            images=[],
+            raw={"event": payload},
+        )
+        message_id, inserted = self.db.record_message(tenant.id, msg)
+        if not inserted:
+            return OrchestratorResult(status="duplicate", detail="event already processed")
+
+        return await self._run_message(
+            tenant=tenant,
+            msg=msg,
+            message_id=message_id,
+            process_pending=False,
+        )
+
     async def _run_message(
         self,
         tenant,
@@ -79,9 +113,7 @@ class Orchestrator:
         message_id: int,
         process_pending: bool,
     ) -> OrchestratorResult:
-        workspace = self.workspace_manager.ensure_workspace(tenant.key)
-        if tenant.workspace_path != str(workspace.root):
-            self.db.update_tenant_workspace(tenant.id, str(workspace.root))
+        workspace = await self._resolve_workspace(tenant)
 
         self.db.update_message_status(message_id, "processing")
 
@@ -140,7 +172,8 @@ class Orchestrator:
             return
 
         self.db.update_message_statuses(message_ids, "processing")
-        inflight_path = self._inflight_updates_path(tenant.key)
+        workspace = await self._resolve_workspace(tenant)
+        inflight_path = self._inflight_updates_path(workspace.tasks_dir)
         if inflight_path.exists():
             try:
                 inflight_path.unlink()
@@ -208,6 +241,36 @@ class Orchestrator:
         return "\n".join(lines) + "\n"
 
     @staticmethod
+    def _build_event_text(
+        event_type: str,
+        payload: dict[str, Any],
+        intent: str | None = None,
+    ) -> str:
+        summary = payload.get("summary") or payload.get("message") or ""
+        summary = str(summary).strip()
+        header = f"EVENT ({event_type})"
+        if summary:
+            header = f"{header}: {summary}"
+        notify = bool(payload.get("notify") or payload.get("notify_text"))
+        intent_line = f"- Intent: {intent.strip()}\n" if isinstance(intent, str) and intent.strip() else ""
+        notify_line = "- This event requests a user notification.\n" if notify else ""
+        return (
+            f"{header}\n\n"
+            "Context:\n"
+            f"{intent_line}"
+            f"{notify_line}"
+            "- The full event payload was stored in the tenant SQLite DB at /workspace/tenant.sqlite\n"
+            "- Table: events (columns: event_type, payload_json, received_at)\n"
+            "- You may query or update this DB if needed.\n"
+        )
+
+    @staticmethod
+    def _now():
+        from datetime import datetime, timezone
+
+        return datetime.now(tz=timezone.utc)
+
+    @staticmethod
     def _append_inflight_update(
         tasks_dir: Path, msg: NormalizedMessage, asset_paths: list[str]
     ) -> None:
@@ -249,9 +312,35 @@ class Orchestrator:
             raw=latest.raw,
         )
 
-    def _inflight_updates_path(self, tenant_key: str) -> Path:
-        workspace = self.workspace_manager.ensure_workspace(tenant_key)
-        return workspace.tasks_dir / "inflight_updates.jsonl"
+    def _inflight_updates_path(self, tasks_dir: Path) -> Path:
+        return tasks_dir / "inflight_updates.jsonl"
+
+    async def _resolve_workspace(self, tenant) -> Workspace:
+        if getattr(tenant, "workspace_path", None):
+            root = Path(tenant.workspace_path)
+            return self.workspace_manager.ensure_workspace_at_path(root)
+        if self.workspace_allocator is not None:
+            root = await self._allocate_workspace(tenant)
+            self.db.update_tenant_workspace(tenant.id, str(root))
+            tenant.workspace_path = str(root)
+            return self.workspace_manager.ensure_workspace_at_path(root)
+        workspace = self.workspace_manager.ensure_workspace(tenant.key)
+        if tenant.workspace_path != str(workspace.root):
+            self.db.update_tenant_workspace(tenant.id, str(workspace.root))
+            tenant.workspace_path = str(workspace.root)
+        return workspace
+
+    async def _allocate_workspace(self, tenant) -> Path:
+        allocator = self.workspace_allocator
+        if allocator is None:
+            raise RuntimeError("workspace allocator not configured")
+        allocate = getattr(allocator, "allocate_workspace", None)
+        if allocate is None:
+            raise RuntimeError("workspace allocator missing allocate_workspace")
+        result = allocate(tenant)
+        if hasattr(result, "__await__"):
+            result = await result
+        return Path(result)
 
     def _ensure_inflight_stream(self, tenant_key: str) -> InflightTextStream:
         if self.inflight_text_queues is None:
@@ -273,6 +362,9 @@ class Orchestrator:
         if not self.inflight_text_queues:
             return
         self.inflight_text_queues.pop(tenant_key, None)
+
+    def _supports_inflight_stream(self) -> bool:
+        return bool(getattr(self.agent, "supports_inflight_stream", False))
 
     @staticmethod
     def _read_optional_file(path: Path) -> str | None:

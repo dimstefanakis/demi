@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 from claudius.models import DomainOrder, NormalizedMessage, Tenant
@@ -73,6 +73,19 @@ class Database:
                 stripe_payment_url TEXT,
                 vercel_response_json TEXT,
                 error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS event_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL,
+                job_type TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                attempts INTEGER NOT NULL,
+                run_after TEXT NOT NULL,
+                last_error TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -183,6 +196,23 @@ class Database:
             return None
         return self._row_to_tenant(row)
 
+    def get_tenant_by_key(self, key: str) -> Tenant | None:
+        conn = self.connect()
+        row = conn.execute("SELECT * FROM tenants WHERE key = ?", (key,)).fetchone()
+        if not row:
+            return None
+        return self._row_to_tenant(row)
+
+    def get_tenant_by_external(self, provider: str, external_id: str) -> Tenant | None:
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT * FROM tenants WHERE provider = ? AND external_id = ?",
+            (provider, external_id),
+        ).fetchone()
+        if not row:
+            return None
+        return self._row_to_tenant(row)
+
     def update_tenant_workspace(self, tenant_id: int, workspace_path: str) -> None:
         conn = self.connect()
         now = datetime.now(tz=timezone.utc).isoformat()
@@ -207,6 +237,104 @@ class Database:
         conn.execute(
             "UPDATE tenants SET last_deploy_url = ?, updated_at = ? WHERE id = ?",
             (url, now, tenant_id),
+        )
+        conn.commit()
+
+    def create_event_job(
+        self,
+        tenant_id: int,
+        job_type: str,
+        payload: dict[str, Any],
+        run_after: str | None = None,
+    ) -> int:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        if run_after is None:
+            run_after = now
+        cur = conn.execute(
+            """
+            INSERT INTO event_jobs (tenant_id, job_type, payload_json, status, attempts, run_after, last_error, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                tenant_id,
+                job_type,
+                json.dumps(payload),
+                "pending",
+                0,
+                run_after,
+                None,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+    def fetch_pending_event_jobs(self, limit: int = 25) -> list[dict[str, Any]]:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        rows = conn.execute(
+            """
+            SELECT * FROM event_jobs
+            WHERE status = 'pending' AND run_after <= ?
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            (now, limit),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def mark_event_job_running(self, job_id: int) -> None:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE event_jobs SET status = ?, updated_at = ? WHERE id = ?",
+            ("running", now, job_id),
+        )
+        conn.commit()
+
+    def mark_event_job_done(self, job_id: int) -> None:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            "UPDATE event_jobs SET status = ?, updated_at = ? WHERE id = ?",
+            ("completed", now, job_id),
+        )
+        conn.commit()
+
+    def mark_event_job_failed(
+        self,
+        job_id: int,
+        error: str,
+        retry_after_seconds: int | None = None,
+        max_attempts: int = 5,
+    ) -> None:
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT attempts FROM event_jobs WHERE id = ?",
+            (job_id,),
+        ).fetchone()
+        attempts = int(row["attempts"]) + 1 if row else 1
+        now = datetime.now(tz=timezone.utc)
+        status = "failed" if attempts >= max_attempts else "pending"
+        run_after = now
+        if retry_after_seconds and status == "pending":
+            run_after = now + timedelta(seconds=retry_after_seconds)
+        conn.execute(
+            """
+            UPDATE event_jobs
+            SET status = ?, attempts = ?, run_after = ?, last_error = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                status,
+                attempts,
+                run_after.isoformat(),
+                error,
+                now.isoformat(),
+                job_id,
+            ),
         )
         conn.commit()
 
