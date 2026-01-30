@@ -46,7 +46,6 @@ class WorkspaceManager:
             self._sync_project_files(root)
         if not memory_path.exists():
             memory_path.write_text("# Memory\n\n")
-
         return Workspace(
             root=root,
             tasks_dir=tasks_dir,
@@ -76,3 +75,9 @@ class WorkspaceManager:
             target = workspace_root / "DESIGN.md"
             if not target.exists():
                 shutil.copy2(design_md, target)
+
+        env_example = self.template_root / ".env.example"
+        if env_example.exists():
+            target = workspace_root / ".env.example"
+            if not target.exists():
+                shutil.copy2(env_example, target)

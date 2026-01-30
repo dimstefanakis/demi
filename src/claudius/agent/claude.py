@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 from pathlib import Path
 import os
 from typing import Any
@@ -20,10 +21,16 @@ from claudius.agent.unsplash_tools import (
     UnsplashToolContext,
     build_unsplash_server,
 )
+from claudius.agent.supabase_tools import (
+    SUPABASE_SERVER_NAME,
+    SupabaseToolContext,
+    build_supabase_server,
+)
 from claudius.agent.tool_logging import log_agent_event
 from claudius.config import Settings
 from claudius.agent.inflight import InflightTextStream
 from claudius.models import NormalizedMessage
+from claudius.tenant_db import ensure_tenant_db
 from claudius.workspace.core import Workspace
 
 
@@ -37,6 +44,8 @@ class AgentResult:
 
 class ClaudeAgent:
     supports_inflight_stream = True
+    SUPABASE_MCP_SERVER_NAME = "supabase"
+    SUPABASE_MCP_BASE_URL = "https://mcp.supabase.com/mcp"
     DEFAULT_ALLOWED_TOOLS = [
         "Read",
         "Write",
@@ -52,8 +61,14 @@ class ClaudeAgent:
         UNSPLASH_SEARCH_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
         SEND_MESSAGE_TOOL,
+        f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
         f"mcp__{CHAT_SERVER_NAME}__record_deploy",
         f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
+        f"mcp__{CHAT_SERVER_NAME}__record_billing_status",
+        f"mcp__{CHAT_SERVER_NAME}__request_backend_subscription",
+        f"mcp__{SUPABASE_SERVER_NAME}__provision_managed_backend",
+        f"mcp__{SUPABASE_SERVER_NAME}__upgrade_managed_backend",
+        f"mcp__{SUPABASE_MCP_SERVER_NAME}__*",
     ]
 
     def __init__(
@@ -88,6 +103,8 @@ class ClaudeAgent:
             ChatToolContext(
                 messenger=messenger,
                 tenant_external_id=message.tenant_external_id,
+                tenant_key=message.tenant_key,
+                provider=message.provider,
                 tasks_dir=workspace.tasks_dir,
                 tenant_id=tenant_id,
                 db=db,
@@ -101,6 +118,21 @@ class ClaudeAgent:
                 tasks_dir=workspace.tasks_dir,
             )
         )
+        supabase_server = build_supabase_server(
+            SupabaseToolContext(
+                tasks_dir=workspace.tasks_dir,
+                db=db,
+                tenant_id=tenant_id,
+            )
+        )
+        mcp_servers = {
+            CHAT_SERVER_NAME: chat_server,
+            UNSPLASH_SERVER_NAME: unsplash_server,
+            SUPABASE_SERVER_NAME: supabase_server,
+        }
+        supabase_mcp = self._build_supabase_mcp_config(workspace, settings)
+        if supabase_mcp:
+            mcp_servers[self.SUPABASE_MCP_SERVER_NAME] = supabase_mcp
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
@@ -110,10 +142,7 @@ class ClaudeAgent:
             add_dirs=[Path.cwd()],
             plugins=self.plugins,
             agents=self.agents,
-            mcp_servers={
-                CHAT_SERVER_NAME: chat_server,
-                UNSPLASH_SERVER_NAME: unsplash_server,
-            },
+            mcp_servers=mcp_servers,
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -194,6 +223,39 @@ class ClaudeAgent:
             usage=usage,
         )
 
+    def _build_supabase_mcp_config(
+        self, workspace: Workspace, settings: Settings
+    ) -> dict[str, Any] | None:
+        if not settings.supabase_access_token:
+            return None
+        payload = self._load_supabase_project_state(workspace)
+        if not payload:
+            return None
+        project_ref = str(payload.get("project_ref") or "").strip()
+        if not project_ref:
+            return None
+        url = f"{self.SUPABASE_MCP_BASE_URL}?project_ref={project_ref}&read_only=true"
+        return {
+            "type": "http",
+            "url": url,
+            "headers": {"Authorization": f"Bearer {settings.supabase_access_token}"},
+        }
+
+    @staticmethod
+    def _load_supabase_project_state(workspace: Workspace) -> dict[str, Any] | None:
+        db = ensure_tenant_db(workspace.root / "tenant.sqlite")
+        payload = db.get_kv("supabase", "project")
+        if payload:
+            return payload
+        path = workspace.tasks_dir / "supabase_project.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
     @staticmethod
     def _build_prompt(task_path: Path, memory_path: Path) -> str:
         settings = Settings()
@@ -270,6 +332,7 @@ class ClaudeAgent:
                     "Glob",
                     f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                     SEND_MESSAGE_TOOL,
+                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 ],
             )
         }

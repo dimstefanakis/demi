@@ -1,16 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from typing import Any
 from fastapi import FastAPI, Request
 
 from claudius.agent.claude import ClaudeAgent
 from claudius.config import Settings
 from claudius.db.core import Database
-from claudius.domains.service import DomainService
 from claudius.messaging.telegram import TelegramClient, TelegramConfig, TelegramUpdateParser
 from claudius.orchestrator import Orchestrator
-from claudius.payments.stripe import StripeClient, StripeConfig
+from claudius.payments.stripe import StripeClient, build_stripe_config, derive_stripe_urls
 from claudius.events import normalize_event_type, verify_signature
 from claudius.jobs.worker import EventWorker, EventWorkerConfig
 from claudius.runtime.docker_agent import DockerAgent
@@ -35,22 +35,10 @@ def create_app() -> FastAPI:
     messenger = TelegramClient(TelegramConfig(bot_token=settings.telegram_bot_token))
 
     stripe_client = None
-    if (
-        settings.stripe_secret_key
-        and settings.stripe_webhook_secret
-        and settings.stripe_success_url
-        and settings.stripe_cancel_url
-    ):
-        stripe_client = StripeClient(
-            StripeConfig(
-                secret_key=settings.stripe_secret_key,
-                webhook_secret=settings.stripe_webhook_secret,
-                success_url=settings.stripe_success_url,
-                cancel_url=settings.stripe_cancel_url,
-            )
-        )
+    stripe_config = build_stripe_config(settings)
+    if stripe_config:
+        stripe_client = StripeClient(stripe_config)
 
-    domain_service = DomainService(db=db, settings=settings, messenger=messenger)
 
     if settings.agent_runtime == "docker":
         pool_root = (settings.root_dir / settings.docker_pool_root).resolve()
@@ -151,21 +139,94 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             return {"status": "invalid"}
 
-        if event.get("type") == "checkout.session.completed":
+        event_type = event.get("type") or ""
+        if event_type == "checkout.session.completed":
             session = (event.get("data") or {}).get("object") or {}
             metadata = session.get("metadata") or {}
-            order_id_raw = metadata.get("domain_order_id")
             session_id = session.get("id")
-            if order_id_raw:
-                try:
-                    order_id = int(order_id_raw)
-                except ValueError:
-                    order_id = None
-                if order_id:
-                    db.mark_domain_order_paid(order_id, stripe_session_id=session_id)
-                    await domain_service.purchase_paid_order(order_id)
+            subscription_id = session.get("subscription")
+
+            order_id = _parse_billing_order_id(metadata)
+            order_row = None
+            if order_id:
+                order_row = db.get_billing_order(order_id)
+            if order_row is None and session_id:
+                order_row = db.get_billing_order_by_session(str(session_id))
+                if order_row:
+                    order_id = int(order_row["id"])
+
+            tenant = None
+            if order_row is not None and order_id is not None:
+                tenant = db.get_tenant_by_id(int(order_row["tenant_id"]))
+                db.mark_billing_order_paid(
+                    order_id,
+                    stripe_session_id=session_id,
+                    stripe_subscription_id=subscription_id,
+                )
+            else:
+                tenant = _resolve_tenant_for_metadata(db, metadata)
+                if tenant is None:
+                    return {"status": "invalid", "reason": "tenant_not_found"}
+                order_type = _infer_order_type(metadata)
+                order_id = db.create_billing_order(
+                    tenant_id=tenant.id,
+                    order_type=order_type,
+                    status="paid",
+                    price_usd=_parse_price_usd(metadata.get("price_usd")),
+                    currency=_parse_currency(metadata.get("currency")),
+                    metadata=metadata,
+                )
+                db.mark_billing_order_paid(
+                    order_id,
+                    stripe_session_id=session_id,
+                    stripe_subscription_id=subscription_id,
+                )
+                order_row = db.get_billing_order(order_id)
+
+            if tenant is None or order_row is None or order_id is None:
+                return {"status": "ok"}
+
+            event_payload = _build_billing_paid_payload(order_row, metadata, order_id)
+            db.create_event_job(
+                tenant.id,
+                job_type="event",
+                payload=event_payload,
+            )
+        elif event_type == "checkout.session.expired":
+            session = (event.get("data") or {}).get("object") or {}
+            _handle_billing_checkout_expired(db, session)
+        elif event_type == "customer.subscription.updated":
+            subscription = (event.get("data") or {}).get("object") or {}
+            _handle_subscription_updated(db, subscription)
+        elif event_type == "customer.subscription.deleted":
+            subscription = (event.get("data") or {}).get("object") or {}
+            _handle_subscription_deleted(db, subscription)
+        elif event_type in (
+            "invoice.payment_failed",
+            "invoice.payment_action_required",
+            "invoice.paid",
+        ):
+            invoice = (event.get("data") or {}).get("object") or {}
+            _handle_invoice_event(db, event_type, invoice)
 
         return {"status": "ok"}
+
+    @app.get("/stripe/success")
+    async def stripe_success():
+        return {"status": "ok", "message": "Payment received. You can close this tab."}
+
+    @app.get("/stripe/cancel")
+    async def stripe_cancel():
+        return {"status": "ok", "message": "Payment canceled. You can close this tab."}
+
+    @app.get("/stripe/health")
+    async def stripe_health():
+        success_url, cancel_url = derive_stripe_urls(settings)
+        return {
+            "configured": stripe_config is not None,
+            "success_url": success_url,
+            "cancel_url": cancel_url,
+        }
 
     return app
 
@@ -215,6 +276,262 @@ def _merge_event_identity(payload: dict, request: Request) -> dict:
         elif query_provider:
             merged["provider"] = query_provider
     return merged
+
+
+def _resolve_tenant_for_metadata(db: Database, metadata: dict[str, Any]) -> Any | None:
+    payload = {
+        "tenant_key": metadata.get("tenant_key"),
+        "tenant_id": metadata.get("tenant_id"),
+        "tenant_external_id": metadata.get("tenant_external_id"),
+        "provider": metadata.get("provider"),
+    }
+    return _resolve_tenant_for_event(db, payload)
+
+
+def _parse_price_usd(value: Any) -> float | None:
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _parse_currency(value: Any) -> str | None:
+    if not value:
+        return None
+    return str(value).strip().upper() or None
+
+
+def _parse_billing_order_id(metadata: dict[str, Any]) -> int | None:
+    for key in ("billing_order_id", "backend_order_id", "domain_order_id", "order_id"):
+        value = metadata.get(key)
+        if value is None:
+            continue
+        try:
+            return int(str(value).strip())
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _infer_order_type(metadata: dict[str, Any]) -> str:
+    order_type = str(metadata.get("order_type") or "").strip().lower()
+    if order_type:
+        return order_type
+    if metadata.get("backend_type") or metadata.get("use_case"):
+        return "managed_backend"
+    if metadata.get("domain"):
+        return "domain"
+    return "unknown"
+
+
+def _extract_order_metadata(order_row: Any) -> dict[str, Any]:
+    if order_row is None:
+        return {}
+    raw = None
+    try:
+        raw = order_row["metadata_json"]
+    except (KeyError, TypeError):
+        raw = None
+    if not raw:
+        return {}
+    if isinstance(raw, dict):
+        return raw
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _build_billing_paid_payload(
+    order_row: Any,
+    metadata: dict[str, Any],
+    order_id: int,
+) -> dict[str, Any]:
+    order_type = str(order_row["order_type"] or "").strip().lower()
+    if order_type == "domain":
+        return _build_domain_paid_payload(order_row, metadata, order_id)
+    if order_type == "managed_backend":
+        return _build_backend_paid_payload(order_row, metadata, order_id)
+    payload = {
+        "summary": "Payment received",
+        "billing_order_id": order_id,
+        "order_type": order_type or "unknown",
+        "price_usd": order_row["price_usd"] or _parse_price_usd(metadata.get("price_usd")),
+        "currency": order_row["currency"] or _parse_currency(metadata.get("currency")),
+    }
+    return {"event_type": "billing_paid", "intent": "billing_paid", "payload": payload}
+
+
+def _build_domain_paid_payload(
+    order_row: Any,
+    metadata: dict[str, Any],
+    order_id: int,
+) -> dict[str, Any]:
+    order_meta = _extract_order_metadata(order_row)
+    domain = order_meta.get("domain") or metadata.get("domain")
+    payload = {
+        "summary": "Domain payment received",
+        "billing_order_id": order_id,
+        "domain": domain,
+        "price_usd": order_row["price_usd"] or _parse_price_usd(metadata.get("price_usd")),
+        "currency": order_row["currency"] or _parse_currency(metadata.get("currency")),
+    }
+    return {"event_type": "domain_paid", "intent": "domain_purchase_paid", "payload": payload}
+
+
+def _build_backend_paid_payload(
+    order_row: Any,
+    metadata: dict[str, Any],
+    order_id: int,
+) -> dict[str, Any]:
+    order_meta = _extract_order_metadata(order_row)
+    payload = {
+        "summary": "Backend upgrade payment received",
+        "billing_order_id": order_id,
+        "backend_type": order_meta.get("backend_type") or metadata.get("backend_type"),
+        "price_usd": order_row["price_usd"] or _parse_price_usd(metadata.get("price_usd")),
+        "currency": order_row["currency"] or _parse_currency(metadata.get("currency")),
+        "use_case": order_meta.get("use_case") or metadata.get("use_case"),
+        "interval": order_meta.get("interval") or metadata.get("interval"),
+        "product_name": order_meta.get("product_name") or metadata.get("product_name"),
+    }
+    return {
+        "event_type": "backend_paid",
+        "intent": "managed_backend_paid",
+        "payload": payload,
+    }
+
+
+def _handle_billing_checkout_expired(db: Database, session: dict[str, Any]) -> None:
+    metadata = session.get("metadata") or {}
+    order_id = _parse_billing_order_id(metadata)
+    session_id = session.get("id")
+    order_row = None
+    if order_id:
+        order_row = db.get_billing_order(order_id)
+    if order_row is None and session_id:
+        order_row = db.get_billing_order_by_session(str(session_id))
+        if order_row:
+            order_id = int(order_row["id"])
+    if order_row is None or order_id is None:
+        return
+    db.update_billing_order_status(order_id, "checkout_expired")
+    tenant = db.get_tenant_by_id(int(order_row["tenant_id"]))
+    if tenant is None:
+        return
+    order_type = str(order_row["order_type"] or "").strip().lower()
+    event_type = "billing_checkout_expired"
+    intent = "billing_checkout_expired"
+    if order_type == "domain":
+        event_type = "domain_checkout_expired"
+        intent = "domain_checkout_expired"
+    elif order_type == "managed_backend":
+        event_type = "backend_checkout_expired"
+        intent = "managed_backend_checkout_expired"
+    db.create_event_job(
+        tenant.id,
+        job_type="event",
+        payload={
+            "event_type": event_type,
+            "intent": intent,
+            "payload": {
+                "summary": event_type.replace("_", " ").title(),
+                "billing_order_id": order_id,
+                "order_type": order_type,
+            },
+        },
+    )
+
+
+def _handle_subscription_updated(db: Database, subscription: dict[str, Any]) -> None:
+    subscription_id = subscription.get("id")
+    if not subscription_id:
+        return
+    order_row = db.get_billing_order_by_subscription(str(subscription_id))
+    if order_row is None or order_row["order_type"] != "managed_backend":
+        return
+    order_id = int(order_row["id"])
+    cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
+    cancel_at = subscription.get("cancel_at")
+    current_period_end = subscription.get("current_period_end")
+    status = subscription.get("status")
+    metadata = {
+        "subscription_status": status,
+        "cancel_at_period_end": cancel_at_period_end,
+        "cancel_at": cancel_at,
+        "current_period_end": current_period_end,
+    }
+    if cancel_at_period_end:
+        db.update_billing_order_status(order_id, "cancel_scheduled", metadata=metadata)
+        _emit_billing_event(db, order_row, "backend_cancel_scheduled", "managed_backend_cancel_scheduled")
+        return
+    if status in {"canceled", "unpaid", "incomplete_expired"}:
+        db.update_billing_order_status(order_id, "canceled", metadata=metadata)
+        _emit_billing_event(db, order_row, "backend_canceled", "managed_backend_canceled")
+        return
+    db.update_billing_order_status(order_id, "active", metadata=metadata)
+
+
+def _handle_subscription_deleted(db: Database, subscription: dict[str, Any]) -> None:
+    subscription_id = subscription.get("id")
+    if not subscription_id:
+        return
+    order_row = db.get_billing_order_by_subscription(str(subscription_id))
+    if order_row is None or order_row["order_type"] != "managed_backend":
+        return
+    order_id = int(order_row["id"])
+    metadata = {
+        "subscription_status": subscription.get("status"),
+        "canceled_at": subscription.get("canceled_at"),
+    }
+    db.update_billing_order_status(order_id, "canceled", metadata=metadata)
+    _emit_billing_event(db, order_row, "backend_canceled", "managed_backend_canceled")
+
+
+def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]) -> None:
+    subscription_id = invoice.get("subscription")
+    if not subscription_id:
+        return
+    order_row = db.get_billing_order_by_subscription(str(subscription_id))
+    if order_row is None or order_row["order_type"] != "managed_backend":
+        return
+    order_id = int(order_row["id"])
+    if event_type == "invoice.payment_failed":
+        db.update_billing_order_status(order_id, "payment_failed")
+        _emit_billing_event(db, order_row, "backend_payment_failed", "managed_backend_payment_failed")
+        return
+    if event_type == "invoice.payment_action_required":
+        db.update_billing_order_status(order_id, "payment_action_required")
+        _emit_billing_event(
+            db, order_row, "backend_payment_action_required", "managed_backend_payment_action_required"
+        )
+        return
+    if event_type == "invoice.paid":
+        if order_row["status"] == "cancel_scheduled":
+            return
+        db.update_billing_order_status(order_id, "active")
+
+
+def _emit_billing_event(db: Database, order_row: Any, event_type: str, intent: str) -> None:
+    tenant = db.get_tenant_by_id(int(order_row["tenant_id"]))
+    if tenant is None:
+        return
+    db.create_event_job(
+        tenant.id,
+        job_type="event",
+        payload={
+            "event_type": event_type,
+            "intent": intent,
+            "payload": {
+                "summary": event_type.replace("_", " ").title(),
+                "billing_order_id": int(order_row["id"]),
+                "order_type": order_row["order_type"],
+            },
+        },
+    )
 
 
 app = create_app()

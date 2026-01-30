@@ -21,13 +21,21 @@ class TenantDatabase:
 
     def init(self) -> None:
         conn = self.connect()
-        conn.execute(
+        conn.executescript(
             """
             CREATE TABLE IF NOT EXISTS events (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 event_type TEXT NOT NULL,
                 payload_json TEXT NOT NULL,
                 received_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS kv_store (
+                namespace TEXT NOT NULL,
+                key TEXT NOT NULL,
+                value_json TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (namespace, key)
             );
             """
         )
@@ -47,8 +55,39 @@ class TenantDatabase:
         conn.commit()
         return int(cur.lastrowid)
 
+    def set_kv(self, namespace: str, key: str, value: dict[str, Any] | None) -> None:
+        conn = self.connect()
+        updated_at = datetime.now(tz=timezone.utc).isoformat()
+        value_json = json.dumps(value) if value is not None else None
+        conn.execute(
+            """
+            INSERT INTO kv_store (namespace, key, value_json, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(namespace, key) DO UPDATE SET
+                value_json = excluded.value_json,
+                updated_at = excluded.updated_at
+            """,
+            (namespace, key, value_json, updated_at),
+        )
+        conn.commit()
+
+    def get_kv(self, namespace: str, key: str) -> dict[str, Any] | None:
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT value_json FROM kv_store WHERE namespace = ? AND key = ?",
+            (namespace, key),
+        ).fetchone()
+        if not row or not row["value_json"]:
+            return None
+        try:
+            payload = json.loads(row["value_json"])
+        except (TypeError, ValueError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
 
 def ensure_tenant_db(path: Path) -> TenantDatabase:
     db = TenantDatabase(path)
     db.init()
     return db
+

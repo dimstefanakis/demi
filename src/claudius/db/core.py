@@ -5,7 +5,7 @@ import sqlite3
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
-from claudius.models import DomainOrder, NormalizedMessage, Tenant
+from claudius.models import NormalizedMessage, Tenant
 
 
 class Database:
@@ -61,18 +61,36 @@ class Database:
                 usage_json TEXT
             );
 
-            CREATE TABLE IF NOT EXISTS domain_orders (
+            CREATE TABLE IF NOT EXISTS billing_orders (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 tenant_id INTEGER NOT NULL,
-                domain TEXT NOT NULL,
+                order_type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 price_usd REAL,
                 currency TEXT,
-                quote_json TEXT,
                 stripe_session_id TEXT,
                 stripe_payment_url TEXT,
-                vercel_response_json TEXT,
+                stripe_subscription_id TEXT,
+                metadata_json TEXT,
                 error TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS supabase_projects (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                tenant_id INTEGER NOT NULL UNIQUE,
+                project_ref TEXT,
+                project_id TEXT,
+                project_name TEXT,
+                region TEXT,
+                status TEXT,
+                api_url TEXT,
+                publishable_key TEXT,
+                secret_key TEXT,
+                anon_key TEXT,
+                service_role_key TEXT,
+                raw_json TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -461,31 +479,31 @@ class Database:
         )
         conn.commit()
 
-    def create_domain_order(
+    def create_billing_order(
         self,
         tenant_id: int,
-        domain: str,
+        order_type: str,
         status: str,
         price_usd: float | None = None,
         currency: str | None = None,
-        quote_json: dict | None = None,
+        metadata: dict | None = None,
         error: str | None = None,
     ) -> int:
         conn = self.connect()
         now = datetime.now(tz=timezone.utc).isoformat()
         cur = conn.execute(
             """
-            INSERT INTO domain_orders (
-                tenant_id, domain, status, price_usd, currency, quote_json, error, created_at, updated_at
+            INSERT INTO billing_orders (
+                tenant_id, order_type, status, price_usd, currency, metadata_json, error, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tenant_id,
-                domain,
+                order_type,
                 status,
                 price_usd,
                 currency,
-                json.dumps(quote_json) if quote_json else None,
+                json.dumps(metadata) if metadata else None,
                 error,
                 now,
                 now,
@@ -494,7 +512,7 @@ class Database:
         conn.commit()
         return int(cur.lastrowid)
 
-    def update_domain_order_payment(
+    def update_billing_order_payment(
         self,
         order_id: int,
         stripe_session_id: str | None,
@@ -505,7 +523,7 @@ class Database:
         now = datetime.now(tz=timezone.utc).isoformat()
         conn.execute(
             """
-            UPDATE domain_orders
+            UPDATE billing_orders
             SET status = ?, stripe_session_id = ?, stripe_payment_url = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -513,45 +531,30 @@ class Database:
         )
         conn.commit()
 
-    def mark_domain_order_paid(self, order_id: int, stripe_session_id: str | None = None) -> None:
-        conn = self.connect()
-        now = datetime.now(tz=timezone.utc).isoformat()
-        conn.execute(
-            """
-            UPDATE domain_orders
-            SET status = ?, stripe_session_id = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            ("paid", stripe_session_id, now, order_id),
-        )
-        conn.commit()
-
-    def mark_domain_order_purchased(
-        self, order_id: int, vercel_response: dict | None = None
+    def mark_billing_order_paid(
+        self,
+        order_id: int,
+        stripe_session_id: str | None = None,
+        stripe_subscription_id: str | None = None,
     ) -> None:
         conn = self.connect()
         now = datetime.now(tz=timezone.utc).isoformat()
         conn.execute(
             """
-            UPDATE domain_orders
-            SET status = ?, vercel_response_json = ?, updated_at = ?
+            UPDATE billing_orders
+            SET status = ?, stripe_session_id = ?, stripe_subscription_id = ?, updated_at = ?
             WHERE id = ?
             """,
-            (
-                "purchased",
-                json.dumps(vercel_response) if vercel_response else None,
-                now,
-                order_id,
-            ),
+            ("paid", stripe_session_id, stripe_subscription_id, now, order_id),
         )
         conn.commit()
 
-    def mark_domain_order_failed(self, order_id: int, error: str) -> None:
+    def mark_billing_order_failed(self, order_id: int, error: str) -> None:
         conn = self.connect()
         now = datetime.now(tz=timezone.utc).isoformat()
         conn.execute(
             """
-            UPDATE domain_orders
+            UPDATE billing_orders
             SET status = ?, error = ?, updated_at = ?
             WHERE id = ?
             """,
@@ -559,28 +562,130 @@ class Database:
         )
         conn.commit()
 
-    def get_domain_order(self, order_id: int) -> DomainOrder | None:
+    def update_billing_order_status(
+        self,
+        order_id: int,
+        status: str,
+        error: str | None = None,
+        metadata: dict | None = None,
+    ) -> None:
         conn = self.connect()
-        row = conn.execute(
-            "SELECT * FROM domain_orders WHERE id = ?", (order_id,)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        metadata_json = None
+        if metadata:
+            row = conn.execute(
+                "SELECT metadata_json FROM billing_orders WHERE id = ?", (order_id,)
+            ).fetchone()
+            current = {}
+            if row and row["metadata_json"]:
+                try:
+                    current = json.loads(row["metadata_json"])
+                except (TypeError, ValueError):
+                    current = {}
+            current.update(metadata)
+            metadata_json = json.dumps(current)
+
+        if metadata_json is None:
+            conn.execute(
+                """
+                UPDATE billing_orders
+                SET status = ?, error = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, error, now, order_id),
+            )
+        else:
+            conn.execute(
+                """
+                UPDATE billing_orders
+                SET status = ?, error = ?, metadata_json = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (status, error, metadata_json, now, order_id),
+            )
+        conn.commit()
+
+    def get_billing_order(self, order_id: int) -> sqlite3.Row | None:
+        conn = self.connect()
+        return conn.execute(
+            "SELECT * FROM billing_orders WHERE id = ?", (order_id,)
         ).fetchone()
-        if not row:
-            return None
-        return DomainOrder(
-            id=row["id"],
-            tenant_id=row["tenant_id"],
-            domain=row["domain"],
-            status=row["status"],
-            price_usd=row["price_usd"],
-            currency=row["currency"],
-            quote_json=row["quote_json"],
-            stripe_session_id=row["stripe_session_id"],
-            stripe_payment_url=row["stripe_payment_url"],
-            vercel_response_json=row["vercel_response_json"],
-            error=row["error"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
+
+    def get_billing_order_by_subscription(self, subscription_id: str) -> sqlite3.Row | None:
+        conn = self.connect()
+        return conn.execute(
+            "SELECT * FROM billing_orders WHERE stripe_subscription_id = ?",
+            (subscription_id,),
+        ).fetchone()
+
+    def get_billing_order_by_session(self, session_id: str) -> sqlite3.Row | None:
+        conn = self.connect()
+        return conn.execute(
+            "SELECT * FROM billing_orders WHERE stripe_session_id = ?",
+            (session_id,),
+        ).fetchone()
+
+    def upsert_supabase_project(
+        self,
+        tenant_id: int,
+        project_ref: str | None,
+        project_id: str | None,
+        project_name: str | None,
+        region: str | None,
+        status: str | None,
+        api_url: str | None,
+        publishable_key: str | None,
+        secret_key: str | None,
+        anon_key: str | None,
+        service_role_key: str | None,
+        raw: dict | None = None,
+    ) -> None:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT INTO supabase_projects (
+                tenant_id, project_ref, project_id, project_name, region, status, api_url,
+                publishable_key, secret_key, anon_key, service_role_key, raw_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id) DO UPDATE SET
+                project_ref = excluded.project_ref,
+                project_id = excluded.project_id,
+                project_name = excluded.project_name,
+                region = excluded.region,
+                status = excluded.status,
+                api_url = excluded.api_url,
+                publishable_key = excluded.publishable_key,
+                secret_key = excluded.secret_key,
+                anon_key = excluded.anon_key,
+                service_role_key = excluded.service_role_key,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at
+            """,
+            (
+                tenant_id,
+                project_ref,
+                project_id,
+                project_name,
+                region,
+                status,
+                api_url,
+                publishable_key,
+                secret_key,
+                anon_key,
+                service_role_key,
+                json.dumps(raw) if raw else None,
+                now,
+                now,
+            ),
         )
+        conn.commit()
+
+    def get_supabase_project(self, tenant_id: int) -> sqlite3.Row | None:
+        conn = self.connect()
+        return conn.execute(
+            "SELECT * FROM supabase_projects WHERE tenant_id = ?", (tenant_id,)
+        ).fetchone()
 
     def _row_to_tenant(self, row: sqlite3.Row) -> Tenant:
         return Tenant(

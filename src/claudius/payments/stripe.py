@@ -9,6 +9,8 @@ from typing import Any
 
 import httpx
 
+from claudius.config import Settings
+
 
 @dataclass(frozen=True)
 class StripeConfig:
@@ -33,9 +35,8 @@ class StripeClient:
         *,
         amount_cents: int,
         currency: str,
-        domain: str,
-        tenant_id: int,
-        order_id: int,
+        product_name: str,
+        metadata: dict[str, str] | None = None,
     ) -> StripeSession:
         data = {
             "mode": "payment",
@@ -44,11 +45,11 @@ class StripeClient:
             "line_items[0][quantity]": "1",
             "line_items[0][price_data][currency]": currency.lower(),
             "line_items[0][price_data][unit_amount]": str(amount_cents),
-            "line_items[0][price_data][product_data][name]": f"Domain purchase: {domain}",
-            "metadata[domain]": domain,
-            "metadata[tenant_id]": str(tenant_id),
-            "metadata[domain_order_id]": str(order_id),
+            "line_items[0][price_data][product_data][name]": product_name,
         }
+        if metadata:
+            for key, value in metadata.items():
+                data[f"metadata[{key}]"] = str(value)
 
         headers = {
             "Authorization": f"Bearer {self.config.secret_key}",
@@ -64,6 +65,44 @@ class StripeClient:
             raise RuntimeError(
                 f"Stripe error: {response.status_code} {response.text}"
             )
+        payload = response.json()
+        return StripeSession(session_id=payload["id"], url=payload["url"])
+
+    async def create_recurring_checkout_session(
+        self,
+        *,
+        amount_cents: int,
+        currency: str,
+        product_name: str,
+        interval: str,
+        metadata: dict[str, str] | None = None,
+    ) -> StripeSession:
+        data = {
+            "mode": "subscription",
+            "success_url": self.config.success_url,
+            "cancel_url": self.config.cancel_url,
+            "line_items[0][quantity]": "1",
+            "line_items[0][price_data][currency]": currency.lower(),
+            "line_items[0][price_data][unit_amount]": str(amount_cents),
+            "line_items[0][price_data][product_data][name]": product_name,
+            "line_items[0][price_data][recurring][interval]": interval,
+        }
+        if metadata:
+            for key, value in metadata.items():
+                data[f"metadata[{key}]"] = str(value)
+
+        headers = {
+            "Authorization": f"Bearer {self.config.secret_key}",
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.stripe.com/v1/checkout/sessions",
+                data=data,
+                headers=headers,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"Stripe error: {response.status_code} {response.text}")
         payload = response.json()
         return StripeSession(session_id=payload["id"], url=payload["url"])
 
@@ -89,6 +128,30 @@ class StripeClient:
             raise ValueError("Invalid Stripe signature.")
 
         return json.loads(payload.decode("utf-8"))
+
+
+def build_stripe_config(settings: Settings) -> StripeConfig | None:
+    if not settings.stripe_secret_key or not settings.stripe_webhook_secret:
+        return None
+    success_url, cancel_url = derive_stripe_urls(settings)
+    if not success_url or not cancel_url:
+        return None
+    return StripeConfig(
+        secret_key=settings.stripe_secret_key,
+        webhook_secret=settings.stripe_webhook_secret,
+        success_url=success_url,
+        cancel_url=cancel_url,
+    )
+
+
+def derive_stripe_urls(settings: Settings) -> tuple[str | None, str | None]:
+    success_url = settings.stripe_success_url
+    cancel_url = settings.stripe_cancel_url
+    if (not success_url or not cancel_url) and settings.public_base_url:
+        base = settings.public_base_url.rstrip("/")
+        success_url = success_url or f"{base}/stripe/success"
+        cancel_url = cancel_url or f"{base}/stripe/cancel"
+    return success_url, cancel_url
 
 
 def _parse_signature_header(header: str) -> tuple[int | None, list[str]]:

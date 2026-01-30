@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 import json
@@ -12,6 +13,9 @@ from claudius.messaging.telegram import TelegramUpdateParser
 from claudius.agent.inflight import InflightTextStream
 from claudius.memory import build_summarization_prompt, read_logs
 from claudius.memory.logs import append_log, write_chat_history
+
+from claudius.failure_guard import clear_block, get_block, record_hard_failure
+from claudius.tenant_db import ensure_tenant_db
 
 
 @dataclass
@@ -35,10 +39,16 @@ class Orchestrator:
         if not user_payload and msg.images:
             user_payload = "(attachment)"
         workspace = await self._resolve_workspace(tenant)
+        if await self._handle_blocked(workspace.tasks_dir, tenant, user_payload=user_payload):
+            self.db.update_message_status(message_id, "processed")
+            return OrchestratorResult(status="blocked", detail="system_blocked")
         self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
         write_chat_history(workspace.tasks_dir)
 
         inflight_run = self.db.get_inflight_run(tenant.id)
+        if inflight_run:
+            if self._reconcile_inflight_run(tenant, inflight_run, workspace):
+                inflight_run = None
         if inflight_run and self._is_run_stale(
             inflight_run,
             max_age_seconds=900,
@@ -78,9 +88,23 @@ class Orchestrator:
         if tenant is None:
             return OrchestratorResult(status="invalid", detail="tenant_not_found")
 
+        workspace = await self._resolve_workspace(tenant)
+        event_intent = str(payload.get("intent") or "").strip()
+        event_type = str(payload.get("event_type") or "").strip()
+        if event_intent == "system_blocked" or event_type == "system_blocked":
+            if not get_block(workspace.tasks_dir, "system"):
+                return OrchestratorResult(status="accepted", detail="block_cleared")
+        else:
+            if await self._handle_blocked(workspace.tasks_dir, tenant, notify=False):
+                return OrchestratorResult(status="blocked", detail="system_blocked")
         inflight_run = self.db.get_inflight_run(tenant.id)
+        if inflight_run:
+            if self._reconcile_inflight_run(tenant, inflight_run, workspace):
+                inflight_run = None
         if inflight_run and not self._is_run_stale(inflight_run, max_age_seconds=900):
             return OrchestratorResult(status="busy", detail="tenant already running")
+        if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
+            await self._finalize_stale_run(tenant, inflight_run)
 
         event_type = str(payload.get("event_type") or "event").strip()
         event_payload = payload.get("payload") or {}
@@ -103,7 +127,7 @@ class Orchestrator:
             tenant=tenant,
             msg=msg,
             message_id=message_id,
-            process_pending=False,
+            process_pending=True,
         )
 
     async def _run_message(
@@ -363,8 +387,141 @@ class Orchestrator:
             return
         self.inflight_text_queues.pop(tenant_key, None)
 
+    async def _handle_blocked(
+        self,
+        tasks_dir: Path,
+        tenant: Any,
+        notify: bool = True,
+        user_payload: str | None = None,
+    ) -> bool:
+        self._ingest_tool_failures(tasks_dir)
+        block = get_block(tasks_dir, "system")
+        if user_payload and block:
+            if notify and self._should_notify_block(tasks_dir, block):
+                payload = {
+                    "event_type": "system_blocked",
+                    "intent": "system_blocked",
+                    "payload": {
+                        "summary": "System blocked",
+                        "reason": block.get("reason"),
+                        "count": block.get("count"),
+                    },
+                }
+                self.db.create_event_job(tenant.id, job_type="event", payload=payload)
+                self._mark_block_notified(tasks_dir, block)
+            self._clear_block_state(tasks_dir)
+            return False
+        if not block:
+            return False
+        if notify and self._should_notify_block(tasks_dir, block):
+            payload = {
+                "event_type": "system_blocked",
+                "intent": "system_blocked",
+                "payload": {
+                    "summary": "System blocked",
+                    "reason": block.get("reason"),
+                    "count": block.get("count"),
+                },
+            }
+            self.db.create_event_job(tenant.id, job_type="event", payload=payload)
+            self._mark_block_notified(tasks_dir, block)
+        return True
+
+    def _clear_block_state(self, tasks_dir: Path) -> None:
+        clear_block(tasks_dir, "system")
+        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+        db.set_kv("system", "block_notified", None)
+
+    def _reconcile_inflight_run(self, tenant: Any, run: Any, workspace: Workspace) -> bool:
+        result_path = workspace.tasks_dir / "run_result.json"
+        if not result_path.exists():
+            return False
+        try:
+            started_raw = run["started_at"]
+        except (KeyError, TypeError):
+            started_raw = None
+        if started_raw:
+            try:
+                started_at = datetime.fromisoformat(started_raw)
+                if started_at.tzinfo is None:
+                    started_at = started_at.replace(tzinfo=timezone.utc)
+                result_time = datetime.fromtimestamp(
+                    result_path.stat().st_mtime, tz=timezone.utc
+                )
+                if result_time < started_at:
+                    return False
+            except (ValueError, OSError):
+                pass
+        try:
+            payload = json.loads(result_path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        error = payload.get("error")
+        status = "failed" if error else "completed"
+        run_id = run.get("id") if hasattr(run, "get") else run["id"]
+        total_cost = payload.get("total_cost_usd")
+        usage = payload.get("usage")
+        if total_cost is not None or usage is not None:
+            self.db.update_run_usage(run_id, total_cost_usd=total_cost, usage=usage)
+        self.db.finish_run(run_id, status=status, error=error)
+        session_id = payload.get("session_id")
+        if session_id:
+            self.db.update_tenant_session(tenant.id, session_id)
+        message_id = run.get("message_id") if hasattr(run, "get") else run["message_id"]
+        if message_id:
+            self.db.update_message_status(
+                int(message_id), "processed" if status == "completed" else "failed"
+            )
+        self._clear_inflight_stream(tenant.key)
+        return True
+
     def _supports_inflight_stream(self) -> bool:
         return bool(getattr(self.agent, "supports_inflight_stream", False))
+
+    def _ingest_tool_failures(self, tasks_dir: Path) -> None:
+        path = tasks_dir / "tool_runs.jsonl"
+        if not path.exists():
+            return
+        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+        cursor = db.get_kv("system", "tool_runs_cursor") or {}
+        last_ts = cursor.get("timestamp")
+        latest_ts = last_ts
+
+        for line in path.read_text().splitlines():
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            ts = entry.get("timestamp")
+            if last_ts and ts and ts <= last_ts:
+                continue
+            if ts:
+                latest_ts = ts
+            result = entry.get("result")
+            if isinstance(result, dict):
+                status = str(result.get("status") or "").strip().lower()
+                if status in {"missing_token", "missing_org", "missing_context", "blocked"}:
+                    record_hard_failure(
+                        tasks_dir,
+                        "system",
+                        reason=f"{entry.get('tool')}:{status}",
+                        max_failures=2,
+                    )
+        if latest_ts and latest_ts != last_ts:
+            db.set_kv("system", "tool_runs_cursor", {"timestamp": latest_ts})
+
+    def _should_notify_block(self, tasks_dir: Path, block: dict[str, Any]) -> bool:
+        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+        cursor = db.get_kv("system", "block_notified") or {}
+        last_at = cursor.get("at")
+        block_at = block.get("at")
+        if not block_at:
+            return True
+        return last_at != block_at
+
+    def _mark_block_notified(self, tasks_dir: Path, block: dict[str, Any]) -> None:
+        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+        db.set_kv("system", "block_notified", {"at": block.get("at")})
 
     @staticmethod
     def _read_optional_file(path: Path) -> str | None:

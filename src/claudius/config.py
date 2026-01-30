@@ -23,6 +23,17 @@ class Settings(BaseSettings):
     vercel_token: str | None = None
     vercel_scope: str | None = None
 
+    public_base_url: str | None = None
+
+    supabase_access_token: str | None = None
+    supabase_org_slug: str | None = None
+    supabase_org_id: str | None = None
+    supabase_region_selection: str = "americas"
+    supabase_region: str | None = None
+    supabase_instance_size: str = "micro"
+    supabase_project_prefix: str = "claudius"
+    supabase_api_base_url: str = "https://api.supabase.com"
+
     agent_runtime: str = "local"
     docker_image: str = "claudius-agent:local"
     docker_pool_size: int = 1

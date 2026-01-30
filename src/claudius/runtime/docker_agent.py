@@ -55,6 +55,10 @@ class DockerAgent:
             )
 
         result = self._read_result(result_path)
+        if not result:
+            raise RuntimeError("agent_result_missing")
+        if result.get("error"):
+            raise RuntimeError(str(result.get("error")))
         self._maybe_update_deploy(db, tenant_id, workspace.tasks_dir)
         if self.forward_messages and messenger and outbound_path.exists():
             await self._forward_messages(outbound_path, messenger, message.tenant_external_id)
@@ -133,6 +137,18 @@ class DockerAgent:
             "VERCEL_TOKEN",
             "VERCEL_SCOPE",
             "EVENT_URL",
+            "STRIPE_SECRET_KEY",
+            "STRIPE_WEBHOOK_SECRET",
+            "STRIPE_SUCCESS_URL",
+            "STRIPE_CANCEL_URL",
+            "PUBLIC_BASE_URL",
+            "SUPABASE_ACCESS_TOKEN",
+            "SUPABASE_ORG_SLUG",
+            "SUPABASE_ORG_ID",
+            "SUPABASE_REGION_SELECTION",
+            "SUPABASE_REGION",
+            "SUPABASE_INSTANCE_SIZE",
+            "SUPABASE_PROJECT_PREFIX",
             "CLAUDE_PLUGINS",
             "ANTHROPIC_API_KEY",
             "CLAUDE_API_KEY",
@@ -149,6 +165,18 @@ class DockerAgent:
             "VERCEL_TOKEN": self.settings.vercel_token,
             "VERCEL_SCOPE": self.settings.vercel_scope,
             "EVENT_URL": self.settings.event_url,
+            "STRIPE_SECRET_KEY": self.settings.stripe_secret_key,
+            "STRIPE_WEBHOOK_SECRET": self.settings.stripe_webhook_secret,
+            "STRIPE_SUCCESS_URL": self.settings.stripe_success_url,
+            "STRIPE_CANCEL_URL": self.settings.stripe_cancel_url,
+            "PUBLIC_BASE_URL": self.settings.public_base_url,
+            "SUPABASE_ACCESS_TOKEN": self.settings.supabase_access_token,
+            "SUPABASE_ORG_SLUG": self.settings.supabase_org_slug,
+            "SUPABASE_ORG_ID": self.settings.supabase_org_id,
+            "SUPABASE_REGION_SELECTION": self.settings.supabase_region_selection,
+            "SUPABASE_REGION": self.settings.supabase_region,
+            "SUPABASE_INSTANCE_SIZE": self.settings.supabase_instance_size,
+            "SUPABASE_PROJECT_PREFIX": self.settings.supabase_project_prefix,
             "ANTHROPIC_API_KEY": self.settings.anthropic_api_key,
             "CLAUDE_API_KEY": self.settings.claude_api_key,
             "GEMINI_API_KEY": self.settings.gemini_api_key,
