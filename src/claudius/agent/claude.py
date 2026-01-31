@@ -86,6 +86,7 @@ class ClaudeAgent:
         UNSPLASH_SEARCH_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__decide_project",
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+        f"mcp__{CHAT_SERVER_NAME}__ack_inflight_updates",
         SEND_MESSAGE_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
         f"mcp__{CHAT_SERVER_NAME}__record_deploy",

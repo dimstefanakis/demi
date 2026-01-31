@@ -192,6 +192,73 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         }
 
     @tool(
+        "ack_inflight_updates",
+        "Record that in-flight updates were consumed so they won't be re-queued.",
+        {"message_ids": list, "provider_message_ids": list, "updates": list, "clear": bool},
+    )
+    async def ack_inflight_updates(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        updates: list[dict[str, Any]] = []
+        raw_updates = args.get("updates")
+        if isinstance(raw_updates, list):
+            for item in raw_updates:
+                if not isinstance(item, dict):
+                    continue
+                updates.append(item)
+        else:
+            message_ids = args.get("message_ids") or []
+            provider_ids = args.get("provider_message_ids") or []
+            if not isinstance(message_ids, list):
+                message_ids = [message_ids]
+            if not isinstance(provider_ids, list):
+                provider_ids = [provider_ids]
+            for idx, raw_id in enumerate(message_ids):
+                entry: dict[str, Any] = {"message_id": raw_id}
+                if idx < len(provider_ids):
+                    entry["provider_message_id"] = provider_ids[idx]
+                updates.append(entry)
+        clear = bool(args.get("clear", True))
+
+        if not updates:
+            payload = {"ok": False, "status": "no_updates"}
+            _log("ack_inflight_updates", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
+
+        consumed_path = context.tasks_dir / "inflight_consumed.jsonl"
+        consumed_path.parent.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(tz=timezone.utc).isoformat()
+        written = 0
+        with consumed_path.open("a", encoding="utf-8") as handle:
+            for update in updates:
+                if not isinstance(update, dict):
+                    continue
+                entry = {"timestamp": timestamp}
+                if "message_id" in update:
+                    entry["message_id"] = update.get("message_id")
+                if "provider_message_id" in update:
+                    entry["provider_message_id"] = update.get("provider_message_id")
+                handle.write(json.dumps(entry) + "\n")
+                written += 1
+
+        if clear:
+            inflight_path = context.tasks_dir / "inflight_updates.jsonl"
+            if inflight_path.exists():
+                try:
+                    inflight_path.unlink()
+                except OSError:
+                    pass
+
+        payload = {"ok": True, "count": written}
+        _log("ack_inflight_updates", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
         "send_payment_link",
         "Send a payment link message using the stored Stripe URL for a billing order.",
         {
@@ -889,6 +956,7 @@ def _migrate_current_task_context(tasks_dir: Path, target_tasks_dir: Path) -> bo
         "summary_prompt.md",
         "memory_prompt.md",
         "inflight_updates.jsonl",
+        "inflight_consumed.jsonl",
         "run_request.json",
         "run_result.json",
         "outbound_messages.jsonl",

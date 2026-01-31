@@ -327,6 +327,8 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 - If tasks/inflight_updates.jsonl exists, read it before heavy steps (Gemini/build/deploy) and after each major phase.
 - When you receive an IN-FLIGHT UPDATE (streamed or from the file), immediately ask the interaction-agent
   to send a short acknowledgment that you received the new request and will handle it after the current work.
+- After reading tasks/inflight_updates.jsonl, call mcp__claudius-chat__ack_inflight_updates with the
+  message_id values from the file to mark them consumed, then clear the file.
 - If updates materially change the request (e.g., "ignore that" or new assets), ask the interaction-agent
   to send a brief restart notice in your own words, then exit.
 - Never interrupt mid-command; only stop between phases.

@@ -99,7 +99,7 @@ class Orchestrator:
             asset_paths = []
             if msg.images and hasattr(self.messenger, "download_images"):
                 asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
-            self._append_inflight_update(workspace.tasks_dir, msg, asset_paths)
+            self._append_inflight_update(workspace.tasks_dir, msg, asset_paths, message_id)
             self._write_request_status(workspace, tenant)
             await self._send_busy_ack(workspace, tenant, msg)
             return OrchestratorResult(status="busy", detail="tenant already running")
@@ -254,6 +254,9 @@ class Orchestrator:
                     pass
 
     async def _drain_pending_messages(self, tenant, project_name: str | None = None) -> None:
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
+        self._consume_inflight_updates(workspace.tasks_dir)
+
         rows = self.db.get_pending_messages(tenant.id, project_name=project_name)
         if not rows:
             return
@@ -265,7 +268,6 @@ class Orchestrator:
             return
 
         self.db.update_message_statuses(message_ids, "processing")
-        workspace = await self._resolve_workspace(tenant, project_name=project_name)
         inflight_path = self._inflight_updates_path(workspace.tasks_dir)
         if inflight_path.exists():
             try:
@@ -459,7 +461,7 @@ class Orchestrator:
 
     @staticmethod
     def _append_inflight_update(
-        tasks_dir: Path, msg: NormalizedMessage, asset_paths: list[str]
+        tasks_dir: Path, msg: NormalizedMessage, asset_paths: list[str], message_id: int
     ) -> None:
         updates_path = tasks_dir / "inflight_updates.jsonl"
         payload = {
@@ -467,10 +469,40 @@ class Orchestrator:
             "text": msg.text or "",
             "assets": asset_paths or [],
             "provider_message_id": msg.provider_message_id,
+            "message_id": message_id,
         }
         updates_path.parent.mkdir(parents=True, exist_ok=True)
         with updates_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+
+    def _consume_inflight_updates(self, tasks_dir: Path) -> list[int]:
+        consumed_path = tasks_dir / "inflight_consumed.jsonl"
+        if not consumed_path.exists():
+            return []
+        message_ids: list[int] = []
+        for line in consumed_path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            raw_id = payload.get("message_id")
+            try:
+                message_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            message_ids.append(message_id)
+        if message_ids:
+            self.db.update_message_statuses(message_ids, "processed")
+        try:
+            consumed_path.unlink()
+        except OSError:
+            pass
+        return message_ids
 
     def _write_request_status(self, workspace: Workspace, tenant: Any) -> None:
         try:
@@ -582,7 +614,12 @@ class Orchestrator:
         self.db.clear_pending_and_processing_messages(tenant.id, project_name)
         self._clear_inflight_stream(tenant.key, project_name)
         self._clear_run_artifacts(workspace.tasks_dir)
-        for name in ("inflight_updates.jsonl", "run_request.json", "run_result.json"):
+        for name in (
+            "inflight_updates.jsonl",
+            "inflight_consumed.jsonl",
+            "run_request.json",
+            "run_result.json",
+        ):
             path = workspace.tasks_dir / name
             if path.exists():
                 try:
