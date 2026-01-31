@@ -3,7 +3,8 @@
 ## Product & Architecture Overview
 - Telegram-first (WhatsApp later) chat agent that builds and edits SMB websites via conversation.
 - Core flow: chat orchestrator → agent runtime (Claude) → Gemini CLI with `DESIGN.md` → build → Vercel deploy.
-- Per-tenant workspace lives under `data/` and includes `memory.md`, `tasks/`, `assets/`, and `site/`.
+- Per-tenant root lives under `data/` and includes `projects/<project_name>/` which contains
+  `memory.md`, `DESCRIPTION.md`, `tasks/`, `assets/`, and `site/` per project.
 - Product constraints to preserve: no templates, fast first result, edit-by-chat loop, Unsplash-sourced images (no AI art).
 
 ## Project Structure & Module Organization

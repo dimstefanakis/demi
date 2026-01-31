@@ -2,23 +2,34 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Any
 
 from claudius.models import NormalizedMessage, Tenant
+from claudius.db.sqlite_utils import configure_sqlite_connection
+from claudius.config import Settings
 
 
 class Database:
     def __init__(self, db_path: Path):
         self.db_path = Path(db_path)
-        self._conn: sqlite3.Connection | None = None
+        self._local = threading.local()
 
     def connect(self) -> sqlite3.Connection:
-        if self._conn is None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self.db_path)
-            self._conn.row_factory = sqlite3.Row
-        return self._conn
+            settings = Settings()
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=settings.sqlite_timeout_seconds,
+            )
+            conn.row_factory = sqlite3.Row
+            configure_sqlite_connection(conn)
+            self._local.conn = conn
+        return conn
 
     def init(self) -> None:
         conn = self.connect()
@@ -45,6 +56,7 @@ class Database:
                 received_at TEXT NOT NULL,
                 text TEXT,
                 raw_json TEXT,
+                project_name TEXT,
                 status TEXT,
                 UNIQUE(tenant_id, provider_message_id)
             );
@@ -58,7 +70,11 @@ class Database:
                 finished_at TEXT,
                 error TEXT,
                 total_cost_usd REAL,
-                usage_json TEXT
+                usage_json TEXT,
+                project_name TEXT,
+                lease_expires_at TEXT,
+                last_heartbeat_at TEXT,
+                last_activity_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS billing_orders (
@@ -111,6 +127,8 @@ class Database:
         )
         self._migrate_messages_unique_index(conn)
         self._migrate_runs_usage_columns(conn)
+        self._migrate_messages_project_column(conn)
+        self._migrate_runs_lease_columns(conn)
         conn.commit()
 
     def _migrate_messages_unique_index(self, conn: sqlite3.Connection) -> None:
@@ -123,6 +141,9 @@ class Database:
         if self._has_unique_index(conn, "messages", ["tenant_id", "provider_message_id"]):
             return
 
+        columns = {info["name"] for info in conn.execute("PRAGMA table_info(messages);").fetchall()}
+        has_project = "project_name" in columns
+
         conn.execute(
             """
             CREATE TABLE messages_new (
@@ -133,18 +154,36 @@ class Database:
                 received_at TEXT NOT NULL,
                 text TEXT,
                 raw_json TEXT,
+                project_name TEXT,
                 status TEXT,
                 UNIQUE(tenant_id, provider_message_id)
             );
             """
         )
-        conn.execute(
-            """
-            INSERT INTO messages_new (id, tenant_id, provider, provider_message_id, received_at, text, raw_json, status)
-            SELECT id, tenant_id, provider, provider_message_id, received_at, text, raw_json, status
-            FROM messages;
-            """
-        )
+        if has_project:
+            conn.execute(
+                """
+                INSERT INTO messages_new (
+                    id, tenant_id, provider, provider_message_id, received_at, text, raw_json,
+                    project_name, status
+                )
+                SELECT id, tenant_id, provider, provider_message_id, received_at, text, raw_json,
+                       project_name, status
+                FROM messages;
+                """
+            )
+        else:
+            conn.execute(
+                """
+                INSERT INTO messages_new (
+                    id, tenant_id, provider, provider_message_id, received_at, text, raw_json,
+                    project_name, status
+                )
+                SELECT id, tenant_id, provider, provider_message_id, received_at, text, raw_json,
+                       NULL, status
+                FROM messages;
+                """
+            )
         conn.execute("DROP TABLE messages;")
         conn.execute("ALTER TABLE messages_new RENAME TO messages;")
 
@@ -160,6 +199,32 @@ class Database:
             conn.execute("ALTER TABLE runs ADD COLUMN total_cost_usd REAL;")
         if "usage_json" not in columns:
             conn.execute("ALTER TABLE runs ADD COLUMN usage_json TEXT;")
+
+    def _migrate_runs_lease_columns(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='runs'"
+        ).fetchone()
+        if not row:
+            return
+        columns = {info["name"] for info in conn.execute("PRAGMA table_info(runs);").fetchall()}
+        if "project_name" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN project_name TEXT;")
+        if "lease_expires_at" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN lease_expires_at TEXT;")
+        if "last_heartbeat_at" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN last_heartbeat_at TEXT;")
+        if "last_activity_at" not in columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN last_activity_at TEXT;")
+
+    def _migrate_messages_project_column(self, conn: sqlite3.Connection) -> None:
+        row = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+        ).fetchone()
+        if not row:
+            return
+        columns = {info["name"] for info in conn.execute("PRAGMA table_info(messages);").fetchall()}
+        if "project_name" not in columns:
+            conn.execute("ALTER TABLE messages ADD COLUMN project_name TEXT;")
 
     @staticmethod
     def _has_unique_index(
@@ -271,7 +336,10 @@ class Database:
             run_after = now
         cur = conn.execute(
             """
-            INSERT INTO event_jobs (tenant_id, job_type, payload_json, status, attempts, run_after, last_error, created_at, updated_at)
+            INSERT INTO event_jobs (
+                tenant_id, job_type, payload_json, status, attempts, run_after,
+                last_error, created_at, updated_at
+            )
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -361,8 +429,11 @@ class Database:
         raw_json = json.dumps(msg.raw)
         cur = conn.execute(
             """
-            INSERT OR IGNORE INTO messages (tenant_id, provider, provider_message_id, received_at, text, raw_json, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT OR IGNORE INTO messages (
+                tenant_id, provider, provider_message_id, received_at, text, raw_json,
+                status, project_name
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 tenant_id,
@@ -372,6 +443,7 @@ class Database:
                 msg.text,
                 raw_json,
                 "received",
+                msg.project_name,
             ),
         )
         conn.commit()
@@ -394,8 +466,28 @@ class Database:
         )
         conn.commit()
 
-    def get_next_pending_message(self, tenant_id: int) -> sqlite3.Row | None:
+    def update_message_project(self, message_id: int, project_name: str | None) -> None:
         conn = self.connect()
+        conn.execute(
+            "UPDATE messages SET project_name = ? WHERE id = ?",
+            (project_name, message_id),
+        )
+        conn.commit()
+
+    def get_next_pending_message(
+        self, tenant_id: int, project_name: str | None = None
+    ) -> sqlite3.Row | None:
+        conn = self.connect()
+        if project_name:
+            return conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE tenant_id = ? AND status = 'pending' AND project_name = ?
+                ORDER BY received_at ASC
+                LIMIT 1
+                """,
+                (tenant_id, project_name),
+            ).fetchone()
         return conn.execute(
             """
             SELECT * FROM messages
@@ -406,17 +498,133 @@ class Database:
             (tenant_id,),
         ).fetchone()
 
-    def get_pending_messages(self, tenant_id: int) -> list[sqlite3.Row]:
+    def get_pending_messages(
+        self, tenant_id: int, project_name: str | None = None
+    ) -> list[sqlite3.Row]:
+        conn = self.connect()
+        if project_name:
+            rows = conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE tenant_id = ? AND status = 'pending' AND project_name = ?
+                ORDER BY received_at ASC
+                """,
+                (tenant_id, project_name),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                """
+                SELECT * FROM messages
+                WHERE tenant_id = ? AND status = 'pending'
+                ORDER BY received_at ASC
+                """,
+                (tenant_id,),
+            ).fetchall()
+        return list(rows or [])
+
+    def fetch_pending_message_groups(self, limit: int = 25) -> list[dict[str, Any]]:
         conn = self.connect()
         rows = conn.execute(
             """
-            SELECT * FROM messages
-            WHERE tenant_id = ? AND status = 'pending'
-            ORDER BY received_at ASC
+            SELECT tenant_id, project_name, MIN(received_at) AS oldest_received_at
+            FROM messages
+            WHERE status = 'pending'
+            GROUP BY tenant_id, project_name
+            ORDER BY oldest_received_at ASC
+            LIMIT ?
             """,
-            (tenant_id,),
+            (limit,),
         ).fetchall()
-        return list(rows or [])
+        return [dict(row) for row in rows]
+
+    def fetch_processing_message_groups(self, limit: int = 25) -> list[dict[str, Any]]:
+        conn = self.connect()
+        rows = conn.execute(
+            """
+            SELECT tenant_id, project_name, MIN(received_at) AS oldest_received_at
+            FROM messages
+            WHERE status = 'processing'
+            GROUP BY tenant_id, project_name
+            ORDER BY oldest_received_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def requeue_processing_messages(self, tenant_id: int, project_name: str | None) -> int:
+        conn = self.connect()
+        if project_name:
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET status = 'pending'
+                WHERE tenant_id = ? AND project_name = ? AND status = 'processing'
+                """,
+                (tenant_id, project_name),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET status = 'pending'
+                WHERE tenant_id = ? AND status = 'processing'
+                """,
+                (tenant_id,),
+            )
+        conn.commit()
+        return cur.rowcount
+
+    def clear_pending_and_processing_messages(
+        self, tenant_id: int, project_name: str | None
+    ) -> int:
+        conn = self.connect()
+        if project_name:
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET status = 'processed'
+                WHERE tenant_id = ? AND project_name = ? AND status IN ('pending', 'processing')
+                """,
+                (tenant_id, project_name),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE messages
+                SET status = 'processed'
+                WHERE tenant_id = ? AND status IN ('pending', 'processing')
+                """,
+                (tenant_id,),
+            )
+        conn.commit()
+        return cur.rowcount
+
+    def finish_running_runs(
+        self, tenant_id: int, project_name: str | None, error: str
+    ) -> int:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        if project_name:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', finished_at = ?, error = ?
+                WHERE tenant_id = ? AND project_name = ? AND status = 'running'
+                """,
+                (now, error, tenant_id, project_name),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', finished_at = ?, error = ?
+                WHERE tenant_id = ? AND status = 'running'
+                """,
+                (now, error, tenant_id),
+            )
+        conn.commit()
+        return cur.rowcount
 
     def update_message_statuses(self, message_ids: list[int], status: str) -> None:
         if not message_ids:
@@ -429,30 +637,127 @@ class Database:
         )
         conn.commit()
 
-    def has_inflight_run(self, tenant_id: int) -> bool:
+    def has_inflight_run(self, tenant_id: int, project_name: str | None = None) -> bool:
         conn = self.connect()
-        row = conn.execute(
-            "SELECT 1 FROM runs WHERE tenant_id = ? AND status = 'running' LIMIT 1",
-            (tenant_id,),
-        ).fetchone()
+        if project_name:
+            row = conn.execute(
+                """
+                SELECT 1 FROM runs
+                WHERE tenant_id = ? AND project_name = ? AND status = 'running'
+                LIMIT 1
+                """,
+                (tenant_id, project_name),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT 1 FROM runs WHERE tenant_id = ? AND status = 'running' LIMIT 1",
+                (tenant_id,),
+            ).fetchone()
         return row is not None
 
-    def get_inflight_run(self, tenant_id: int) -> sqlite3.Row | None:
+    def get_inflight_run(
+        self, tenant_id: int, project_name: str | None = None
+    ) -> sqlite3.Row | None:
         conn = self.connect()
+        if project_name:
+            return conn.execute(
+                """
+                SELECT * FROM runs
+                WHERE tenant_id = ? AND project_name = ? AND status = 'running'
+                ORDER BY started_at DESC
+                LIMIT 1
+                """,
+                (tenant_id, project_name),
+            ).fetchone()
         return conn.execute(
             "SELECT * FROM runs WHERE tenant_id = ? AND status = 'running' LIMIT 1",
             (tenant_id,),
         ).fetchone()
 
-    def create_run(self, tenant_id: int, message_id: int | None = None) -> int:
+    def create_run(
+        self,
+        tenant_id: int,
+        message_id: int | None = None,
+        project_name: str | None = None,
+        lease_seconds: int | None = None,
+    ) -> int:
         conn = self.connect()
-        now = datetime.now(tz=timezone.utc).isoformat()
+        now_dt = datetime.now(tz=timezone.utc)
+        now = now_dt.isoformat()
+        lease_expires = None
+        if lease_seconds is not None:
+            lease_expires = (now_dt + timedelta(seconds=lease_seconds)).isoformat()
         cur = conn.execute(
-            "INSERT INTO runs (tenant_id, message_id, status, started_at) VALUES (?, ?, 'running', ?)",
-            (tenant_id, message_id or 0, now),
+            """
+            INSERT INTO runs (
+                tenant_id, message_id, status, started_at, project_name,
+                lease_expires_at, last_heartbeat_at, last_activity_at
+            )
+            VALUES (?, ?, 'running', ?, ?, ?, ?, ?)
+            """,
+            (
+                tenant_id,
+                message_id or 0,
+                now,
+                project_name,
+                lease_expires,
+                now,
+                now,
+            ),
         )
         conn.commit()
         return int(cur.lastrowid)
+
+    def update_run_lease(
+        self,
+        run_id: int,
+        lease_expires_at: str | None,
+        last_activity_at: str | None = None,
+        last_heartbeat_at: str | None = None,
+    ) -> None:
+        conn = self.connect()
+        fields = ["lease_expires_at = ?"]
+        params: list[Any] = [lease_expires_at]
+        if last_activity_at is not None:
+            fields.append("last_activity_at = ?")
+            params.append(last_activity_at)
+        if last_heartbeat_at is not None:
+            fields.append("last_heartbeat_at = ?")
+            params.append(last_heartbeat_at)
+        params.append(run_id)
+        conn.execute(
+            f"UPDATE runs SET {', '.join(fields)} WHERE id = ?",
+            params,
+        )
+        conn.commit()
+
+    def expire_stale_runs(
+        self, tenant_id: int, project_name: str | None, now: datetime
+    ) -> int:
+        conn = self.connect()
+        now_str = now.isoformat()
+        if project_name:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', finished_at = ?, error = ?
+                WHERE tenant_id = ? AND project_name = ? AND status = 'running'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                """,
+                (now_str, "lease_expired", tenant_id, project_name, now_str),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE runs
+                SET status = 'failed', finished_at = ?, error = ?
+                WHERE tenant_id = ? AND status = 'running'
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?
+                """,
+                (now_str, "lease_expired", tenant_id, now_str),
+            )
+        conn.commit()
+        return cur.rowcount
 
     def finish_run(self, run_id: int, status: str = "completed", error: str | None = None) -> None:
         conn = self.connect()
@@ -494,7 +799,8 @@ class Database:
         cur = conn.execute(
             """
             INSERT INTO billing_orders (
-                tenant_id, order_type, status, price_usd, currency, metadata_json, error, created_at, updated_at
+                tenant_id, order_type, status, price_usd, currency, metadata_json,
+                error, created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
@@ -578,10 +884,14 @@ class Database:
             ).fetchone()
             current = {}
             if row and row["metadata_json"]:
-                try:
-                    current = json.loads(row["metadata_json"])
-                except (TypeError, ValueError):
-                    current = {}
+                raw = row["metadata_json"]
+                if isinstance(raw, dict):
+                    current = raw
+                else:
+                    try:
+                        current = json.loads(raw)
+                    except (TypeError, ValueError):
+                        current = {}
             current.update(metadata)
             metadata_json = json.dumps(current)
 
@@ -646,7 +956,8 @@ class Database:
             """
             INSERT INTO supabase_projects (
                 tenant_id, project_ref, project_id, project_name, region, status, api_url,
-                publishable_key, secret_key, anon_key, service_role_key, raw_json, created_at, updated_at
+                publishable_key, secret_key, anon_key, service_role_key, raw_json,
+                created_at, updated_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(tenant_id) DO UPDATE SET
                 project_ref = excluded.project_ref,

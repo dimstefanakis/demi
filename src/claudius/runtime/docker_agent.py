@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 from claudius.agent.claude import AgentResult
+from claudius.agent.claude import ClaudeAgent
 from claudius.config import Settings
 from claudius.runtime.docker_pool import DockerPool
 
@@ -31,26 +32,29 @@ class DockerAgent:
         payments=None,
         session_id=None,
     ) -> AgentResult:
+        tenant_root = getattr(workspace, "tenant_root", workspace.root)
         request_path = workspace.tasks_dir / "run_request.json"
         result_path = workspace.tasks_dir / "run_result.json"
         outbound_path = workspace.tasks_dir / "outbound_messages.jsonl"
 
-        request_payload = self._build_request(workspace.root, task_path, message, session_id)
+        request_payload = self._build_request(
+            tenant_root, workspace.root, task_path, message, session_id
+        )
         request_path.write_text(json.dumps(request_payload, indent=2))
 
         env = self._build_env()
-        slot = self.pool.pop_container_for_workspace(workspace.root)
+        slot = self.pool.pop_container_for_workspace(tenant_root)
         if slot:
             await self.pool.exec_in_container(
                 slot,
-                self._entrypoint_command(workspace.root, request_path),
+                self._entrypoint_command(tenant_root, request_path),
                 env=env,
             )
             await self.pool.retire_container(slot)
         else:
             await self.pool.run_in_fresh_container(
-                workspace.root,
-                self._entrypoint_command(workspace.root, request_path),
+                tenant_root,
+                self._entrypoint_command(tenant_root, request_path),
                 env=env,
             )
 
@@ -73,26 +77,83 @@ class DockerAgent:
             usage=result.get("usage"),
         )
 
-    def _entrypoint_command(self, workspace_root: Path, request_path: Path) -> list[str]:
-        container_request = self._container_path(workspace_root, request_path)
+    async def send_interaction_message(
+        self,
+        workspace,
+        text: str,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+    ) -> None:
+        interaction_agent = ClaudeAgent()
+        await interaction_agent.send_interaction_message(
+            workspace=workspace,
+            text=text,
+            messenger=messenger,
+            tenant_id=tenant_id,
+            db=db,
+            payments=payments,
+            session_id=session_id,
+            provider=provider,
+            tenant_external_id=tenant_external_id,
+        )
+
+    async def send_interaction_instruction(
+        self,
+        workspace,
+        instruction: str,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+    ) -> None:
+        interaction_agent = ClaudeAgent()
+        await interaction_agent.send_interaction_instruction(
+            workspace=workspace,
+            instruction=instruction,
+            messenger=messenger,
+            tenant_id=tenant_id,
+            db=db,
+            payments=payments,
+            session_id=session_id,
+            provider=provider,
+            tenant_external_id=tenant_external_id,
+        )
+
+    def _entrypoint_command(self, tenant_root: Path, request_path: Path) -> list[str]:
+        container_request = self._container_path(tenant_root, request_path)
         return ["python", "-m", "claudius.runtime.agent_entrypoint", "--request", container_request]
 
-    def _container_path(self, workspace_root: Path, host_path: Path) -> str:
+    def _container_path(self, tenant_root: Path, host_path: Path) -> str:
         try:
-            rel = host_path.relative_to(workspace_root)
+            rel = host_path.relative_to(tenant_root)
         except ValueError:
             rel = host_path.name
         return str(Path(self.mount_path) / rel)
 
-    def _build_request(self, workspace_root: Path, task_path: Path, message, session_id: str | None) -> dict[str, Any]:
+    def _build_request(
+        self,
+        tenant_root: Path,
+        project_root: Path,
+        task_path: Path,
+        message,
+        session_id: str | None,
+    ) -> dict[str, Any]:
         try:
-            relative_task = task_path.relative_to(workspace_root)
+            relative_task = task_path.relative_to(tenant_root)
             container_task = str(Path(self.mount_path) / relative_task)
         except ValueError:
             container_task = str(Path(self.mount_path) / "tasks" / task_path.name)
 
         return {
-            "workspace_root": self.mount_path,
+            "workspace_root": self._container_path(tenant_root, project_root),
             "task_path": container_task,
             "session_id": session_id,
             "message": {

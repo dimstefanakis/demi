@@ -21,6 +21,7 @@ class NormalizedMessage:
     text: str | None
     images: list[Attachment]
     raw: dict[str, Any]
+    project_name: str | None = None
 
     @property
     def tenant_key(self) -> str:
@@ -45,4 +46,3 @@ class Tenant:
 class OrchestratorResult:
     status: str
     detail: str | None = None
-

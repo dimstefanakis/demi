@@ -11,9 +11,10 @@ import json
 import re
 
 from claudius.db.core import Database
-from claudius.memory.logs import append_log, read_logs, write_chat_history
+from claudius.memory.logs import append_log, write_chat_history
 from claudius.agent.tool_logging import log_tool_run
 from claudius.config import Settings
+from claudius.workspace.project_decider import decide_project as decide_project_for_tenant
 from claudius.payments.stripe import StripeClient, StripeConfig, build_stripe_config
 from claudius.tenant_db import ensure_tenant_db
 
@@ -46,7 +47,13 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             return None
         return StripeClient(config)
 
-    def _log(tool_name: str, args: dict[str, Any], result: Any | None = None, error: str | None = None, start: float | None = None) -> None:
+    def _log(
+        tool_name: str,
+        args: dict[str, Any],
+        result: Any | None = None,
+        error: str | None = None,
+        start: float | None = None,
+    ) -> None:
         duration_ms = None
         if start is not None:
             duration_ms = (time.monotonic() - start) * 1000.0
@@ -74,9 +81,58 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
             }
-        decision = _should_send(text, context.tasks_dir)
-        payload = {"send": decision, "reason": "ok" if decision else "duplicate"}
+        decision, reason = _should_send(text, context.tasks_dir)
+        payload = {"send": decision, "reason": reason}
         _log("should_send_message", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "decide_project",
+        "Decide which project to work on based on chat history and project context.",
+        {"text": str, "set_active": bool, "switch_context": bool},
+    )
+    async def decide_project(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        text = str(args.get("text", "")).strip()
+        set_active = bool(args.get("set_active", False))
+        switch_context = bool(args.get("switch_context", False))
+        if not text:
+            payload = {"ok": False, "status": "missing_text"}
+            _log("decide_project", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_root = _tenant_root_from_tasks_dir(context.tasks_dir)
+        decision = decide_project_for_tenant(tenant_root, text)
+        if decision is None:
+            payload = {"ok": False, "status": "no_decision"}
+            _log("decide_project", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
+        active_updated = False
+        if set_active:
+            active_updated = _set_active_project(tenant_root, decision.project_name)
+        project_root = (Path(tenant_root) / "projects" / decision.project_name).resolve()
+        switched = False
+        if switch_context and project_root.exists():
+            switched = _migrate_current_task_context(context.tasks_dir, project_root / "tasks")
+        payload = {
+            "ok": True,
+            "project_name": decision.project_name,
+            "confidence": decision.confidence,
+            "reason": decision.reason,
+            "scores": decision.scores,
+            "active_updated": active_updated,
+            "project_root": str(project_root),
+            "switched": switched,
+        }
+        _log("decide_project", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
             "is_error": False,
@@ -657,6 +713,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
     return [
         should_send_message,
+        decide_project,
         send_message,
         send_payment_link,
         record_deploy,
@@ -678,13 +735,13 @@ def _is_duplicate_message(text: str, tasks_dir: Path, max_entries: int = 12) -> 
     return False
 
 
-def _should_send(text: str, tasks_dir: Path) -> bool:
+def _should_send(text: str, tasks_dir: Path) -> tuple[bool, str]:
     if not text.strip():
-        return False
+        return False, "empty"
     run_id = _current_run_id(tasks_dir)
     if run_id and _final_sent_for_run(tasks_dir, run_id):
-        return False
-    return True
+        return False, "final_already_sent"
+    return True, "ok"
 
 
 def _current_run_id(tasks_dir: Path) -> str | None:
@@ -798,3 +855,62 @@ def _load_payment_url(
         if url:
             return url
     return None
+
+
+def _tenant_root_from_tasks_dir(tasks_dir: Path) -> Path:
+    project_root = tasks_dir.parent
+    if project_root.parent.name == "projects":
+        return project_root.parent.parent
+    return project_root
+
+
+def _set_active_project(tenant_root: Path, project_name: str) -> bool:
+    projects_dir = Path(tenant_root) / "projects"
+    try:
+        projects_dir.mkdir(parents=True, exist_ok=True)
+        active_path = projects_dir / "active.txt"
+        active_path.write_text(project_name.strip() + "\n")
+        return True
+    except OSError:
+        return False
+
+
+def _migrate_current_task_context(tasks_dir: Path, target_tasks_dir: Path) -> bool:
+    try:
+        target_tasks_dir.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return False
+    patterns = [
+        "latest.md",
+        "task-*.md",
+        "chat_log.jsonl",
+        "chat_history.md",
+        "chat_summary.md",
+        "summary_prompt.md",
+        "inflight_updates.jsonl",
+        "run_request.json",
+        "run_result.json",
+        "outbound_messages.jsonl",
+        "tool_runs.jsonl",
+        "agent_events.jsonl",
+        "deploy_url.txt",
+        "result_summary.md",
+        "backend_quote.json",
+        "domain_quote.json",
+    ]
+    moved = False
+    for pattern in patterns:
+        for path in tasks_dir.glob(pattern):
+            try:
+                destination = target_tasks_dir / path.name
+                if destination.exists():
+                    try:
+                        path.unlink()
+                    except OSError:
+                        pass
+                    continue
+                path.replace(destination)
+                moved = True
+            except OSError:
+                continue
+    return moved

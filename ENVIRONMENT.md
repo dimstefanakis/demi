@@ -7,12 +7,15 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - Agents run inside short-lived Docker containers created per task run.
 - Containers are destroyed after the run completes (no long-lived processes).
 - The repository code lives in the container image (default workdir: `/app`).
-- Tenant workspaces are mounted at `/workspace`.
+- Tenant roots are mounted at `/workspace`.
+- Projects live under `/workspace/projects/<project_name>/` and each run targets one project.
+- Active project selection is stored in `/workspace/projects/active.txt` when no explicit project is provided.
 
 ## Persistence
 - Only `/workspace` persists across runs (bind-mounted tenant volume).
 - Everything outside `/workspace` is ephemeral.
-- Persist state in `/workspace` (memory.md, tasks/, site/, assets/, tenant.sqlite) or external services.
+- Persist state in the project workspace (`/workspace/projects/<project_name>/`)
+  (memory.md, DESCRIPTION.md, tasks/, site/, assets/, tenant.sqlite) or external services.
 
 ## Tools Available in Container
 - Python + uv
@@ -47,6 +50,10 @@ Default env allowlist includes:
 - SUPABASE_ACCESS_TOKEN / SUPABASE_ORG_SLUG / SUPABASE_ORG_ID
 - SUPABASE_REGION_SELECTION / SUPABASE_REGION / SUPABASE_INSTANCE_SIZE / SUPABASE_PROJECT_PREFIX
 - CLAUDE_PLUGINS / ANTHROPIC_API_KEY / CLAUDE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
+
+Main DB credentials (e.g., `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`,
+`CLAUDIUS_MAIN_DB_URL`) are intentionally excluded from the tenant container allowlist.
+Keep them only in the orchestrator/worker environment.
 
 ## Operational Notes
 - If you are unsure how to accomplish a task, inspect this file and repo docs

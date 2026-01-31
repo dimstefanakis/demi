@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import suppress
 import json
 from typing import Any
 from fastapi import FastAPI, Request
 
 from claudius.agent.claude import ClaudeAgent
 from claudius.config import Settings
-from claudius.db.core import Database
-from claudius.messaging.telegram import TelegramClient, TelegramConfig, TelegramUpdateParser
+from claudius.db.factory import build_database
+from claudius.messaging.telegram import (
+    TelegramClient,
+    TelegramConfig,
+    TelegramUpdateParser,
+)
 from claudius.orchestrator import Orchestrator
 from claudius.payments.stripe import StripeClient, build_stripe_config, derive_stripe_urls
 from claudius.events import normalize_event_type, verify_signature
 from claudius.jobs.worker import EventWorker, EventWorkerConfig
+from claudius.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from claudius.runtime.docker_agent import DockerAgent
 from claudius.runtime.docker_pool import DockerPool, DockerPoolConfig
 from claudius.tenant_db import ensure_tenant_db
@@ -21,10 +28,14 @@ from claudius.workspace.core import WorkspaceManager
 
 def create_app() -> FastAPI:
     settings = Settings()
-    db = Database(settings.resolved_db_path())
+    db = build_database(settings)
     db.init()
+    logger = logging.getLogger("claudius.app")
 
-    workspace_manager = WorkspaceManager(settings.resolved_data_dir(), template_root=settings.root_dir)
+    workspace_manager = WorkspaceManager(
+        settings.resolved_data_dir(),
+        template_root=settings.root_dir,
+    )
 
     agent: Any = ClaudeAgent()
     pool: DockerPool | None = None
@@ -58,6 +69,7 @@ def create_app() -> FastAPI:
         workspace_allocator = pool
 
     worker: EventWorker | None = None
+    pending_worker: PendingWorker | None = None
     orchestrator = Orchestrator(
         db=db,
         workspace_manager=workspace_manager,
@@ -75,22 +87,81 @@ def create_app() -> FastAPI:
                 batch_size=settings.events_worker_batch_size,
             ),
         )
+    if settings.pending_worker_enabled:
+        pending_worker = PendingWorker(
+            db=db,
+            orchestrator=orchestrator,
+            config=PendingWorkerConfig(
+                poll_interval=settings.pending_worker_poll_interval,
+                batch_size=settings.pending_worker_batch_size,
+            ),
+        )
 
     app = FastAPI()
 
     if pool is not None:
+        async def _warm_pool_background() -> None:
+            try:
+                await asyncio.wait_for(
+                    pool.ensure_pool(),
+                    timeout=settings.docker_pool_warm_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "Docker pool warmup timed out after %.1fs; continuing without warm pool.",
+                    settings.docker_pool_warm_timeout_seconds,
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("Docker pool warmup failed; continuing without warm pool.")
+
         @app.on_event("startup")
         async def _warm_pool() -> None:
-            await pool.ensure_pool()
+            app.state.pool_warm_task = asyncio.create_task(
+                _warm_pool_background(),
+                name="docker-pool-warmup",
+            )
+
+        @app.on_event("shutdown")
+        async def _stop_pool_warmup() -> None:
+            task = getattr(app.state, "pool_warm_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     if worker is not None:
         @app.on_event("startup")
         async def _start_events_worker() -> None:
-            asyncio.create_task(worker.run_forever())
+            app.state.events_worker_task = asyncio.create_task(
+                worker.run_forever(),
+                name="events-worker",
+            )
 
         @app.on_event("shutdown")
         async def _stop_events_worker() -> None:
             worker.stop()
+            task = getattr(app.state, "events_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    if pending_worker is not None:
+        @app.on_event("startup")
+        async def _start_pending_worker() -> None:
+            app.state.pending_worker_task = asyncio.create_task(
+                pending_worker.run_forever(),
+                name="pending-worker",
+            )
+
+        @app.on_event("shutdown")
+        async def _stop_pending_worker() -> None:
+            pending_worker.stop()
+            task = getattr(app.state, "pending_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
 
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
@@ -115,7 +186,8 @@ def create_app() -> FastAPI:
         if tenant is None:
             return {"status": "invalid", "reason": "tenant_not_found"}
 
-        workspace = workspace_manager.ensure_workspace(tenant.key)
+        project_name = orchestrator._resolve_project_from_payload(payload)
+        workspace = await orchestrator._resolve_workspace(tenant, project_name=project_name)
         tenant_db = ensure_tenant_db(workspace.root / "tenant.sqlite")
         event_type = normalize_event_type(payload)
         tenant_db.record_event(event_type, payload)
@@ -127,6 +199,10 @@ def create_app() -> FastAPI:
         db.create_event_job(tenant.id, job_type="event", payload=job_payload)
 
         return {"status": "accepted"}
+
+    @app.get("/health")
+    async def health():
+        return {"status": "ok"}
 
     @app.post("/stripe/webhook")
     async def stripe_webhook(request: Request):
@@ -466,11 +542,21 @@ def _handle_subscription_updated(db: Database, subscription: dict[str, Any]) -> 
     }
     if cancel_at_period_end:
         db.update_billing_order_status(order_id, "cancel_scheduled", metadata=metadata)
-        _emit_billing_event(db, order_row, "backend_cancel_scheduled", "managed_backend_cancel_scheduled")
+        _emit_billing_event(
+            db,
+            order_row,
+            "backend_cancel_scheduled",
+            "managed_backend_cancel_scheduled",
+        )
         return
     if status in {"canceled", "unpaid", "incomplete_expired"}:
         db.update_billing_order_status(order_id, "canceled", metadata=metadata)
-        _emit_billing_event(db, order_row, "backend_canceled", "managed_backend_canceled")
+        _emit_billing_event(
+            db,
+            order_row,
+            "backend_canceled",
+            "managed_backend_canceled",
+        )
         return
     db.update_billing_order_status(order_id, "active", metadata=metadata)
 
@@ -488,7 +574,12 @@ def _handle_subscription_deleted(db: Database, subscription: dict[str, Any]) -> 
         "canceled_at": subscription.get("canceled_at"),
     }
     db.update_billing_order_status(order_id, "canceled", metadata=metadata)
-    _emit_billing_event(db, order_row, "backend_canceled", "managed_backend_canceled")
+    _emit_billing_event(
+        db,
+        order_row,
+        "backend_canceled",
+        "managed_backend_canceled",
+    )
 
 
 def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]) -> None:
@@ -501,12 +592,20 @@ def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]
     order_id = int(order_row["id"])
     if event_type == "invoice.payment_failed":
         db.update_billing_order_status(order_id, "payment_failed")
-        _emit_billing_event(db, order_row, "backend_payment_failed", "managed_backend_payment_failed")
+        _emit_billing_event(
+            db,
+            order_row,
+            "backend_payment_failed",
+            "managed_backend_payment_failed",
+        )
         return
     if event_type == "invoice.payment_action_required":
         db.update_billing_order_status(order_id, "payment_action_required")
         _emit_billing_event(
-            db, order_row, "backend_payment_action_required", "managed_backend_payment_action_required"
+            db,
+            order_row,
+            "backend_payment_action_required",
+            "managed_backend_payment_action_required",
         )
         return
     if event_type == "invoice.paid":

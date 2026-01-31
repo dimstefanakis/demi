@@ -41,10 +41,11 @@ The orchestrator does not build sites itself.
 
 ### 2) Tenant Workspace (Per Client)
 Persistent on disk:
-- `memory.md` for stable facts and decisions
-- `tasks/` for task briefs and results
-- `assets/` for uploaded and sourced images
-- `site/` for the website codebase
+- `projects/<project_name>/memory.md` for stable facts and decisions
+- `projects/<project_name>/DESCRIPTION.md` for project summary/context
+- `projects/<project_name>/tasks/` for task briefs and results
+- `projects/<project_name>/assets/` for uploaded and sourced images
+- `projects/<project_name>/site/` for the website codebase
 
 ---
 

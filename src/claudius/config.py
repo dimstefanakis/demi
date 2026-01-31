@@ -11,6 +11,9 @@ class Settings(BaseSettings):
     root_dir: Path = Path(".")
     data_dir: Path = Path("data")
     db_path: Path | None = None
+    main_db_backend: str = "sqlite"
+    main_db_supabase_url: str | None = None
+    main_db_supabase_service_key: str | None = None
 
     telegram_bot_token: str | None = None
 
@@ -41,6 +44,8 @@ class Settings(BaseSettings):
     docker_mount_path: str = "/workspace"
     docker_env_allowlist: str | None = None
     docker_forward_messages: bool = False
+    docker_command_timeout_seconds: float = 0.0
+    docker_pool_warm_timeout_seconds: float = 45.0
 
     anthropic_api_key: str | None = None
     claude_api_key: str | None = None
@@ -53,6 +58,18 @@ class Settings(BaseSettings):
     events_worker_poll_interval: float = 1.5
     events_worker_batch_size: int = 20
     event_url: str | None = None
+
+    pending_worker_enabled: bool = True
+    pending_worker_poll_interval: float = 2.5
+    pending_worker_batch_size: int = 20
+
+    run_lease_seconds: int = 600
+    run_activity_poll_interval: float = 2.5
+
+    sqlite_timeout_seconds: float = 0.5
+    sqlite_busy_timeout_ms: int = 500
+    sqlite_journal_mode: str = "WAL"
+    sqlite_synchronous: str = "NORMAL"
 
     unsplash_app_id: str | None = None
     unsplash_access_key: str | None = None

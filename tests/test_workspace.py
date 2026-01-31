@@ -5,6 +5,8 @@ def test_workspace_created(tmp_path):
     manager = WorkspaceManager(root_dir=tmp_path)
     workspace = manager.ensure_workspace(tenant_key="telegram:987654")
 
+    assert workspace.tenant_root == tmp_path / "telegram:987654"
+    assert workspace.project_name == "main"
     assert workspace.root.exists()
     assert workspace.tasks_dir.exists()
     assert workspace.assets_dir.exists()
@@ -12,6 +14,7 @@ def test_workspace_created(tmp_path):
 
     # memory file created
     assert workspace.memory_path.exists()
+    assert workspace.description_path.exists()
 
 
 def test_workspace_copies_design_md(tmp_path):

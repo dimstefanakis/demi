@@ -32,13 +32,16 @@ This document solidifies the MVP infrastructure for a chat-first website agent w
 ## Tenant Workspace (Persistent)
 ```
 data/tenants/<tenant_id>/
-  memory.md
-  tasks/
-  site/
-  assets/
+  projects/<project_name>/
+    memory.md
+    DESCRIPTION.md
+    tasks/
+    site/
+    assets/
   tooling/
   tooling.lock
 ```
+- `projects/` enables multiple sites per tenant; each project has its own workspace.
 - `tooling/` persists tenant-specific CLIs; base image provides common tools.
 
 ## Hot-Pool Assignment Flow (First Message)

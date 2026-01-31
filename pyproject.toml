@@ -13,12 +13,16 @@ dependencies = [
   "pydantic-settings>=2.2",
   "httpx>=0.27",
   "claude-agent-sdk>=0.1.0",
+  "supabase>=2.6",
 ]
 
 [project.optional-dependencies]
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.23",
+]
+db = [
+  "psycopg[binary]>=3.1",
 ]
 
 [tool.pytest.ini_options]
@@ -27,4 +31,3 @@ asyncio_mode = "auto"
 
 [tool.ruff]
 line-length = 100
-

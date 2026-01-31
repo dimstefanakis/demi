@@ -8,6 +8,7 @@ import json
 import os
 import uuid
 
+from claudius.config import Settings
 
 @dataclass(frozen=True)
 class DockerPoolConfig:
@@ -191,13 +192,29 @@ class DockerPool:
 
     @staticmethod
     async def _run_cmd(args: list[str]) -> str:
+        settings = Settings()
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=os.environ.copy(),
         )
-        stdout, stderr = await proc.communicate()
+        if settings.docker_command_timeout_seconds and settings.docker_command_timeout_seconds > 0:
+            try:
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(),
+                    timeout=settings.docker_command_timeout_seconds,
+                )
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.wait()
+                redacted = DockerPool._redact_args(args)
+                raise RuntimeError(
+                    f"command timed out after {settings.docker_command_timeout_seconds}s: "
+                    f"{' '.join(redacted)}"
+                ) from None
+        else:
+            stdout, stderr = await proc.communicate()
         if proc.returncode != 0:
             redacted = DockerPool._redact_args(args)
             raise RuntimeError(

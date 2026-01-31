@@ -1,0 +1,69 @@
+services:
+  nginx:
+    image: nginx:1.25-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./deploy/nginx/conf.d:/etc/nginx/conf.d
+    depends_on:
+      - api_blue
+      - api_green
+    restart: unless-stopped
+
+  api_blue:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    image: claudius-api:blue
+    env_file:
+      - .env
+    environment:
+      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
+      - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
+      - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
+      - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - EVENTS_WORKER_ENABLED=false
+      - PENDING_WORKER_ENABLED=false
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  api_green:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    image: claudius-api:green
+    env_file:
+      - .env
+    environment:
+      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
+      - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
+      - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
+      - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - EVENTS_WORKER_ENABLED=false
+      - PENDING_WORKER_ENABLED=false
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/app.Dockerfile
+    image: claudius-worker:latest
+    env_file:
+      - .env
+    environment:
+      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
+      - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
+      - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
+      - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - EVENTS_WORKER_ENABLED=true
+      - PENDING_WORKER_ENABLED=true
+    command: ["python", "-m", "claudius.worker_entrypoint"]
+    volumes:
+      - ./data:/app/data
+      - /var/run/docker.sock:/var/run/docker.sock
+    restart: unless-stopped

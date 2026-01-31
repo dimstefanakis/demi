@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 import json
+import re
+import asyncio
 
 from claudius.db.core import Database
 from claudius.models import NormalizedMessage, OrchestratorResult
@@ -16,6 +18,8 @@ from claudius.memory.logs import append_log, write_chat_history
 
 from claudius.failure_guard import clear_block, get_block, record_hard_failure
 from claudius.tenant_db import ensure_tenant_db
+from claudius.workspace.project_decider import decide_project
+from claudius.config import Settings
 
 
 @dataclass
@@ -35,17 +39,37 @@ class Orchestrator:
         if not inserted:
             return OrchestratorResult(status="duplicate", detail="message already processed")
 
+        msg, project_name = self._resolve_project_for_tenant(tenant, msg)
+        if project_name:
+            self.db.update_message_project(message_id, project_name)
         user_payload = (msg.text or "").strip()
         if not user_payload and msg.images:
             user_payload = "(attachment)"
-        workspace = await self._resolve_workspace(tenant)
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
+
+        if self._is_reset_command(user_payload):
+            self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
+            write_chat_history(workspace.tasks_dir)
+            self._reset_state(workspace, tenant, project_name=project_name)
+            self.db.update_message_status(message_id, "processed")
+            await self._send_interaction_message(
+                workspace,
+                tenant,
+                msg,
+                "Reset done. I cleared stuck runs and pending requests. "
+                "Send your request again and I’ll pick it up.",
+            )
+            return OrchestratorResult(status="accepted", detail="reset")
+
         if await self._handle_blocked(workspace.tasks_dir, tenant, user_payload=user_payload):
             self.db.update_message_status(message_id, "processed")
             return OrchestratorResult(status="blocked", detail="system_blocked")
         self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
         write_chat_history(workspace.tasks_dir)
 
-        inflight_run = self.db.get_inflight_run(tenant.id)
+        settings = Settings()
+        self.db.expire_stale_runs(tenant.id, project_name, self._now())
+        inflight_run = self.db.get_inflight_run(tenant.id, project_name)
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
@@ -58,8 +82,14 @@ class Orchestrator:
 
         if inflight_run:
             supports_stream = self._supports_inflight_stream()
-            stream = self._get_inflight_stream(tenant.key)
-            if supports_stream and stream is not None and stream.accepting and msg.text and not msg.images:
+            stream = self._get_inflight_stream(tenant.key, project_name)
+            if (
+                supports_stream
+                and stream is not None
+                and stream.accepting
+                and msg.text
+                and not msg.images
+            ):
                 await stream.queue.put(msg.text)
                 self.db.update_message_status(message_id, "processed")
                 return OrchestratorResult(status="busy", detail="streamed to in-flight run")
@@ -69,6 +99,8 @@ class Orchestrator:
             if msg.images and hasattr(self.messenger, "download_images"):
                 asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
             self._append_inflight_update(workspace.tasks_dir, msg, asset_paths)
+            self._write_request_status(workspace, tenant)
+            await self._send_busy_ack(workspace, tenant, msg)
             return OrchestratorResult(status="busy", detail="tenant already running")
 
         return await self._run_message(
@@ -76,6 +108,7 @@ class Orchestrator:
             msg=msg,
             message_id=message_id,
             process_pending=True,
+            project_name=project_name,
         )
 
     async def handle_event_job(
@@ -88,7 +121,8 @@ class Orchestrator:
         if tenant is None:
             return OrchestratorResult(status="invalid", detail="tenant_not_found")
 
-        workspace = await self._resolve_workspace(tenant)
+        project_name = self._resolve_project_from_payload(payload)
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
         event_intent = str(payload.get("intent") or "").strip()
         event_type = str(payload.get("event_type") or "").strip()
         if event_intent == "system_blocked" or event_type == "system_blocked":
@@ -97,7 +131,8 @@ class Orchestrator:
         else:
             if await self._handle_blocked(workspace.tasks_dir, tenant, notify=False):
                 return OrchestratorResult(status="blocked", detail="system_blocked")
-        inflight_run = self.db.get_inflight_run(tenant.id)
+        self.db.expire_stale_runs(tenant.id, project_name, self._now())
+        inflight_run = self.db.get_inflight_run(tenant.id, project_name)
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
@@ -118,6 +153,7 @@ class Orchestrator:
             text=event_text,
             images=[],
             raw={"event": payload},
+            project_name=project_name,
         )
         message_id, inserted = self.db.record_message(tenant.id, msg)
         if not inserted:
@@ -128,6 +164,7 @@ class Orchestrator:
             msg=msg,
             message_id=message_id,
             process_pending=True,
+            project_name=project_name,
         )
 
     async def _run_message(
@@ -136,10 +173,12 @@ class Orchestrator:
         msg: NormalizedMessage,
         message_id: int,
         process_pending: bool,
+        project_name: str | None = None,
     ) -> OrchestratorResult:
-        workspace = await self._resolve_workspace(tenant)
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
 
         self.db.update_message_status(message_id, "processing")
+        self._write_request_status(workspace, tenant)
 
         asset_paths = []
         if msg.images and hasattr(self.messenger, "download_images"):
@@ -151,9 +190,25 @@ class Orchestrator:
         self._clear_run_artifacts(workspace.tasks_dir)
         self._maybe_prepare_compaction(workspace.tasks_dir)
 
-        run_id = self.db.create_run(tenant.id, message_id=message_id)
-        inflight_stream = self._ensure_inflight_stream(tenant.key)
+        settings = Settings()
+        run_id = self.db.create_run(
+            tenant.id,
+            message_id=message_id,
+            project_name=workspace.project_name,
+            lease_seconds=settings.run_lease_seconds,
+        )
+        inflight_stream = self._ensure_inflight_stream(tenant.key, workspace.project_name)
+        monitor = None
+        monitor_task = None
         try:
+            monitor = RunActivityMonitor(
+                db=self.db,
+                run_id=run_id,
+                tasks_dir=workspace.tasks_dir,
+                lease_seconds=settings.run_lease_seconds,
+                poll_interval=settings.run_activity_poll_interval,
+            )
+            monitor_task = asyncio.create_task(monitor.run())
             agent_result = await self.agent.prepare_context(
                 workspace=workspace,
                 task_path=task_path,
@@ -174,18 +229,28 @@ class Orchestrator:
             )
             self.db.finish_run(run_id, status="completed")
             self.db.update_message_status(message_id, "processed")
-            self._clear_inflight_stream(tenant.key)
+            self._clear_inflight_stream(tenant.key, workspace.project_name)
             if process_pending:
-                await self._drain_pending_messages(tenant)
+                await self._drain_pending_messages(tenant, project_name=workspace.project_name)
+            self._write_request_status(workspace, tenant)
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
             self.db.finish_run(run_id, status="failed", error=str(exc))
             self.db.update_message_status(message_id, "failed")
-            self._clear_inflight_stream(tenant.key)
+            self._clear_inflight_stream(tenant.key, workspace.project_name)
+            self._write_request_status(workspace, tenant)
             raise
+        finally:
+            if monitor is not None:
+                monitor.stop()
+            if monitor_task is not None:
+                try:
+                    await monitor_task
+                except Exception:
+                    pass
 
-    async def _drain_pending_messages(self, tenant) -> None:
-        rows = self.db.get_pending_messages(tenant.id)
+    async def _drain_pending_messages(self, tenant, project_name: str | None = None) -> None:
+        rows = self.db.get_pending_messages(tenant.id, project_name=project_name)
         if not rows:
             return
 
@@ -196,7 +261,7 @@ class Orchestrator:
             return
 
         self.db.update_message_statuses(message_ids, "processing")
-        workspace = await self._resolve_workspace(tenant)
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
         inflight_path = self._inflight_updates_path(workspace.tasks_dir)
         if inflight_path.exists():
             try:
@@ -210,12 +275,14 @@ class Orchestrator:
                 msg=combined,
                 message_id=message_ids[0],
                 process_pending=False,
+                project_name=project_name,
             )
         except Exception:  # noqa: BLE001
             self.db.update_message_statuses(message_ids, "failed")
             raise
         else:
             self.db.update_message_statuses(message_ids, "processed")
+        self._write_request_status(workspace, tenant)
 
     @staticmethod
     def _is_run_stale(
@@ -246,14 +313,19 @@ class Orchestrator:
         message_id = row.get("message_id") if hasattr(row, "get") else row["message_id"]
         if message_id:
             self.db.update_message_status(int(message_id), "processed")
-        self._clear_inflight_stream(tenant.key)
+        project_name = row["project_name"] if row and "project_name" in row.keys() else None
+        self._clear_inflight_stream(tenant.key, project_name)
 
     @staticmethod
     def _build_task_content(msg: NormalizedMessage, asset_paths: list[str] | None = None) -> str:
         message_text = (msg.text or "").strip()
         if not message_text and msg.images:
             message_text = "(attachment only)"
-        lines = ["# Task", "", f"Message: {message_text}".strip()]
+        lines = ["# Task", ""]
+        if msg.project_name:
+            lines.append(f"Project: {msg.project_name}")
+            lines.append("")
+        lines.append(f"Message: {message_text}".strip())
         if msg.images:
             lines.append("\n## Images")
             for image in msg.images:
@@ -263,6 +335,88 @@ class Orchestrator:
             for path in asset_paths:
                 lines.append(f"- {path}")
         return "\n".join(lines) + "\n"
+
+    def _resolve_project_from_message(
+        self, msg: NormalizedMessage
+    ) -> tuple[NormalizedMessage, str | None]:
+        project_name = getattr(msg, "project_name", None)
+        if not project_name:
+            project_name = self._resolve_project_from_payload(msg.raw or {})
+        text = msg.text
+        if not project_name:
+            project_name, text = self._extract_project_directive(text)
+        if text != msg.text:
+            msg = replace(msg, text=text)
+        if project_name:
+            project_name = self.workspace_manager.normalize_project_name(project_name)
+        return msg, project_name
+
+    def _resolve_project_for_tenant(
+        self, tenant: Any, msg: NormalizedMessage
+    ) -> tuple[NormalizedMessage, str | None]:
+        msg, project_name = self._resolve_project_from_message(msg)
+        if project_name:
+            if msg.project_name != project_name:
+                msg = replace(msg, project_name=project_name)
+            return msg, project_name
+        tenant_root = self._tenant_root_for(tenant)
+        decision = decide_project(tenant_root, msg.text, payload=msg.raw or {})
+        inferred = decision.project_name if decision else None
+        if inferred and msg.project_name != inferred:
+            msg = replace(msg, project_name=inferred)
+        if inferred:
+            self.workspace_manager.set_active_project(tenant_root, inferred)
+        return msg, inferred
+
+    def _tenant_root_for(self, tenant: Any) -> Path:
+        workspace_path = getattr(tenant, "workspace_path", None)
+        if workspace_path:
+            return self.workspace_manager.infer_tenant_root(Path(workspace_path))
+        return self.workspace_manager.tenant_root_for_key(tenant.key)
+
+    @staticmethod
+    def _extract_project_directive(text: str | None) -> tuple[str | None, str | None]:
+        if not text:
+            return None, text
+        lines = text.splitlines()
+        if not lines:
+            return None, text
+        first = lines[0].strip()
+        match = re.match(r"^project\s*[:=]\s*(.+)$", first, flags=re.IGNORECASE)
+        if match is None:
+            match = re.match(r"^/project\s+(.+)$", first, flags=re.IGNORECASE)
+        if not match:
+            return None, text
+        project = match.group(1).strip()
+        remaining = "\n".join(lines[1:]).strip()
+        return project, remaining or None
+
+    @staticmethod
+    def _is_reset_command(text: str | None) -> bool:
+        if not text:
+            return False
+        return bool(re.match(r"^/reset(?:@\w+)?(?:\s|$)", text.strip(), flags=re.IGNORECASE))
+
+    @staticmethod
+    def _resolve_project_from_payload(payload: dict[str, Any]) -> str | None:
+        def _pick(data: dict[str, Any] | None) -> str | None:
+            if not data:
+                return None
+            for key in ("project_name", "project", "project_id", "projectId"):
+                value = data.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+            return None
+
+        project = _pick(payload)
+        if project:
+            return project
+        project = _pick(
+            payload.get("payload") if isinstance(payload.get("payload"), dict) else None
+        )
+        if project:
+            return project
+        return _pick(payload.get("event") if isinstance(payload.get("event"), dict) else None)
 
     @staticmethod
     def _build_event_text(
@@ -276,14 +430,19 @@ class Orchestrator:
         if summary:
             header = f"{header}: {summary}"
         notify = bool(payload.get("notify") or payload.get("notify_text"))
-        intent_line = f"- Intent: {intent.strip()}\n" if isinstance(intent, str) and intent.strip() else ""
+        intent_line = (
+            f"- Intent: {intent.strip()}\n"
+            if isinstance(intent, str) and intent.strip()
+            else ""
+        )
         notify_line = "- This event requests a user notification.\n" if notify else ""
         return (
             f"{header}\n\n"
             "Context:\n"
             f"{intent_line}"
             f"{notify_line}"
-            "- The full event payload was stored in the tenant SQLite DB at /workspace/tenant.sqlite\n"
+            "- The full event payload was stored in the project SQLite DB "
+            "(tenant.sqlite in the project root)\n"
             "- Table: events (columns: event_type, payload_json, received_at)\n"
             "- You may query or update this DB if needed.\n"
         )
@@ -308,6 +467,125 @@ class Orchestrator:
         updates_path.parent.mkdir(parents=True, exist_ok=True)
         with updates_path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(payload) + "\n")
+
+    def _write_request_status(self, workspace: Workspace, tenant: Any) -> None:
+        try:
+            pending = self.db.get_pending_messages(tenant.id, project_name=workspace.project_name)
+            inflight = self.db.get_inflight_run(tenant.id, project_name=workspace.project_name)
+            lines = [
+                "# Request Status",
+                "",
+                f"Project: {workspace.project_name}",
+                f"Run: {inflight['id'] if inflight else 'none'}",
+                f"Run Status: {inflight['status'] if inflight else 'idle'}",
+                "",
+                "## Pending Messages",
+            ]
+            if not pending:
+                lines.append("- None")
+            else:
+                for row in pending:
+                    text = str(row["text"] or "").strip().replace("\n", " ")
+                    lines.append(f"- {row['received_at']}: {text}")
+            status_path = workspace.tasks_dir / "request_status.md"
+            status_path.write_text("\n".join(lines) + "\n")
+        except Exception:
+            pass
+
+    async def _send_busy_ack(
+        self, workspace: Workspace, tenant: Any, msg: NormalizedMessage
+    ) -> None:
+        instruction = (
+            "Send a brief acknowledgment that you've received the new message and "
+            "will get to it once current work finishes. Keep it short and natural. "
+            "If you've already acknowledged recently, do not send."
+        )
+        await self._send_interaction_instruction(workspace, tenant, msg, instruction)
+
+    async def _send_interaction_instruction(
+        self,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage | None,
+        instruction: str,
+    ) -> None:
+        sender = getattr(self.agent, "send_interaction_instruction", None)
+        if sender is None:
+            return
+        try:
+            await sender(
+                workspace=workspace,
+                instruction=instruction,
+                messenger=self.messenger,
+                tenant_id=tenant.id,
+                db=self.db,
+                payments=self.payments,
+                session_id=getattr(tenant, "session_id", None),
+                provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
+                tenant_external_id=getattr(msg, "tenant_external_id", None)
+                or getattr(tenant, "external_id", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                append_log(
+                    workspace.tasks_dir,
+                    "system",
+                    f"interaction_instruction_failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+    async def _send_interaction_message(
+        self,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage | None,
+        text: str,
+    ) -> None:
+        sender = getattr(self.agent, "send_interaction_message", None)
+        if sender is None:
+            return
+        try:
+            await sender(
+                workspace=workspace,
+                text=text,
+                messenger=self.messenger,
+                tenant_id=tenant.id,
+                db=self.db,
+                payments=self.payments,
+                session_id=getattr(tenant, "session_id", None),
+                provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
+                tenant_external_id=getattr(msg, "tenant_external_id", None)
+                or getattr(tenant, "external_id", None),
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                append_log(
+                    workspace.tasks_dir,
+                    "system",
+                    f"interaction_send_failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+    def _reset_state(
+        self,
+        workspace: Workspace,
+        tenant: Any,
+        project_name: str | None = None,
+    ) -> None:
+        self.db.finish_running_runs(tenant.id, project_name, error="user_reset")
+        self.db.clear_pending_and_processing_messages(tenant.id, project_name)
+        self._clear_inflight_stream(tenant.key, project_name)
+        self._clear_run_artifacts(workspace.tasks_dir)
+        for name in ("inflight_updates.jsonl", "run_request.json", "run_result.json"):
+            path = workspace.tasks_dir / name
+            if path.exists():
+                try:
+                    path.unlink()
+                except OSError:
+                    pass
+        self._write_request_status(workspace, tenant)
 
     def _combine_pending_messages(self, rows: list[Any]) -> NormalizedMessage | None:
         messages: list[NormalizedMessage] = []
@@ -334,24 +612,31 @@ class Orchestrator:
             text=combined_text or None,
             images=combined_images,
             raw=latest.raw,
+            project_name=latest.project_name,
         )
 
     def _inflight_updates_path(self, tasks_dir: Path) -> Path:
         return tasks_dir / "inflight_updates.jsonl"
 
-    async def _resolve_workspace(self, tenant) -> Workspace:
+    async def _resolve_workspace(self, tenant, project_name: str | None = None) -> Workspace:
         if getattr(tenant, "workspace_path", None):
-            root = Path(tenant.workspace_path)
-            return self.workspace_manager.ensure_workspace_at_path(root)
+            tenant_root = self.workspace_manager.infer_tenant_root(
+                Path(tenant.workspace_path)
+            )
+            return self.workspace_manager.ensure_project_for_tenant_root(
+                tenant_root, project_name=project_name
+            )
         if self.workspace_allocator is not None:
-            root = await self._allocate_workspace(tenant)
-            self.db.update_tenant_workspace(tenant.id, str(root))
-            tenant.workspace_path = str(root)
-            return self.workspace_manager.ensure_workspace_at_path(root)
-        workspace = self.workspace_manager.ensure_workspace(tenant.key)
-        if tenant.workspace_path != str(workspace.root):
-            self.db.update_tenant_workspace(tenant.id, str(workspace.root))
-            tenant.workspace_path = str(workspace.root)
+            tenant_root = await self._allocate_workspace(tenant)
+            self.db.update_tenant_workspace(tenant.id, str(tenant_root))
+            tenant.workspace_path = str(tenant_root)
+            return self.workspace_manager.ensure_project_for_tenant_root(
+                tenant_root, project_name=project_name
+            )
+        workspace = self.workspace_manager.ensure_workspace(tenant.key, project_name=project_name)
+        if tenant.workspace_path != str(workspace.tenant_root):
+            self.db.update_tenant_workspace(tenant.id, str(workspace.tenant_root))
+            tenant.workspace_path = str(workspace.tenant_root)
         return workspace
 
     async def _allocate_workspace(self, tenant) -> Path:
@@ -366,26 +651,35 @@ class Orchestrator:
             result = await result
         return Path(result)
 
-    def _ensure_inflight_stream(self, tenant_key: str) -> InflightTextStream:
+    def _ensure_inflight_stream(
+        self, tenant_key: str, project_name: str | None
+    ) -> InflightTextStream:
         if self.inflight_text_queues is None:
             self.inflight_text_queues = {}
-        stream = self.inflight_text_queues.get(tenant_key)
+        stream_key = self._stream_key(tenant_key, project_name)
+        stream = self.inflight_text_queues.get(stream_key)
         if stream is None:
             import asyncio
 
             stream = InflightTextStream(queue=asyncio.Queue())
-            self.inflight_text_queues[tenant_key] = stream
+            self.inflight_text_queues[stream_key] = stream
         return stream
 
-    def _get_inflight_stream(self, tenant_key: str) -> InflightTextStream | None:
+    def _get_inflight_stream(
+        self, tenant_key: str, project_name: str | None
+    ) -> InflightTextStream | None:
         if not self.inflight_text_queues:
             return None
-        return self.inflight_text_queues.get(tenant_key)
+        return self.inflight_text_queues.get(self._stream_key(tenant_key, project_name))
 
-    def _clear_inflight_stream(self, tenant_key: str) -> None:
+    def _clear_inflight_stream(self, tenant_key: str, project_name: str | None) -> None:
         if not self.inflight_text_queues:
             return
-        self.inflight_text_queues.pop(tenant_key, None)
+        self.inflight_text_queues.pop(self._stream_key(tenant_key, project_name), None)
+
+    @staticmethod
+    def _stream_key(tenant_key: str, project_name: str | None) -> str:
+        return f"{tenant_key}:{project_name or 'main'}"
 
     async def _handle_blocked(
         self,
@@ -458,7 +752,7 @@ class Orchestrator:
             return False
         error = payload.get("error")
         status = "failed" if error else "completed"
-        run_id = run.get("id") if hasattr(run, "get") else run["id"]
+        run_id = run["id"] if hasattr(run, "keys") else run.get("id")
         total_cost = payload.get("total_cost_usd")
         usage = payload.get("usage")
         if total_cost is not None or usage is not None:
@@ -467,12 +761,17 @@ class Orchestrator:
         session_id = payload.get("session_id")
         if session_id:
             self.db.update_tenant_session(tenant.id, session_id)
-        message_id = run.get("message_id") if hasattr(run, "get") else run["message_id"]
+        message_id = run["message_id"] if hasattr(run, "keys") else run.get("message_id")
         if message_id:
             self.db.update_message_status(
                 int(message_id), "processed" if status == "completed" else "failed"
             )
-        self._clear_inflight_stream(tenant.key)
+        project_name = (
+            run["project_name"]
+            if hasattr(run, "keys") and "project_name" in run.keys()
+            else None
+        )
+        self._clear_inflight_stream(tenant.key, project_name)
         return True
 
     def _supports_inflight_stream(self) -> bool:
@@ -482,8 +781,11 @@ class Orchestrator:
         path = tasks_dir / "tool_runs.jsonl"
         if not path.exists():
             return
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        cursor = db.get_kv("system", "tool_runs_cursor") or {}
+        try:
+            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+            cursor = db.get_kv("system", "tool_runs_cursor") or {}
+        except Exception:
+            return
         last_ts = cursor.get("timestamp")
         latest_ts = last_ts
 
@@ -508,11 +810,17 @@ class Orchestrator:
                         max_failures=2,
                     )
         if latest_ts and latest_ts != last_ts:
-            db.set_kv("system", "tool_runs_cursor", {"timestamp": latest_ts})
+            try:
+                db.set_kv("system", "tool_runs_cursor", {"timestamp": latest_ts})
+            except Exception:
+                return
 
     def _should_notify_block(self, tasks_dir: Path, block: dict[str, Any]) -> bool:
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        cursor = db.get_kv("system", "block_notified") or {}
+        try:
+            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+            cursor = db.get_kv("system", "block_notified") or {}
+        except Exception:
+            return True
         last_at = cursor.get("at")
         block_at = block.get("at")
         if not block_at:
@@ -520,8 +828,11 @@ class Orchestrator:
         return last_at != block_at
 
     def _mark_block_notified(self, tasks_dir: Path, block: dict[str, Any]) -> None:
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        db.set_kv("system", "block_notified", {"at": block.get("at")})
+        try:
+            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
+            db.set_kv("system", "block_notified", {"at": block.get("at")})
+        except Exception:
+            return
 
     @staticmethod
     def _read_optional_file(path: Path) -> str | None:
@@ -548,19 +859,36 @@ class Orchestrator:
     @staticmethod
     def _message_from_row(row: Any) -> NormalizedMessage | None:
         try:
-            raw = json.loads(row["raw_json"]) if row["raw_json"] else None
-        except (TypeError, json.JSONDecodeError, KeyError):
+            raw_value = row["raw_json"] if row and "raw_json" in row.keys() else None
+        except (AttributeError, KeyError, TypeError):
+            raw_value = None
+        if isinstance(raw_value, dict):
+            raw = raw_value
+        elif raw_value:
+            try:
+                raw = json.loads(raw_value)
+            except (TypeError, json.JSONDecodeError):
+                raw = None
+        else:
             raw = None
         provider = row["provider"] if "provider" in row.keys() else None
         if provider == "telegram" and raw:
-            return TelegramUpdateParser.parse(raw)
+            msg = TelegramUpdateParser.parse(raw)
+            if msg and "project_name" in row.keys():
+                msg.project_name = row["project_name"]
+            return msg
         return None
+
     @staticmethod
-    def _append_chat_log(tasks_dir: Path, role: str, text: str, timestamp: Any | None = None) -> None:
+    def _append_chat_log(
+        tasks_dir: Path, role: str, text: str, timestamp: Any | None = None
+    ) -> None:
         append_log(tasks_dir, f"{role}_message", text, timestamp=timestamp)
 
     @staticmethod
-    def _maybe_prepare_compaction(tasks_dir: Path, max_entries: int = 30, keep_last: int = 10) -> None:
+    def _maybe_prepare_compaction(
+        tasks_dir: Path, max_entries: int = 30, keep_last: int = 10
+    ) -> None:
         entries = read_logs(tasks_dir)
         if len(entries) <= max_entries:
             return
@@ -570,5 +898,61 @@ class Orchestrator:
         prompt = build_summarization_prompt(previous_summary, to_summarize)
         summary_prompt_path = tasks_dir / "summary_prompt.md"
         summary_prompt_path.write_text(
-            f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n{prompt.messages[0]['content']}\n"
+            f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
+            f"{prompt.messages[0]['content']}\n"
         )
+
+
+@dataclass
+class RunActivityMonitor:
+    db: Database
+    run_id: int
+    tasks_dir: Path
+    lease_seconds: int
+    poll_interval: float = 2.5
+    _running: bool = True
+
+    async def run(self) -> None:
+        last_mtime = self._latest_activity_mtime()
+        last_heartbeat = datetime.now(tz=timezone.utc)
+        heartbeat_interval = self._heartbeat_interval()
+        while self._running:
+            await asyncio.sleep(self.poll_interval)
+            now = datetime.now(tz=timezone.utc)
+            latest = self._latest_activity_mtime()
+            activity_changed = latest > last_mtime
+            if activity_changed:
+                last_mtime = latest
+            if activity_changed or (now - last_heartbeat).total_seconds() >= heartbeat_interval:
+                lease_expires = (now + timedelta(seconds=self.lease_seconds)).isoformat()
+                self.db.update_run_lease(
+                    self.run_id,
+                    lease_expires_at=lease_expires,
+                    last_activity_at=now.isoformat() if activity_changed else None,
+                    last_heartbeat_at=now.isoformat(),
+                )
+                last_heartbeat = now
+
+    def stop(self) -> None:
+        self._running = False
+
+    def _latest_activity_mtime(self) -> float:
+        paths = [
+            self.tasks_dir / "tool_runs.jsonl",
+            self.tasks_dir / "agent_events.jsonl",
+            self.tasks_dir / "outbound_messages.jsonl",
+            self.tasks_dir / "run_result.json",
+        ]
+        latest = 0.0
+        for path in paths:
+            try:
+                if path.exists():
+                    latest = max(latest, path.stat().st_mtime)
+            except OSError:
+                continue
+        return latest
+
+    def _heartbeat_interval(self) -> float:
+        if self.lease_seconds <= 0:
+            return 15.0
+        return max(5.0, min(30.0, self.lease_seconds / 4))

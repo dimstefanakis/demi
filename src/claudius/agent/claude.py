@@ -59,6 +59,7 @@ class ClaudeAgent:
         "Task",
         "Skill",
         UNSPLASH_SEARCH_TOOL,
+        f"mcp__{CHAT_SERVER_NAME}__decide_project",
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
         SEND_MESSAGE_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
@@ -223,6 +224,130 @@ class ClaudeAgent:
             usage=usage,
         )
 
+    async def send_interaction_message(
+        self,
+        workspace: Workspace,
+        text: str,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+    ) -> None:
+        interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
+        chat_server = build_chat_server(
+            ChatToolContext(
+                messenger=messenger,
+                tenant_external_id=str(tenant_external_id or ""),
+                tenant_key=(
+                    f"{provider}:{tenant_external_id}" if provider and tenant_external_id else None
+                ),
+                provider=provider,
+                tasks_dir=workspace.tasks_dir,
+                tenant_id=tenant_id,
+                db=db,
+                payments=payments,
+            )
+        )
+        options = ClaudeAgentOptions(
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+            ],
+            permission_mode=self.permission_mode,
+            system_prompt=interaction_prompt,
+            setting_sources=self.setting_sources,
+            cwd=workspace.root,
+            add_dirs=[Path.cwd()],
+            plugins=self.plugins,
+            agents=None,
+            mcp_servers={CHAT_SERVER_NAME: chat_server},
+        )
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        try:
+            prompt = (
+                "Send the following user update if it fits the current context. "
+                "If it would be redundant, do not send.\n\n"
+                f"UPDATE:\n{text}"
+            )
+            await client.query(prompt, session_id=session_id or "interaction")
+            async for msg in client.receive_messages():
+                if isinstance(msg, ResultMessage):
+                    break
+        finally:
+            await client.disconnect()
+
+    async def send_interaction_instruction(
+        self,
+        workspace: Workspace,
+        instruction: str,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+    ) -> None:
+        interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
+        chat_server = build_chat_server(
+            ChatToolContext(
+                messenger=messenger,
+                tenant_external_id=str(tenant_external_id or ""),
+                tenant_key=(
+                    f"{provider}:{tenant_external_id}" if provider and tenant_external_id else None
+                ),
+                provider=provider,
+                tasks_dir=workspace.tasks_dir,
+                tenant_id=tenant_id,
+                db=db,
+                payments=payments,
+            )
+        )
+        options = ClaudeAgentOptions(
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+            ],
+            permission_mode=self.permission_mode,
+            system_prompt=interaction_prompt,
+            setting_sources=self.setting_sources,
+            cwd=workspace.root,
+            add_dirs=[Path.cwd()],
+            plugins=self.plugins,
+            agents=None,
+            mcp_servers={CHAT_SERVER_NAME: chat_server},
+        )
+        client = ClaudeSDKClient(options=options)
+        await client.connect()
+        try:
+            prompt = (
+                "Follow the instruction below. If sending a message would be redundant, "
+                "do not send anything.\n\n"
+                f"INSTRUCTION:\n{instruction}"
+            )
+            await client.query(prompt, session_id=session_id or "interaction")
+            async for msg in client.receive_messages():
+                if isinstance(msg, ResultMessage):
+                    break
+        finally:
+            await client.disconnect()
+
     def _build_supabase_mcp_config(
         self, workspace: Workspace, settings: Settings
     ) -> dict[str, Any] | None:
@@ -285,9 +410,7 @@ class ClaudeAgent:
         import time
 
         start = time.monotonic()
-        last_activity = start
-        idle_timeout = 3.0
-        max_window = 20.0
+        max_window = 3600.0
 
         while True:
             if stop_event is not None and stop_event.is_set():
@@ -297,20 +420,21 @@ class ClaudeAgent:
             try:
                 update = await asyncio.wait_for(inflight_stream.queue.get(), timeout=0.2)
             except asyncio.TimeoutError:
-                if time.monotonic() - last_activity >= idle_timeout:
-                    break
                 continue
             if update is None:
                 break
             text = str(update).strip()
             if not text:
                 continue
-            last_activity = time.monotonic()
             yield {
                 "type": "user",
                 "message": {
                     "role": "user",
-                    "content": f"IN-FLIGHT UPDATE (same task, do not respond separately): {text}",
+                    "content": (
+                        "IN-FLIGHT UPDATE (new user request while you're working; "
+                        "acknowledge via interaction-agent, then continue current task): "
+                        f"{text}"
+                    ),
                 },
             }
 

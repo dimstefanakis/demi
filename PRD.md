@@ -94,6 +94,8 @@ Users never:
 3. Fast first result
 4. Editability is the core loop
 5. Opinionated by default
+6. Never leave the user hanging (always acknowledge)
+7. Reliable progress even when runs stall
 
 ---
 
@@ -112,10 +114,11 @@ Responsibilities:
 
 ### 2) Tenant Workspace (Per Client)
 Persistent on disk:
-- `memory.md` (long-term facts and decisions)
-- `tasks/` (task briefs + results)
-- `assets/` (uploaded/sourced images)
-- `site/` (website codebase)
+- `projects/<project_name>/memory.md` (long-term facts and decisions)
+- `projects/<project_name>/DESCRIPTION.md` (project summary/context)
+- `projects/<project_name>/tasks/` (task briefs + results)
+- `projects/<project_name>/assets/` (uploaded/sourced images)
+- `projects/<project_name>/site/` (website codebase)
 
 ### 3) Per-Tenant Container (Execution)
 Dedicated container per tenant:
@@ -128,6 +131,37 @@ Dedicated container per tenant:
 - Vercel projects per tenant
 - Created once and reused
 - URL stored in DB
+
+---
+
+## Conversation Reliability & UX (High Priority)
+### Goals (User Experience)
+- Always receive an acknowledgment when they send a message.
+- Continue sending requests even while work is in progress.
+- Avoid “stuck” runs; the system should recover automatically.
+- Seamless handling of multiple projects without repeated clarification.
+
+### Behavior
+1) **Immediate Acknowledgment**
+   - If a run is already in progress for the same project, respond quickly with a short acknowledgment.
+2) **Per‑Project Concurrency**
+   - Only block work within the same project.
+   - Requests for different projects should proceed in parallel (separate queues).
+3) **Queued Requests**
+   - Incoming messages for a busy project are queued and merged into the next run.
+   - Statuses are recorded so the agent can see what’s pending.
+4) **Run Leases & Auto‑Recovery**
+   - Each run has a lease with periodic heartbeats.
+   - If the lease expires, mark the run failed and allow new work to start.
+   - Avoid requiring a manual reset when containers die or jobs stall.
+5) **Context‑Aware Project Routing**
+   - The system infers the correct project based on recent chat history and project context
+     (DESCRIPTION/memory/task summaries).
+   - The active project is stored for future runs but can be overridden per request.
+
+### Operator/Agent Visibility
+- Write a lightweight request status file per project (e.g., `tasks/request_status.md`)
+  summarizing active run + pending messages so agents can self‑diagnose.
 
 ---
 
