@@ -4,6 +4,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import os
+import re
 from typing import Any
 from contextlib import asynccontextmanager
 import asyncio
@@ -69,6 +70,7 @@ class ClaudeAgent:
     supports_inflight_stream = True
     SUPABASE_MCP_SERVER_NAME = "supabase"
     SUPABASE_MCP_BASE_URL = "https://mcp.supabase.com/mcp"
+    CHROME_DEVTOOLS_MCP_SERVER_NAME = "chrome-devtools"
     DEFAULT_ALLOWED_TOOLS = [
         "Read",
         "Write",
@@ -93,6 +95,7 @@ class ClaudeAgent:
         f"mcp__{SUPABASE_SERVER_NAME}__provision_managed_backend",
         f"mcp__{SUPABASE_SERVER_NAME}__upgrade_managed_backend",
         f"mcp__{SUPABASE_MCP_SERVER_NAME}__*",
+        f"mcp__{CHROME_DEVTOOLS_MCP_SERVER_NAME}__*",
     ]
 
     def __init__(
@@ -158,6 +161,14 @@ class ClaudeAgent:
         supabase_mcp = self._build_supabase_mcp_config(workspace, settings)
         if supabase_mcp:
             mcp_servers[self.SUPABASE_MCP_SERVER_NAME] = supabase_mcp
+        chrome_mcp = self._build_chrome_devtools_mcp_config(
+            workspace=workspace,
+            settings=settings,
+            tenant_id=tenant_id,
+            message=message,
+        )
+        if chrome_mcp:
+            mcp_servers[self.CHROME_DEVTOOLS_MCP_SERVER_NAME] = chrome_mcp
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
@@ -388,6 +399,41 @@ class ClaudeAgent:
             "headers": {"Authorization": f"Bearer {settings.supabase_access_token}"},
         }
 
+    def _build_chrome_devtools_mcp_config(
+        self,
+        workspace: Workspace,
+        settings: Settings,
+        tenant_id: int | None,
+        message: NormalizedMessage,
+    ) -> dict[str, Any] | None:
+        if not settings.chrome_devtools_mcp_enabled:
+            return None
+
+        tenant_slug = self._chrome_tenant_slug(tenant_id, message)
+        base_dir = self._resolve_tenant_path(
+            workspace, settings.chrome_devtools_mcp_profile_dir
+        )
+        profile_dir = base_dir / tenant_slug
+        profile_dir.mkdir(parents=True, exist_ok=True)
+
+        command = settings.chrome_devtools_mcp_command
+        args = []
+        if Path(command).name == "npx":
+            args.append("-y")
+        args.append(settings.chrome_devtools_mcp_package)
+        if settings.chrome_devtools_mcp_headless:
+            args.append("--headless=true")
+        if settings.chrome_devtools_mcp_executable_path:
+            args.append(
+                f"--executablePath={settings.chrome_devtools_mcp_executable_path}"
+            )
+        args.append(f"--userDataDir={profile_dir}")
+
+        return {
+            "command": command,
+            "args": args,
+        }
+
     @staticmethod
     def _load_supabase_project_state(workspace: Workspace) -> dict[str, Any] | None:
         db = ensure_tenant_db(workspace.root / "tenant.sqlite")
@@ -516,11 +562,25 @@ class ClaudeAgent:
             if fallback.exists():
                 return fallback.read_text(encoding="utf-8")
             if (parent / "pyproject.toml").exists():
-                if fallback.exists():
-                    return fallback.read_text(encoding="utf-8")
                 break
 
         raise FileNotFoundError(f"Prompt file not found: {path}")
+
+    @staticmethod
+    def _resolve_tenant_path(workspace: Workspace, path: Path) -> Path:
+        if path.is_absolute():
+            return path
+        return (workspace.tenant_root / path).resolve()
+
+    @staticmethod
+    def _chrome_tenant_slug(tenant_id: int | None, message: NormalizedMessage) -> str:
+        if tenant_id is not None:
+            raw = f"tenant-{tenant_id}"
+        else:
+            raw = message.tenant_key or message.tenant_external_id or "tenant-unknown"
+        cleaned = re.sub(r"[^a-z0-9._-]+", "-", raw.strip().lower())
+        cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_")
+        return cleaned or "tenant-unknown"
 
     @staticmethod
     def _load_plugins_from_env() -> list[dict]:

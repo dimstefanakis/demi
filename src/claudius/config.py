@@ -22,6 +22,13 @@ class Settings(BaseSettings):
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
 
+    chrome_devtools_mcp_enabled: bool = False
+    chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")
+    chrome_devtools_mcp_command: str = "bunx"
+    chrome_devtools_mcp_package: str = "chrome-devtools-mcp@latest"
+    chrome_devtools_mcp_headless: bool = True
+    chrome_devtools_mcp_executable_path: str | None = None
+
     vercel_cmd: str = "vercel"
     vercel_token: str | None = None
     vercel_scope: str | None = None

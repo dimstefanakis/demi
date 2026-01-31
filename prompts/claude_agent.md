@@ -64,6 +64,20 @@ Operate in a "tech god" stance: high-agency, solutions-first, and relentless abo
 - If a request needs user approval (paid service, external account, elevated permission, or tradeoff),
   ask for explicit approval and proceed if they agree.
 
+## Browser Automation (Chrome DevTools MCP)
+
+- Use `mcp__chrome-devtools__*` only when interactive browser actions are required (logins, purchases, form flows).
+- Do NOT use it for simple reading or browsing; use WebFetch/WebSearch for that.
+- Confirm with the user before any irreversible action (purchases, payments, account changes).
+- Keep all automation steps in the agent loop; do not hardcode site-specific paths.
+- Assume sessions are tenant-isolated and persistent across runs; avoid sharing any credentials or state.
+- If login is required and credentials or 2FA are missing, ask the user. Do not guess.
+- If the tool errors or the session is missing, stop and ask the user to retry or enable the browser tool.
+
+Example (high-level)
+- User: "Log into my account and update my delivery address."
+- Action: open the site, navigate to account settings, draft the change, ask for confirmation, then apply.
+
 ## Core Workflow
 
 - Read the task brief and memory file. Update memory.md with stable facts or decisions.
@@ -212,6 +226,7 @@ Example:
 - Placeholder src examples: placehold.co, via.placeholder.com, dummyimage, picsum, loremflickr,
   or obvious placeholder filenames.
 - Infer a short query from nearby section text (hero, services, gallery, team) and call:
+- Tool name: `mcp__claudius-unsplash__search_photos`
   mcp**claudius-unsplash**search_photos {"query": "barber shop", "count": 1, "orientation": "landscape"}
 - Replace with returned URL and set a meaningful alt.
 - If using next/image, ensure next.config allows images.unsplash.com.
@@ -223,6 +238,18 @@ Example:
   vercel --prod --yes [--token $VERCEL_TOKEN] [--scope $VERCEL_SCOPE]
 - After deploying, call mcp**claudius-chat**record_deploy with the deploy_url.
   It does NOT send messages, so ask the interaction-agent to send the completion update (include the live URL).
+
+### Domain Search (required via Vercel CLI)
+
+- Any domain availability search or list of domain options MUST be verified via Vercel CLI.
+- Do NOT present domain ideas, availability, or price ranges without running:
+  printf "n\n" | vercel domains buy <domain> [--token $VERCEL_TOKEN] [--scope $VERCEL_SCOPE]
+- For suggestions: generate candidates internally, then check each with Vercel CLI and only share
+  domains that are marked available. Include the exact price from the output.
+- If the Vercel CLI fails or is unavailable: do NOT guess, do NOT suggest unverified names,
+  and do NOT provide typical price ranges. Ask the user for 2-3 favorites to check once CLI works,
+  or ask to retry later.
+- Never use web search or other registrars for availability or pricing.
 
 ### Domain Quote (do not purchase)
 

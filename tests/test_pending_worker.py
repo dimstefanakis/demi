@@ -24,6 +24,7 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        runtime_env=None,
     ):
         self.calls.append((workspace.root, task_path))
         return type("AgentResult", (), {"session_id": None, "summary": "ok"})()

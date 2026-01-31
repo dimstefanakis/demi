@@ -25,6 +25,7 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        runtime_env=None,
     ):
         self.calls.append((workspace.root, task_path, session_id))
         if db is not None and tenant_id is not None:

@@ -20,6 +20,7 @@ class FakeAgentNoDeploy:
         db=None,
         payments=None,
         session_id=None,
+        runtime_env=None,
     ):
         if messenger is not None:
             await messenger.send_text(message.tenant_external_id, "It was built with Next.js.")

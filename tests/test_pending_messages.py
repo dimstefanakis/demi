@@ -23,6 +23,7 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        runtime_env=None,
     ):
         self.messages.append(message)
         return type("AgentResult", (), {"session_id": session_id, "summary": "ok"})()
