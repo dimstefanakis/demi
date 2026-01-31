@@ -6,7 +6,7 @@ def test_prompt_includes_bun_commands(tmp_path):
     task = tmp_path / "task.md"
     memory = tmp_path / "memory.md"
     task.write_text("Task")
-    memory.write_text("Memory")
+    memory.write_text("Memory contents for snapshot")
 
     prompt = ClaudeAgent._build_prompt(task_path=task, memory_path=memory)
 
@@ -18,3 +18,4 @@ def test_prompt_includes_bun_commands(tmp_path):
     assert "record_domain_quote" in prompt
     assert "interaction-agent" in prompt
     assert "mcp__claudius-unsplash__search_photos" in prompt
+    assert "Memory contents for snapshot" in prompt

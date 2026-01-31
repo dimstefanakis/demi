@@ -289,6 +289,12 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 - If tasks/summary_prompt.md exists, use it to update tasks/chat_summary.md, then trim
   tasks/chat_log.jsonl to keep only the most recent 10 entries and delete summary_prompt.md.
 
+## Memory Updates
+
+- If tasks/memory_prompt.md exists, use it to update memory.md, then delete memory_prompt.md.
+- Only store stable facts, preferences, decisions, and long-term context. Exclude transient tasks.
+- If nothing new is learned, leave memory.md unchanged (still delete memory_prompt.md).
+
 ## In-Flight Updates
 
 - If tasks/inflight_updates.jsonl exists, read it before heavy steps (Gemini/build/deploy) and after each major phase.
@@ -309,3 +315,5 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 
 - Task brief: <<TASK_PATH>>
 - Memory file: <<MEMORY_PATH>>
+- Memory snapshot (always in context):
+<<MEMORY_SNAPSHOT>>

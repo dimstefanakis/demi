@@ -408,13 +408,29 @@ class ClaudeAgent:
         settings = Settings()
         template = ClaudeAgent._load_prompt_file(settings.claude_prompt_path)
         event_url = settings.event_url or "not configured"
+        memory_snapshot = ClaudeAgent._read_memory_snapshot(memory_path)
         return (
             template.replace("<<TASK_PATH>>", str(task_path))
             .replace("<<MEMORY_PATH>>", str(memory_path))
+            .replace("<<MEMORY_SNAPSHOT>>", memory_snapshot)
             .replace("<<EVENT_URL>>", event_url)
             .rstrip()
             + "\n"
         )
+
+    @staticmethod
+    def _read_memory_snapshot(memory_path: Path, max_bytes: int = 8000) -> str:
+        try:
+            content = memory_path.read_text(encoding="utf-8")
+        except OSError:
+            return "(memory missing)"
+        content = content.strip()
+        if not content:
+            return "(memory empty)"
+        if len(content) > max_bytes:
+            trimmed = content[:max_bytes].rstrip()
+            return f"{trimmed}\n\n...[truncated]"
+        return content
 
     @staticmethod
     async def _prompt_stream(

@@ -26,3 +26,19 @@ def test_compaction_prompt_created(tmp_path):
     content = prompt_path.read_text()
     assert "SYSTEM_PROMPT:" in content
     assert "USER_MESSAGE:" in content
+
+
+def test_memory_prompt_created(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("# Memory\n\n- Existing detail\n")
+    for i in range(3):
+        append_log(tasks_dir, "user_message", f"msg {i}")
+
+    Orchestrator._maybe_prepare_memory_update(tasks_dir, memory_path, max_entries=2)
+    prompt_path = tasks_dir / "memory_prompt.md"
+    assert prompt_path.exists()
+    content = prompt_path.read_text()
+    assert "SYSTEM_PROMPT:" in content
+    assert "USER_MESSAGE:" in content
+    assert "Existing memory:" in content

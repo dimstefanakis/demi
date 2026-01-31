@@ -13,7 +13,7 @@ from claudius.models import NormalizedMessage, OrchestratorResult
 from claudius.workspace.core import Workspace, WorkspaceManager
 from claudius.messaging.telegram import TelegramUpdateParser
 from claudius.agent.inflight import InflightTextStream
-from claudius.memory import build_summarization_prompt, read_logs
+from claudius.memory import build_memory_prompt, build_summarization_prompt, read_logs
 from claudius.memory.logs import append_log, write_chat_history
 
 from claudius.failure_guard import clear_block, get_block, record_hard_failure
@@ -190,6 +190,7 @@ class Orchestrator:
 
         self._clear_run_artifacts(workspace.tasks_dir)
         self._maybe_prepare_compaction(workspace.tasks_dir)
+        self._maybe_prepare_memory_update(workspace.tasks_dir, workspace.memory_path)
 
         settings = Settings()
         run_id = self.db.create_run(
@@ -890,6 +891,7 @@ class Orchestrator:
             "user_reply.txt",
             "result_summary.md",
             "summary_prompt.md",
+            "memory_prompt.md",
         ):
             path = tasks_dir / name
             if path.exists():
@@ -940,6 +942,25 @@ class Orchestrator:
         prompt = build_summarization_prompt(previous_summary, to_summarize)
         summary_prompt_path = tasks_dir / "summary_prompt.md"
         summary_prompt_path.write_text(
+            f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
+            f"{prompt.messages[0]['content']}\n"
+        )
+
+    @staticmethod
+    def _maybe_prepare_memory_update(
+        tasks_dir: Path, memory_path: Path, max_entries: int = 40
+    ) -> None:
+        entries = read_logs(tasks_dir)
+        if not entries:
+            return
+        recent = entries[-max_entries:]
+        try:
+            previous_memory = memory_path.read_text(encoding="utf-8")
+        except OSError:
+            previous_memory = ""
+        prompt = build_memory_prompt(previous_memory, recent)
+        memory_prompt_path = tasks_dir / "memory_prompt.md"
+        memory_prompt_path.write_text(
             f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
             f"{prompt.messages[0]['content']}\n"
         )
