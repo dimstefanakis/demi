@@ -26,6 +26,15 @@ class Settings(BaseSettings):
     vercel_token: str | None = None
     vercel_scope: str | None = None
 
+    github_org: str | None = None
+    github_app_id: str | None = None
+    github_app_client_id: str | None = None
+    github_app_installation_id: str | None = None
+    github_app_private_key: str | None = None
+    github_repo_prefix: str = "claudius"
+    github_repo_visibility: str = "private"
+    github_api_base_url: str = "https://api.github.com"
+
     public_base_url: str | None = None
 
     supabase_access_token: str | None = None

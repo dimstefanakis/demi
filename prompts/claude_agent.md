@@ -82,6 +82,18 @@ Operate in a "tech god" stance: high-agency, solutions-first, and relentless abo
   - `EVENT_URL` should be set to that same value when wiring tenant sites.
   - This is the canonical external webhook URL; use it when describing how to connect third-party sources.
   - Use only for simple, unauthenticated event flows that store data in the project SQLite.
+
+## GitHub Repos (Autonomous Versioning)
+
+- Each project has a dedicated GitHub repo in the org. Repo metadata lives at `github_repo.json`
+  in the project root (non-secret).
+- A short-lived installation token is provided at runtime via `GITHUB_TOKEN`.
+  Repo hints are available in: `GITHUB_REPO_FULL_NAME`, `GITHUB_REPO_HTTP_URL`,
+  `GITHUB_REPO_SSH_URL`, and `GITHUB_REPO_DEFAULT_BRANCH` when configured.
+- You decide if/when to initialize git, commit, and push. Do not assume every run must commit.
+- Never write tokens to disk, logs, or chat messages. Keep secrets only in env vars.
+- If you push, prefer HTTPS remote without embedded credentials and pass the token via headers:
+  `git -c http.extraheader="Authorization: Bearer $GITHUB_TOKEN" push`.
 - If the request needs auth, complex data models, or multi-user access, use the managed backend flow below (do not mention vendor names).
   - When wiring a site to events, ensure the tenant's Vercel project has `EVENT_URL` set.
 

@@ -5,6 +5,8 @@ import json
 from pathlib import Path
 import os
 from typing import Any
+from contextlib import asynccontextmanager
+import asyncio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
 from claude_agent_sdk.types import ResultMessage, SystemMessage
@@ -32,6 +34,27 @@ from claudius.agent.inflight import InflightTextStream
 from claudius.models import NormalizedMessage
 from claudius.tenant_db import ensure_tenant_db
 from claudius.workspace.core import Workspace
+
+
+_ENV_LOCK = asyncio.Lock()
+
+
+@asynccontextmanager
+async def _apply_runtime_env(runtime_env: dict[str, str] | None):
+    if not runtime_env:
+        yield
+        return
+    async with _ENV_LOCK:
+        previous = {key: os.environ.get(key) for key in runtime_env}
+        os.environ.update({key: str(value) for key, value in runtime_env.items()})
+        try:
+            yield
+        finally:
+            for key, value in previous.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
 
 @dataclass
@@ -99,6 +122,7 @@ class ClaudeAgent:
         db: Any | None = None,
         payments: Any | None = None,
         session_id: str | None = None,
+        runtime_env: dict[str, str] | None = None,
     ) -> AgentResult:
         chat_server = build_chat_server(
             ChatToolContext(
@@ -160,8 +184,6 @@ class ClaudeAgent:
         )
         stop_event = None
         if inflight_stream is not None:
-            import asyncio
-
             stop_event = asyncio.Event()
         log_agent_event(
             workspace.tasks_dir,
@@ -171,39 +193,39 @@ class ClaudeAgent:
                 "task_path": str(task_path),
             },
         )
-        await client.query(
-            self._prompt_stream(
-                prompt, inflight_stream=inflight_stream, stop_event=stop_event
-            ),
-            session_id=session_id or "default",
-        )
-
         summary = None
         new_session_id = session_id
         total_cost_usd = None
         usage: dict[str, Any] | None = None
 
         try:
-            async for msg in client.receive_messages():
-                log_agent_event(
-                    workspace.tasks_dir,
-                    "sdk_message",
-                    {
-                        "class": msg.__class__.__name__,
-                        "subtype": getattr(msg, "subtype", None),
-                        "repr": repr(msg)[:1000],
-                    },
+            async with _apply_runtime_env(runtime_env):
+                await client.query(
+                    self._prompt_stream(
+                        prompt, inflight_stream=inflight_stream, stop_event=stop_event
+                    ),
+                    session_id=session_id or "default",
                 )
-                if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                    new_session_id = msg.data.get("session_id", new_session_id)
-                if isinstance(msg, ResultMessage):
-                    new_session_id = msg.session_id or new_session_id
-                    summary = msg.result
-                    total_cost_usd = msg.total_cost_usd
-                    usage = msg.usage
-                    if stop_event is not None:
-                        stop_event.set()
-                    break
+                async for msg in client.receive_messages():
+                    log_agent_event(
+                        workspace.tasks_dir,
+                        "sdk_message",
+                        {
+                            "class": msg.__class__.__name__,
+                            "subtype": getattr(msg, "subtype", None),
+                            "repr": repr(msg)[:1000],
+                        },
+                    )
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        new_session_id = msg.data.get("session_id", new_session_id)
+                    if isinstance(msg, ResultMessage):
+                        new_session_id = msg.session_id or new_session_id
+                        summary = msg.result
+                        total_cost_usd = msg.total_cost_usd
+                        usage = msg.usage
+                        if stop_event is not None:
+                            stop_event.set()
+                        break
         finally:
             log_agent_event(
                 workspace.tasks_dir,

@@ -31,6 +31,7 @@ class DockerAgent:
         db=None,
         payments=None,
         session_id=None,
+        runtime_env: dict[str, str] | None = None,
     ) -> AgentResult:
         tenant_root = getattr(workspace, "tenant_root", workspace.root)
         request_path = workspace.tasks_dir / "run_request.json"
@@ -42,7 +43,7 @@ class DockerAgent:
         )
         request_path.write_text(json.dumps(request_payload, indent=2))
 
-        env = self._build_env()
+        env = self._build_env(runtime_env)
         slot = self.pool.pop_container_for_workspace(tenant_root)
         if slot:
             await self.pool.exec_in_container(
@@ -173,7 +174,7 @@ class DockerAgent:
             },
         }
 
-    def _build_env(self) -> dict[str, str]:
+    def _build_env(self, extra_env: dict[str, str] | None = None) -> dict[str, str]:
         allowlist = self._env_allowlist()
         env: dict[str, str] = {}
         for key in allowlist:
@@ -184,6 +185,8 @@ class DockerAgent:
             value = self._settings_fallback(key)
             if value:
                 env[key] = value
+        if extra_env:
+            env.update(extra_env)
         return env
 
     def _env_allowlist(self) -> list[str]:

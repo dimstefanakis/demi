@@ -19,6 +19,7 @@ from claudius.memory.logs import append_log, write_chat_history
 from claudius.failure_guard import clear_block, get_block, record_hard_failure
 from claudius.tenant_db import ensure_tenant_db
 from claudius.workspace.project_decider import decide_project
+from claudius.domains.github_app import GitHubAppConfig, GitHubRepoManager
 from claudius.config import Settings
 
 
@@ -209,6 +210,7 @@ class Orchestrator:
                 poll_interval=settings.run_activity_poll_interval,
             )
             monitor_task = asyncio.create_task(monitor.run())
+            github_env = await self._prepare_github_env(workspace, tenant)
             agent_result = await self.agent.prepare_context(
                 workspace=workspace,
                 task_path=task_path,
@@ -219,6 +221,7 @@ class Orchestrator:
                 db=self.db,
                 payments=self.payments,
                 session_id=tenant.session_id,
+                runtime_env=github_env,
             )
             if agent_result.session_id:
                 self.db.update_tenant_session(tenant.id, agent_result.session_id)
@@ -638,6 +641,45 @@ class Orchestrator:
             self.db.update_tenant_workspace(tenant.id, str(workspace.tenant_root))
             tenant.workspace_path = str(workspace.tenant_root)
         return workspace
+
+    async def _prepare_github_env(
+        self,
+        workspace: Workspace,
+        tenant: Any,
+    ) -> dict[str, str]:
+        settings = Settings()
+        config = GitHubAppConfig.from_settings(settings)
+        if not config or not config.enabled:
+            return {}
+        manager = GitHubRepoManager(config)
+        try:
+            repo = await manager.ensure_repo(
+                project_root=workspace.root,
+                tenant_id=int(tenant.id),
+                project_name=workspace.project_name,
+            )
+            token = await manager.create_repo_token(repo)
+        except Exception as exc:  # noqa: BLE001
+            append_log(
+                workspace.tasks_dir,
+                "system",
+                f"github_setup_failed: {type(exc).__name__}: {exc}",
+            )
+            return {}
+        env: dict[str, str] = {
+            "GITHUB_TOKEN": token,
+            "GITHUB_REPO_FULL_NAME": repo.full_name,
+            "GITHUB_REPO_NAME": repo.name,
+            "GITHUB_REPO_OWNER": config.org,
+        }
+        if repo.clone_url:
+            env["GITHUB_REPO_HTTP_URL"] = repo.clone_url
+            env["GITHUB_REPO_URL"] = repo.clone_url
+        if repo.ssh_url:
+            env["GITHUB_REPO_SSH_URL"] = repo.ssh_url
+        if repo.default_branch:
+            env["GITHUB_REPO_DEFAULT_BRANCH"] = repo.default_branch
+        return env
 
     async def _allocate_workspace(self, tenant) -> Path:
         allocator = self.workspace_allocator
