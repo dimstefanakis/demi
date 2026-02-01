@@ -80,10 +80,25 @@ async def test_pending_messages_coalesced(tmp_path):
 
     id_a, _ = db.record_message(tenant.id, msg_a)
     id_b, _ = db.record_message(tenant.id, msg_b)
-    db.update_message_status(id_a, "pending")
-    db.update_message_status(id_b, "pending")
 
-    await orchestrator._drain_pending_messages(tenant)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=None,
+        message_id=id_a,
+        msg=msg_a,
+        status="queued",
+    )
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=None,
+        message_id=id_b,
+        msg=msg_b,
+        status="queued",
+    )
+
+    await orchestrator._drain_run_inputs(tenant)
 
     assert len(agent.messages) == 1
     combined = agent.messages[0].text or ""

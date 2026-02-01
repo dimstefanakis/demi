@@ -297,7 +297,8 @@ async def test_orchestrator_updates_request_status_for_pending(tmp_path):
 
     tenant = db.get_or_create_tenant("telegram", "444")
     workspace = workspace_manager.ensure_workspace(tenant.key)
-    db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
+    run_id = db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
+    db.set_active_run(tenant.id, workspace.project_name, run_id, None)
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -314,8 +315,46 @@ async def test_orchestrator_updates_request_status_for_pending(tmp_path):
 
     assert result.status == "busy"
     status_text = (workspace.tasks_dir / "request_status.md").read_text()
-    assert "Pending Messages" in status_text
+    assert "Queued Run Inputs" in status_text
     assert "Add a testimonials section" in status_text
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
+    db = Database(tmp_path / "claudius.sqlite")
+    db.init()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = db.get_or_create_tenant("telegram", "555")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    run_id = db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
+    db.set_active_run(tenant.id, workspace.project_name, run_id, None)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="queued-1",
+        tenant_external_id="555",
+        received_at=datetime.now(tz=timezone.utc),
+        text="Queue this update",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "busy"
+    assert not agent.calls
+    queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert queued
 
 
 @pytest.mark.asyncio

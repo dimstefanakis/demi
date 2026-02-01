@@ -69,7 +69,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     @tool(
         "should_send_message",
         "Check recent chat history to see if a message would be redundant.",
-        {"text": str},
+        {"text": str, "reply_to_message_id": str, "reply_to_text": str},
     )
     async def should_send_message(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
@@ -81,6 +81,21 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
             }
+        reply_to_message_id = str(args.get("reply_to_message_id", "")).strip()
+        reply_to_text = str(args.get("reply_to_text", "")).strip()
+        if reply_to_message_id or reply_to_text:
+            matches, match_reason = _reply_to_matches(
+                context.tasks_dir,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
+            )
+            if not matches:
+                payload = {"send": False, "reason": match_reason}
+                _log("should_send_message", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": False,
+                }
         decision, reason = _should_send(text, context.tasks_dir)
         payload = {"send": decision, "reason": reason}
         _log("should_send_message", args, result=payload, start=start)
@@ -141,7 +156,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     @tool(
         "send_message",
         "Send a user-facing chat update via the active messaging provider.",
-        {"text": str, "final": bool},
+        {"text": str, "final": bool, "reply_to_message_id": str, "reply_to_text": str},
     )
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
@@ -171,6 +186,27 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
+        reply_to_message_id = str(args.get("reply_to_message_id", "")).strip()
+        reply_to_text = str(args.get("reply_to_text", "")).strip()
+        if reply_to_message_id or reply_to_text:
+            matches, match_reason = _reply_to_matches(
+                context.tasks_dir,
+                reply_to_message_id=reply_to_message_id,
+                reply_to_text=reply_to_text,
+            )
+            if not matches:
+                _log(
+                    "send_message",
+                    args,
+                    result={"skipped": match_reason},
+                    start=start,
+                )
+                return {
+                    "content": [
+                        {"type": "text", "text": f"Skipped: {match_reason}."}
+                    ],
+                    "is_error": False,
+                }
 
         try:
             await context.messenger.send_text(context.tenant_external_id, text)
@@ -824,6 +860,45 @@ def _current_run_id(tasks_dir: Path) -> str | None:
         return None
     run_id = str(message.get("provider_message_id") or "").strip()
     return run_id or None
+
+
+def _current_run_message(tasks_dir: Path) -> dict[str, Any] | None:
+    path = tasks_dir / "run_request.json"
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    message = data.get("message") if isinstance(data, dict) else None
+    if not isinstance(message, dict):
+        return None
+    text = str(message.get("text") or "").strip()
+    images = message.get("images") if isinstance(message.get("images"), list) else []
+    if not text and images:
+        text = "(attachment)"
+    return {
+        "provider_message_id": str(message.get("provider_message_id") or "").strip(),
+        "text": text,
+    }
+
+
+def _reply_to_matches(
+    tasks_dir: Path,
+    *,
+    reply_to_message_id: str,
+    reply_to_text: str,
+) -> tuple[bool, str]:
+    current = _current_run_message(tasks_dir)
+    if current is None:
+        return False, "run_request_missing"
+    current_id = current.get("provider_message_id") or ""
+    current_text = str(current.get("text") or "").strip()
+    if reply_to_message_id and reply_to_message_id != current_id:
+        return False, "reply_to_message_id_mismatch"
+    if reply_to_text and reply_to_text.strip() != current_text:
+        return False, "reply_to_text_mismatch"
+    return True, "ok"
 
 
 def _final_sent_for_run(tasks_dir: Path, run_id: str) -> bool:

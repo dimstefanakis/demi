@@ -79,6 +79,10 @@ class Settings(BaseSettings):
     pending_worker_poll_interval: float = 2.5
     pending_worker_batch_size: int = 20
 
+    outbox_worker_enabled: bool = True
+    outbox_worker_poll_interval: float = 1.0
+    outbox_worker_batch_size: int = 50
+
     run_lease_seconds: int = 600
     run_activity_poll_interval: float = 2.5
 

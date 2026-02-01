@@ -10,6 +10,7 @@ from claudius.agent.claude import ClaudeAgent
 from claudius.config import Settings
 from claudius.db.factory import build_database
 from claudius.jobs.pending_worker import PendingWorker, PendingWorkerConfig
+from claudius.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from claudius.jobs.worker import EventWorker, EventWorkerConfig
 from claudius.messaging.telegram import TelegramClient, TelegramConfig
 from claudius.orchestrator import Orchestrator
@@ -97,8 +98,25 @@ async def _run_workers() -> None:
             asyncio.create_task(pending_worker.run_forever(), name="pending-worker")
         )
 
+    if settings.outbox_worker_enabled:
+        outbox_worker = OutboxWorker(
+            db=db,
+            messenger=messenger,
+            config=OutboxWorkerConfig(
+                poll_interval=settings.outbox_worker_poll_interval,
+                batch_size=settings.outbox_worker_batch_size,
+            ),
+        )
+        workers.append(outbox_worker)
+        tasks.append(
+            asyncio.create_task(outbox_worker.run_forever(), name="outbox-worker")
+        )
+
     if not tasks:
-        raise RuntimeError("No workers enabled. Set EVENTS_WORKER_ENABLED or PENDING_WORKER_ENABLED")
+        raise RuntimeError(
+            "No workers enabled. Set EVENTS_WORKER_ENABLED, PENDING_WORKER_ENABLED, "
+            "or OUTBOX_WORKER_ENABLED"
+        )
 
     stop_event = asyncio.Event()
 

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+import uuid
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -123,12 +124,48 @@ class Database:
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS run_inputs (
+                id TEXT PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                run_id INTEGER,
+                project_name TEXT,
+                source TEXT NOT NULL,
+                provider_message_id TEXT,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                claimed_at TEXT,
+                handled_at TEXT,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS outbox (
+                id TEXT PRIMARY KEY,
+                tenant_id INTEGER NOT NULL,
+                run_id INTEGER,
+                project_name TEXT,
+                correlation_id TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                status TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                sent_at TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS active_runs (
+                tenant_id INTEGER NOT NULL,
+                project_name TEXT NOT NULL,
+                run_id INTEGER NOT NULL,
+                lease_expires_at TEXT,
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (tenant_id, project_name)
+            );
             """
         )
         self._migrate_messages_unique_index(conn)
         self._migrate_runs_usage_columns(conn)
         self._migrate_messages_project_column(conn)
         self._migrate_runs_lease_columns(conn)
+        self._migrate_run_input_indexes(conn)
         conn.commit()
 
     def _migrate_messages_unique_index(self, conn: sqlite3.Connection) -> None:
@@ -226,6 +263,33 @@ class Database:
         if "project_name" not in columns:
             conn.execute("ALTER TABLE messages ADD COLUMN project_name TEXT;")
 
+    def _migrate_run_input_indexes(self, conn: sqlite3.Connection) -> None:
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS run_inputs_dedupe_idx
+                ON run_inputs (tenant_id, provider_message_id)
+                WHERE provider_message_id IS NOT NULL
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS run_inputs_queue_idx
+                ON run_inputs (tenant_id, project_name, status, created_at)
+            """
+        )
+        conn.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS outbox_dedupe_idx
+                ON outbox (tenant_id, correlation_id)
+            """
+        )
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS active_runs_run_idx
+                ON active_runs (run_id)
+            """
+        )
+
     @staticmethod
     def _has_unique_index(
         conn: sqlite3.Connection, table: str, columns: list[str]
@@ -295,6 +359,11 @@ class Database:
         if not row:
             return None
         return self._row_to_tenant(row)
+
+    def list_tenants(self) -> list[Tenant]:
+        conn = self.connect()
+        rows = conn.execute("SELECT * FROM tenants").fetchall()
+        return [self._row_to_tenant(row) for row in rows or []]
 
     def update_tenant_workspace(self, tenant_id: int, workspace_path: str) -> None:
         conn = self.connect()
@@ -635,6 +704,344 @@ class Database:
             f"UPDATE messages SET status = ? WHERE id IN ({placeholders})",
             (status, *message_ids),
         )
+        conn.commit()
+
+    def fetch_messages_by_statuses(
+        self,
+        tenant_id: int,
+        statuses: list[str],
+        project_name: str | None = None,
+    ) -> list[sqlite3.Row]:
+        if not statuses:
+            return []
+        conn = self.connect()
+        placeholders = ",".join("?" for _ in statuses)
+        params: list[Any] = [tenant_id, *statuses]
+        project_clause = ""
+        if project_name:
+            project_clause = " AND project_name = ?"
+            params.append(project_name)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM messages
+            WHERE tenant_id = ? AND status IN ({placeholders}){project_clause}
+            ORDER BY received_at ASC
+            """,
+            tuple(params),
+        ).fetchall()
+        return list(rows or [])
+
+    def create_run_input(
+        self,
+        tenant_id: int,
+        run_id: int | None,
+        project_name: str | None,
+        source: str,
+        provider_message_id: str | None,
+        payload: dict[str, Any],
+        status: str = "queued",
+    ) -> str:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        run_input_id = str(uuid.uuid4())
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO run_inputs (
+                id, tenant_id, run_id, project_name, source, provider_message_id,
+                payload_json, status, claimed_at, handled_at, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                run_input_id,
+                tenant_id,
+                run_id,
+                project_name,
+                source,
+                provider_message_id,
+                json.dumps(payload),
+                status,
+                None,
+                None,
+                now,
+            ),
+        )
+        conn.commit()
+        if cur.rowcount == 1:
+            return run_input_id
+        row = conn.execute(
+            """
+            SELECT id FROM run_inputs
+            WHERE tenant_id = ? AND provider_message_id = ?
+            """,
+            (tenant_id, provider_message_id),
+        ).fetchone()
+        return str(row["id"]) if row else run_input_id
+
+    def claim_run_inputs_for_project(
+        self, tenant_id: int, project_name: str | None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        where_project = ""
+        params: list[Any] = [tenant_id]
+        if project_name:
+            where_project = " AND project_name = ?"
+            params.append(project_name)
+        params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM run_inputs
+            WHERE tenant_id = ? AND status = 'queued'{where_project}
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"""
+            UPDATE run_inputs
+            SET status = 'claimed', claimed_at = ?
+            WHERE id IN ({placeholders})
+            """,
+            (now, *ids),
+        )
+        conn.commit()
+        return [dict(row) for row in rows]
+
+    def update_run_inputs_statuses(self, ids: list[str], status: str) -> None:
+        if not ids:
+            return
+        conn = self.connect()
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        fields = "status = ?"
+        params: list[Any] = [status]
+        if status == "handled":
+            fields = "status = ?, handled_at = ?"
+            params.append(now)
+        elif status == "queued":
+            fields = "status = ?, claimed_at = NULL"
+        params.extend(ids)
+        conn.execute(
+            f"UPDATE run_inputs SET {fields} WHERE id IN ({placeholders})",
+            tuple(params),
+        )
+        conn.commit()
+
+    def cancel_run_inputs(self, tenant_id: int, project_name: str | None) -> int:
+        conn = self.connect()
+        if project_name:
+            cur = conn.execute(
+                """
+                UPDATE run_inputs
+                SET status = 'cancelled'
+                WHERE tenant_id = ? AND project_name = ? AND status IN ('queued', 'claimed')
+                """,
+                (tenant_id, project_name),
+            )
+        else:
+            cur = conn.execute(
+                """
+                UPDATE run_inputs
+                SET status = 'cancelled'
+                WHERE tenant_id = ? AND status IN ('queued', 'claimed')
+                """,
+                (tenant_id,),
+            )
+        conn.commit()
+        return cur.rowcount
+
+    def fetch_run_inputs(
+        self,
+        tenant_id: int,
+        project_name: str | None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        conn = self.connect()
+        params: list[Any] = [tenant_id]
+        where_project = ""
+        where_status = ""
+        if project_name:
+            where_project = " AND project_name = ?"
+            params.append(project_name)
+        if status:
+            where_status = " AND status = ?"
+            params.append(status)
+        limit_clause = ""
+        if limit:
+            limit_clause = " LIMIT ?"
+            params.append(limit)
+        rows = conn.execute(
+            f"""
+            SELECT * FROM run_inputs
+            WHERE tenant_id = ?{where_project}{where_status}
+            ORDER BY created_at ASC{limit_clause}
+            """,
+            tuple(params),
+        ).fetchall()
+        return [dict(row) for row in rows or []]
+
+    def fetch_queued_run_input_groups(self, limit: int = 25) -> list[dict[str, Any]]:
+        conn = self.connect()
+        rows = conn.execute(
+            """
+            SELECT tenant_id, project_name, MIN(created_at) AS oldest_created_at
+            FROM run_inputs
+            WHERE status = 'queued'
+            GROUP BY tenant_id, project_name
+            ORDER BY oldest_created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        return [dict(row) for row in rows or []]
+
+    def enqueue_outbox(
+        self,
+        tenant_id: int,
+        run_id: int | None,
+        project_name: str | None,
+        correlation_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        outbox_id = str(uuid.uuid4())
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO outbox (
+                id, tenant_id, run_id, project_name, correlation_id,
+                payload_json, status, created_at, sent_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                outbox_id,
+                tenant_id,
+                run_id,
+                project_name,
+                correlation_id,
+                json.dumps(payload),
+                "queued",
+                now,
+                None,
+            ),
+        )
+        conn.commit()
+        if cur.rowcount == 1:
+            return outbox_id
+        row = conn.execute(
+            """
+            SELECT id FROM outbox
+            WHERE tenant_id = ? AND correlation_id = ?
+            """,
+            (tenant_id, correlation_id),
+        ).fetchone()
+        return str(row["id"]) if row else outbox_id
+
+    def claim_outbox(self, limit: int = 25) -> list[dict[str, Any]]:
+        conn = self.connect()
+        rows = conn.execute(
+            """
+            SELECT * FROM outbox
+            WHERE status = 'queued'
+            ORDER BY created_at ASC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+        if not rows:
+            return []
+        ids = [row["id"] for row in rows]
+        placeholders = ",".join("?" for _ in ids)
+        conn.execute(
+            f"UPDATE outbox SET status = 'sending' WHERE id IN ({placeholders})",
+            tuple(ids),
+        )
+        conn.commit()
+        return [dict(row) for row in rows]
+
+    def update_outbox_statuses(self, ids: list[str], status: str) -> None:
+        if not ids:
+            return
+        conn = self.connect()
+        placeholders = ",".join("?" for _ in ids)
+        now = datetime.now(tz=timezone.utc).isoformat()
+        fields = "status = ?"
+        params: list[Any] = [status]
+        if status == "sent":
+            fields = "status = ?, sent_at = ?"
+            params.append(now)
+        params.extend(ids)
+        conn.execute(
+            f"UPDATE outbox SET {fields} WHERE id IN ({placeholders})",
+            tuple(params),
+        )
+        conn.commit()
+
+    def set_active_run(
+        self,
+        tenant_id: int,
+        project_name: str,
+        run_id: int,
+        lease_expires_at: str | None,
+    ) -> None:
+        conn = self.connect()
+        now = datetime.now(tz=timezone.utc).isoformat()
+        conn.execute(
+            """
+            INSERT INTO active_runs (
+                tenant_id, project_name, run_id, lease_expires_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(tenant_id, project_name)
+            DO UPDATE SET run_id = excluded.run_id,
+                          lease_expires_at = excluded.lease_expires_at,
+                          updated_at = excluded.updated_at
+            """,
+            (tenant_id, project_name, run_id, lease_expires_at, now),
+        )
+        conn.commit()
+
+    def get_active_run(
+        self, tenant_id: int, project_name: str | None
+    ) -> sqlite3.Row | None:
+        conn = self.connect()
+        if project_name:
+            row = conn.execute(
+                """
+                SELECT * FROM active_runs
+                WHERE tenant_id = ? AND project_name = ?
+                LIMIT 1
+                """,
+                (tenant_id, project_name),
+            ).fetchone()
+        else:
+            row = conn.execute(
+                """
+                SELECT * FROM active_runs
+                WHERE tenant_id = ?
+                LIMIT 1
+                """,
+                (tenant_id,),
+            ).fetchone()
+        return row
+
+    def clear_active_run(self, tenant_id: int, project_name: str | None) -> None:
+        conn = self.connect()
+        if project_name:
+            conn.execute(
+                "DELETE FROM active_runs WHERE tenant_id = ? AND project_name = ?",
+                (tenant_id, project_name),
+            )
+        else:
+            conn.execute("DELETE FROM active_runs WHERE tenant_id = ?", (tenant_id,))
         conn.commit()
 
     def has_inflight_run(self, tenant_id: int, project_name: str | None = None) -> bool:

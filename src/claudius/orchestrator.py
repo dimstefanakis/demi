@@ -9,7 +9,7 @@ import re
 import asyncio
 
 from claudius.db.core import Database
-from claudius.models import NormalizedMessage, OrchestratorResult
+from claudius.models import Attachment, NormalizedMessage, OrchestratorResult
 from claudius.workspace.core import Workspace, WorkspaceManager
 from claudius.messaging.telegram import TelegramUpdateParser
 from claudius.agent.inflight import InflightTextStream
@@ -74,41 +74,54 @@ class Orchestrator:
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
-        if inflight_run and self._is_run_stale(
-            inflight_run,
-            max_age_seconds=900,
-        ):
+        if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
             await self._finalize_stale_run(tenant, inflight_run)
             inflight_run = None
 
-        if inflight_run:
-            supports_stream = self._supports_inflight_stream()
-            stream = self._get_inflight_stream(tenant.key, project_name)
-            if (
-                supports_stream
-                and stream is not None
-                and stream.accepting
-                and msg.text
-                and not msg.images
-            ):
-                await stream.queue.put(msg.text)
-                self.db.update_message_status(message_id, "processed")
-                return OrchestratorResult(status="busy", detail="streamed to in-flight run")
+        active_run = self.db.get_active_run(tenant.id, project_name)
+        if active_run:
+            if not inflight_run or int(active_run["run_id"]) != int(inflight_run["id"]):
+                self.db.clear_active_run(tenant.id, project_name)
+                active_run = None
 
-            self.db.update_message_status(message_id, "pending")
-            asset_paths = []
-            if msg.images and hasattr(self.messenger, "download_images"):
-                asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
-            self._append_inflight_update(workspace.tasks_dir, msg, asset_paths, message_id)
+        if active_run:
+            self.db.update_message_status(message_id, "queued")
+            self._enqueue_run_input(
+                tenant_id=tenant.id,
+                run_id=int(active_run["run_id"]),
+                project_name=project_name,
+                message_id=message_id,
+                msg=msg,
+                status="queued",
+            )
             self._write_request_status(workspace, tenant)
             await self._send_busy_ack(workspace, tenant, msg)
             return OrchestratorResult(status="busy", detail="tenant already running")
 
+        lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
+        run_id = self.db.create_run(
+            tenant.id,
+            message_id=message_id,
+            project_name=workspace.project_name,
+            lease_seconds=settings.run_lease_seconds,
+        )
+        self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
+        run_input_id = self._enqueue_run_input(
+            tenant_id=tenant.id,
+            run_id=run_id,
+            project_name=project_name,
+            message_id=message_id,
+            msg=msg,
+            status="claimed",
+        )
         return await self._run_message(
             tenant=tenant,
             msg=msg,
             message_id=message_id,
-            process_pending=True,
+            message_ids=[message_id],
+            run_id=run_id,
+            run_input_ids=[run_input_id],
+            process_queue=True,
             project_name=project_name,
         )
 
@@ -137,10 +150,15 @@ class Orchestrator:
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
-        if inflight_run and not self._is_run_stale(inflight_run, max_age_seconds=900):
-            return OrchestratorResult(status="busy", detail="tenant already running")
         if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
             await self._finalize_stale_run(tenant, inflight_run)
+            inflight_run = None
+
+        active_run = self.db.get_active_run(tenant.id, project_name)
+        if active_run:
+            if not inflight_run or int(active_run["run_id"]) != int(inflight_run["id"]):
+                self.db.clear_active_run(tenant.id, project_name)
+                active_run = None
 
         event_type = str(payload.get("event_type") or "event").strip()
         event_payload = payload.get("payload") or {}
@@ -159,12 +177,44 @@ class Orchestrator:
         message_id, inserted = self.db.record_message(tenant.id, msg)
         if not inserted:
             return OrchestratorResult(status="duplicate", detail="event already processed")
+        if active_run:
+            self.db.update_message_status(message_id, "queued")
+            self._enqueue_run_input(
+                tenant_id=tenant.id,
+                run_id=int(active_run["run_id"]),
+                project_name=project_name,
+                message_id=message_id,
+                msg=msg,
+                status="queued",
+            )
+            self._write_request_status(workspace, tenant)
+            return OrchestratorResult(status="busy", detail="tenant already running")
 
+        settings = Settings()
+        lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
+        run_id = self.db.create_run(
+            tenant.id,
+            message_id=message_id,
+            project_name=workspace.project_name,
+            lease_seconds=settings.run_lease_seconds,
+        )
+        self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
+        run_input_id = self._enqueue_run_input(
+            tenant_id=tenant.id,
+            run_id=run_id,
+            project_name=project_name,
+            message_id=message_id,
+            msg=msg,
+            status="claimed",
+        )
         return await self._run_message(
             tenant=tenant,
             msg=msg,
             message_id=message_id,
-            process_pending=True,
+            message_ids=[message_id],
+            run_id=run_id,
+            run_input_ids=[run_input_id],
+            process_queue=True,
             project_name=project_name,
         )
 
@@ -173,12 +223,16 @@ class Orchestrator:
         tenant,
         msg: NormalizedMessage,
         message_id: int,
-        process_pending: bool,
+        message_ids: list[int] | None,
+        process_queue: bool,
         project_name: str | None = None,
+        run_id: int | None = None,
+        run_input_ids: list[str] | None = None,
     ) -> OrchestratorResult:
         workspace = await self._resolve_workspace(tenant, project_name=project_name)
-
-        self.db.update_message_status(message_id, "processing")
+        message_ids = message_ids or ([message_id] if message_id else [])
+        if message_ids:
+            self.db.update_message_statuses(message_ids, "processing")
         self._write_request_status(workspace, tenant)
 
         asset_paths = []
@@ -193,12 +247,15 @@ class Orchestrator:
         self._maybe_prepare_memory_update(workspace.tasks_dir, workspace.memory_path)
 
         settings = Settings()
-        run_id = self.db.create_run(
-            tenant.id,
-            message_id=message_id,
-            project_name=workspace.project_name,
-            lease_seconds=settings.run_lease_seconds,
-        )
+        if run_id is None:
+            run_id = self.db.create_run(
+                tenant.id,
+                message_id=message_id,
+                project_name=workspace.project_name,
+                lease_seconds=settings.run_lease_seconds,
+            )
+        lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
+        self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
         inflight_stream = self._ensure_inflight_stream(tenant.key, workspace.project_name)
         monitor = None
         monitor_task = None
@@ -232,16 +289,24 @@ class Orchestrator:
                 usage=getattr(agent_result, "usage", None),
             )
             self.db.finish_run(run_id, status="completed")
-            self.db.update_message_status(message_id, "processed")
+            if message_ids:
+                self.db.update_message_statuses(message_ids, "processed")
+            if run_input_ids:
+                self.db.update_run_inputs_statuses(run_input_ids, "handled")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
-            if process_pending:
-                await self._drain_pending_messages(tenant, project_name=workspace.project_name)
+            self.db.clear_active_run(tenant.id, workspace.project_name)
+            if process_queue:
+                await self._drain_run_inputs(tenant, project_name=workspace.project_name)
             self._write_request_status(workspace, tenant)
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
             self.db.finish_run(run_id, status="failed", error=str(exc))
-            self.db.update_message_status(message_id, "failed")
+            if message_ids:
+                self.db.update_message_statuses(message_ids, "failed")
+            if run_input_ids:
+                self.db.update_run_inputs_statuses(run_input_ids, "queued")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
+            self.db.clear_active_run(tenant.id, workspace.project_name)
             self._write_request_status(workspace, tenant)
             raise
         finally:
@@ -253,65 +318,75 @@ class Orchestrator:
                 except Exception:
                     pass
 
-    async def _drain_pending_messages(self, tenant, project_name: str | None = None) -> None:
-        workspace = await self._resolve_workspace(tenant, project_name=project_name)
-        self._consume_inflight_updates(workspace.tasks_dir)
-
-        rows = self.db.get_pending_messages(tenant.id, project_name=project_name)
-        if not rows:
-            return
-
-        message_ids = [int(row["id"]) for row in rows]
-        combined = self._combine_pending_messages(rows)
-        if not combined:
-            self.db.update_message_statuses(message_ids, "failed")
-            return
-
-        self.db.update_message_statuses(message_ids, "processing")
-        inflight_path = self._inflight_updates_path(workspace.tasks_dir)
-        if inflight_path.exists():
-            try:
-                inflight_path.unlink()
-            except OSError:
-                pass
-
-        try:
+    async def _drain_run_inputs(self, tenant, project_name: str | None = None) -> None:
+        while True:
+            rows = self.db.claim_run_inputs_for_project(
+                tenant.id,
+                project_name,
+                limit=10,
+            )
+            if not rows:
+                return
+            run_input_ids = [str(row["id"]) for row in rows]
+            combined, message_ids = self._combine_run_inputs(rows)
+            if not combined:
+                self.db.update_run_inputs_statuses(run_input_ids, "queued")
+                return
+            primary_message_id = message_ids[0] if message_ids else 0
             await self._run_message(
                 tenant=tenant,
                 msg=combined,
-                message_id=message_ids[0],
-                process_pending=False,
+                message_id=primary_message_id,
+                message_ids=message_ids,
+                run_input_ids=run_input_ids,
+                process_queue=False,
                 project_name=project_name,
             )
-        except Exception:  # noqa: BLE001
-            self.db.update_message_statuses(message_ids, "failed")
-            raise
-        else:
-            self.db.update_message_statuses(message_ids, "processed")
-        self._write_request_status(workspace, tenant)
 
     @staticmethod
     def _is_run_stale(
         row: Any,
         max_age_seconds: int = 1800,
     ) -> bool:
-        try:
-            started_at = row["started_at"]
-        except (KeyError, TypeError):
-            return False
-        if not started_at:
-            return False
         from datetime import datetime, timezone
 
+        def _parse_dt(value: Any) -> datetime | None:
+            if not value:
+                return None
+            try:
+                parsed = datetime.fromisoformat(value)
+            except (TypeError, ValueError):
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed
+
+        now = datetime.now(tz=timezone.utc)
+        lease_expires_at = None
         try:
-            started_dt = datetime.fromisoformat(started_at)
-        except ValueError:
-            return False
-        if started_dt.tzinfo is None:
-            started_dt = started_dt.replace(tzinfo=timezone.utc)
-        age = (datetime.now(tz=timezone.utc) - started_dt).total_seconds()
-        if age > max_age_seconds:
-            return True
+            lease_expires_at = row["lease_expires_at"]
+        except (KeyError, TypeError):
+            lease_expires_at = None
+        lease_dt = _parse_dt(lease_expires_at)
+        if lease_dt is not None:
+            return lease_dt <= now
+
+        last_activity_at = None
+        last_heartbeat_at = None
+        started_at = None
+        try:
+            last_activity_at = row["last_activity_at"]
+            last_heartbeat_at = row["last_heartbeat_at"]
+            started_at = row["started_at"]
+        except (KeyError, TypeError):
+            pass
+
+        for candidate in (last_activity_at, last_heartbeat_at, started_at):
+            candidate_dt = _parse_dt(candidate)
+            if candidate_dt is None:
+                continue
+            age = (now - candidate_dt).total_seconds()
+            return age > max_age_seconds
         return False
 
     async def _finalize_stale_run(self, tenant, row: Any) -> None:
@@ -506,7 +581,12 @@ class Orchestrator:
 
     def _write_request_status(self, workspace: Workspace, tenant: Any) -> None:
         try:
-            pending = self.db.get_pending_messages(tenant.id, project_name=workspace.project_name)
+            queued = self.db.fetch_run_inputs(
+                tenant.id,
+                workspace.project_name,
+                status="queued",
+                limit=25,
+            )
             inflight = self.db.get_inflight_run(tenant.id, project_name=workspace.project_name)
             lines = [
                 "# Request Status",
@@ -515,14 +595,23 @@ class Orchestrator:
                 f"Run: {inflight['id'] if inflight else 'none'}",
                 f"Run Status: {inflight['status'] if inflight else 'idle'}",
                 "",
-                "## Pending Messages",
+                "## Queued Run Inputs",
             ]
-            if not pending:
+            if not queued:
                 lines.append("- None")
             else:
-                for row in pending:
-                    text = str(row["text"] or "").strip().replace("\n", " ")
-                    lines.append(f"- {row['received_at']}: {text}")
+                for row in queued:
+                    payload = row.get("payload_json") if isinstance(row, dict) else None
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except json.JSONDecodeError:
+                            payload = {}
+                    if not isinstance(payload, dict):
+                        payload = {}
+                    text = str(payload.get("text") or "").strip().replace("\n", " ")
+                    received_at = payload.get("received_at") or row.get("created_at")
+                    lines.append(f"- {received_at}: {text}")
             status_path = workspace.tasks_dir / "request_status.md"
             status_path.write_text("\n".join(lines) + "\n")
         except Exception:
@@ -531,12 +620,33 @@ class Orchestrator:
     async def _send_busy_ack(
         self, workspace: Workspace, tenant: Any, msg: NormalizedMessage
     ) -> None:
+        user_text = (msg.text or "").strip()
+        if not user_text and msg.images:
+            user_text = "(attachment)"
         instruction = (
-            "Send a brief acknowledgment that you've received the new message and "
-            "will get to it once current work finishes. Keep it short and natural. "
-            "If you've already acknowledged recently, do not send."
+            "Acknowledge the user's new request while another task is in progress. "
+            "Say it's queued and you'll handle it next. "
+            "Keep it brief, friendly, and non-technical."
         )
-        await self._send_interaction_instruction(workspace, tenant, msg, instruction)
+        if user_text:
+            instruction = f"{instruction}\n\nUser message:\n{user_text}"
+        sent = await self._send_interaction_instruction(
+            workspace=workspace,
+            tenant=tenant,
+            msg=msg,
+            instruction=instruction,
+        )
+        if sent:
+            return
+        text = "Got it — I’ll handle this after I finish the current task."
+        correlation_id = f"busy_ack:{tenant.id}:{msg.provider_message_id}"
+        self._enqueue_outbox_message(
+            tenant=tenant,
+            text=text,
+            correlation_id=correlation_id,
+            run_id=None,
+            project_name=workspace.project_name,
+        )
 
     async def _send_interaction_instruction(
         self,
@@ -544,10 +654,10 @@ class Orchestrator:
         tenant: Any,
         msg: NormalizedMessage | None,
         instruction: str,
-    ) -> None:
+    ) -> bool:
         sender = getattr(self.agent, "send_interaction_instruction", None)
         if sender is None:
-            return
+            return False
         try:
             await sender(
                 workspace=workspace,
@@ -561,6 +671,7 @@ class Orchestrator:
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
             )
+            return True
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(
@@ -570,6 +681,32 @@ class Orchestrator:
                 )
             except Exception:
                 pass
+        return False
+
+    def _enqueue_outbox_message(
+        self,
+        *,
+        tenant: Any,
+        text: str,
+        correlation_id: str,
+        run_id: int | None,
+        project_name: str | None,
+    ) -> None:
+        payload = {
+            "tenant_external_id": getattr(tenant, "external_id", None),
+            "provider": getattr(tenant, "provider", None),
+            "text": text,
+        }
+        try:
+            self.db.enqueue_outbox(
+                tenant_id=int(tenant.id),
+                run_id=run_id,
+                project_name=project_name,
+                correlation_id=correlation_id,
+                payload=payload,
+            )
+        except Exception:
+            return
 
     async def _send_interaction_message(
         self,
@@ -612,6 +749,8 @@ class Orchestrator:
     ) -> None:
         self.db.finish_running_runs(tenant.id, project_name, error="user_reset")
         self.db.clear_pending_and_processing_messages(tenant.id, project_name)
+        self.db.clear_active_run(tenant.id, project_name)
+        self.db.cancel_run_inputs(tenant.id, project_name)
         self._clear_inflight_stream(tenant.key, project_name)
         self._clear_run_artifacts(workspace.tasks_dir)
         for name in (
@@ -627,6 +766,77 @@ class Orchestrator:
                 except OSError:
                     pass
         self._write_request_status(workspace, tenant)
+
+    async def migrate_legacy_queue(self) -> int:
+        migrated = 0
+        tenants = self.db.list_tenants()
+        if not tenants:
+            return 0
+        now = self._now()
+        for tenant in tenants:
+            rows = self.db.fetch_messages_by_statuses(
+                tenant.id,
+                ["pending", "processing"],
+            )
+            if not rows:
+                continue
+            grouped: dict[str | None, list[Any]] = {}
+            for row in rows:
+                project_name = row["project_name"] if "project_name" in row.keys() else None
+                grouped.setdefault(project_name, []).append(row)
+            for project_name, group_rows in grouped.items():
+                self.db.expire_stale_runs(tenant.id, project_name, now)
+                inflight = self.db.get_inflight_run(tenant.id, project_name)
+                if inflight:
+                    continue
+                self.db.finish_running_runs(tenant.id, project_name, error="migrated")
+                self.db.clear_active_run(tenant.id, project_name)
+                message_ids: list[int] = []
+                for row in group_rows:
+                    message_id = int(row["id"])
+                    message_ids.append(message_id)
+                    msg = self._message_from_row(row)
+                    if not msg:
+                        try:
+                            received_raw = row["received_at"] if "received_at" in row.keys() else None
+                            received_at = (
+                                datetime.fromisoformat(str(received_raw))
+                                if received_raw
+                                else self._now()
+                            )
+                            if received_at.tzinfo is None:
+                                received_at = received_at.replace(tzinfo=timezone.utc)
+                        except Exception:
+                            received_at = self._now()
+                        msg = NormalizedMessage(
+                            provider=str(row.get("provider") if hasattr(row, "get") else row["provider"]),
+                            provider_message_id=str(
+                                row.get("provider_message_id")
+                                if hasattr(row, "get")
+                                else row["provider_message_id"]
+                            ),
+                            tenant_external_id=str(tenant.external_id),
+                            received_at=received_at,
+                            text=str(
+                                row.get("text") if hasattr(row, "get") else row["text"] or ""
+                            )
+                            or None,
+                            images=[],
+                            raw={},
+                            project_name=project_name,
+                        )
+                    self._enqueue_run_input(
+                        tenant_id=tenant.id,
+                        run_id=None,
+                        project_name=project_name,
+                        message_id=message_id,
+                        msg=msg,
+                        status="queued",
+                    )
+                    migrated += 1
+                if message_ids:
+                    self.db.update_message_statuses(message_ids, "processed")
+        return migrated
 
     def _combine_pending_messages(self, rows: list[Any]) -> NormalizedMessage | None:
         messages: list[NormalizedMessage] = []
@@ -654,6 +864,144 @@ class Orchestrator:
             images=combined_images,
             raw=latest.raw,
             project_name=latest.project_name,
+        )
+
+    @staticmethod
+    def _build_run_input_payload(msg: NormalizedMessage, message_id: int) -> dict[str, Any]:
+        return {
+            "message_id": message_id,
+            "provider": msg.provider,
+            "provider_message_id": msg.provider_message_id,
+            "tenant_external_id": msg.tenant_external_id,
+            "received_at": msg.received_at.isoformat(),
+            "text": msg.text,
+            "images": [
+                {
+                    "provider_file_id": img.provider_file_id,
+                    "width": img.width,
+                    "height": img.height,
+                }
+                for img in msg.images
+            ],
+            "raw": msg.raw,
+            "project_name": msg.project_name,
+        }
+
+    def _enqueue_run_input(
+        self,
+        *,
+        tenant_id: int,
+        run_id: int | None,
+        project_name: str | None,
+        message_id: int,
+        msg: NormalizedMessage,
+        status: str = "queued",
+    ) -> str:
+        payload = self._build_run_input_payload(msg, message_id)
+        return self.db.create_run_input(
+            tenant_id=tenant_id,
+            run_id=run_id,
+            project_name=project_name,
+            source=msg.provider,
+            provider_message_id=msg.provider_message_id,
+            payload=payload,
+            status=status,
+        )
+
+    def _message_from_run_input(self, row: Any) -> NormalizedMessage | None:
+        try:
+            raw_value = row.get("payload_json") if hasattr(row, "get") else row["payload_json"]
+        except (AttributeError, KeyError, TypeError):
+            raw_value = None
+        if isinstance(raw_value, str):
+            try:
+                payload = json.loads(raw_value)
+            except json.JSONDecodeError:
+                payload = {}
+        elif isinstance(raw_value, dict):
+            payload = raw_value
+        else:
+            payload = {}
+        try:
+            received_raw = payload.get("received_at")
+            received_at = datetime.fromisoformat(received_raw) if received_raw else self._now()
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=timezone.utc)
+        except Exception:
+            received_at = self._now()
+        images = []
+        for img in payload.get("images") or []:
+            try:
+                images.append(
+                    Attachment(
+                        provider_file_id=str(img.get("provider_file_id")),
+                        width=img.get("width"),
+                        height=img.get("height"),
+                    )
+                )
+            except Exception:
+                continue
+        return NormalizedMessage(
+            provider=str(payload.get("provider") or "event"),
+            provider_message_id=str(payload.get("provider_message_id") or ""),
+            tenant_external_id=str(payload.get("tenant_external_id") or ""),
+            received_at=received_at,
+            text=payload.get("text"),
+            images=images,
+            raw=payload.get("raw") or {},
+            project_name=payload.get("project_name"),
+        )
+
+    def _combine_run_inputs(self, rows: list[Any]) -> tuple[NormalizedMessage | None, list[int]]:
+        messages: list[NormalizedMessage] = []
+        message_ids: list[int] = []
+        for row in rows:
+            msg = self._message_from_run_input(row)
+            if msg:
+                messages.append(msg)
+            try:
+                raw_value = row.get("payload_json") if hasattr(row, "get") else row["payload_json"]
+            except (AttributeError, KeyError, TypeError):
+                raw_value = None
+            payload = None
+            if isinstance(raw_value, dict):
+                payload = raw_value
+            elif isinstance(raw_value, str):
+                try:
+                    payload = json.loads(raw_value)
+                except json.JSONDecodeError:
+                    payload = None
+            if isinstance(payload, dict):
+                raw_id = payload.get("message_id")
+                try:
+                    message_id = int(raw_id)
+                except (TypeError, ValueError):
+                    message_id = 0
+                if message_id:
+                    message_ids.append(message_id)
+        if not messages:
+            return None, message_ids
+
+        combined_text = "\n".join(
+            [m.text.strip() for m in messages if m.text and m.text.strip()]
+        ).strip()
+        combined_images = []
+        for m in messages:
+            combined_images.extend(m.images)
+
+        latest = messages[-1]
+        return (
+            NormalizedMessage(
+                provider=latest.provider,
+                provider_message_id=latest.provider_message_id,
+                tenant_external_id=latest.tenant_external_id,
+                received_at=latest.received_at,
+                text=combined_text or None,
+                images=combined_images,
+                raw=latest.raw,
+                project_name=latest.project_name,
+            ),
+            message_ids,
         )
 
     def _inflight_updates_path(self, tasks_dir: Path) -> Path:

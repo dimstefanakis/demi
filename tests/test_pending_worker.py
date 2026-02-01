@@ -84,7 +84,14 @@ async def test_pending_worker_drains_queue(tmp_path):
         project_name=workspace.project_name,
     )
     message_id, _ = db.record_message(tenant.id, msg)
-    db.update_message_status(message_id, "processing")
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=workspace.project_name,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
 
     worker = PendingWorker(
         db=db,
@@ -96,7 +103,9 @@ async def test_pending_worker_drains_queue(tmp_path):
         ),
     )
 
-    await worker._requeue_processing_groups()
+    groups = db.fetch_queued_run_input_groups(limit=5)
+    assert groups
+    await worker._handle_group(groups[0])
 
     row = db.connect().execute(
         "SELECT status FROM messages WHERE id = ?",
@@ -133,7 +142,6 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
         project_name=workspace.project_name,
     )
     message_id, _ = db.record_message(tenant.id, msg)
-    db.update_message_status(message_id, "processing")
 
     run_id = db.create_run(
         tenant.id,
@@ -142,13 +150,22 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
         lease_seconds=3600,
     )
     past = datetime.now(tz=timezone.utc) - timedelta(seconds=901)
-    future = datetime.now(tz=timezone.utc) + timedelta(seconds=3600)
+    expired = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
     conn = db.connect()
     conn.execute(
         "UPDATE runs SET started_at = ?, lease_expires_at = ? WHERE id = ?",
-        (past.isoformat(), future.isoformat(), run_id),
+        (past.isoformat(), expired.isoformat(), run_id),
     )
     conn.commit()
+
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=workspace.project_name,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
 
     worker = PendingWorker(
         db=db,
@@ -161,14 +178,16 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
         ),
     )
 
-    await worker._requeue_processing_groups()
+    groups = db.fetch_queued_run_input_groups(limit=5)
+    assert groups
+    await worker._handle_group(groups[0])
 
     run = db.connect().execute(
         "SELECT status, error FROM runs WHERE id = ?",
         (run_id,),
     ).fetchone()
     assert run["status"] == "failed"
-    assert run["error"] == "stale_run_timeout"
+    assert run["error"] == "lease_expired"
     row = db.connect().execute(
         "SELECT status FROM messages WHERE id = ?",
         (message_id,),

@@ -20,10 +20,17 @@ Do not perform build, design, or deployment work.
 - Read tasks/chat_history.md and tasks/chat_summary.md (if present) before responding.
 - Re-read tasks/chat_history.md immediately before sending. If the latest assistant
   message already answers the user, do not send another message.
+- Read tasks/run_request.json to get the latest user message text and provider_message_id.
+  Treat that as the source of truth for what you're responding to.
+- If the instruction you were given conflicts with tasks/run_request.json, ignore the
+  instruction and respond to the run_request message instead. If run_request.json
+  is missing or unclear, do not send anything.
 - Draft a short response.
-- Call mcp__claudius-chat__should_send_message with the draft text (sanity check only).
+- Call mcp__claudius-chat__should_send_message with the draft text and include
+  reply_to_message_id + reply_to_text from tasks/run_request.json.
 - Only send if you still believe it fits the current context.
-- Use mcp__claudius-chat__send_message to send updates.
+- Use mcp__claudius-chat__send_message to send updates, including
+  reply_to_message_id + reply_to_text from tasks/run_request.json.
 - If this message should end the thread (final/terminal), set `final: true` on the send tool.
 
 ## Links (Critical)

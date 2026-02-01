@@ -20,6 +20,7 @@ from claudius.payments.stripe import StripeClient, build_stripe_config, derive_s
 from claudius.events import normalize_event_type, verify_signature
 from claudius.jobs.worker import EventWorker, EventWorkerConfig
 from claudius.jobs.pending_worker import PendingWorker, PendingWorkerConfig
+from claudius.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from claudius.runtime.docker_agent import DockerAgent
 from claudius.runtime.docker_pool import DockerPool, DockerPoolConfig
 from claudius.tenant_db import ensure_tenant_db
@@ -70,6 +71,7 @@ def create_app() -> FastAPI:
 
     worker: EventWorker | None = None
     pending_worker: PendingWorker | None = None
+    outbox_worker: OutboxWorker | None = None
     orchestrator = Orchestrator(
         db=db,
         workspace_manager=workspace_manager,
@@ -96,8 +98,26 @@ def create_app() -> FastAPI:
                 batch_size=settings.pending_worker_batch_size,
             ),
         )
+    if settings.outbox_worker_enabled:
+        outbox_worker = OutboxWorker(
+            db=db,
+            messenger=messenger,
+            config=OutboxWorkerConfig(
+                poll_interval=settings.outbox_worker_poll_interval,
+                batch_size=settings.outbox_worker_batch_size,
+            ),
+        )
 
     app = FastAPI()
+
+    @app.on_event("startup")
+    async def _migrate_legacy_queue() -> None:
+        try:
+            migrated = await orchestrator.migrate_legacy_queue()
+            if migrated:
+                logger.info("Migrated %s legacy queued messages to run_inputs", migrated)
+        except Exception:  # noqa: BLE001
+            logger.exception("Legacy queue migration failed")
 
     if pool is not None:
         async def _warm_pool_background() -> None:
@@ -158,6 +178,23 @@ def create_app() -> FastAPI:
         async def _stop_pending_worker() -> None:
             pending_worker.stop()
             task = getattr(app.state, "pending_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    if outbox_worker is not None:
+        @app.on_event("startup")
+        async def _start_outbox_worker() -> None:
+            app.state.outbox_worker_task = asyncio.create_task(
+                outbox_worker.run_forever(),
+                name="outbox-worker",
+            )
+
+        @app.on_event("shutdown")
+        async def _stop_outbox_worker() -> None:
+            outbox_worker.stop()
+            task = getattr(app.state, "outbox_worker_task", None)
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):

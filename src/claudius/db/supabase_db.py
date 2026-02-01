@@ -96,6 +96,10 @@ class SupabaseDatabase:
         row = self._select_one("tenants", provider=provider, external_id=external_id)
         return self._row_to_tenant(row) if row else None
 
+    def list_tenants(self) -> list[Tenant]:
+        data = self._execute(self._table("tenants").select("*"))
+        return [self._row_to_tenant(row) for row in (data or [])]
+
     def update_tenant_workspace(self, tenant_id: int, workspace_path: str) -> None:
         now = datetime.now(tz=timezone.utc).isoformat()
         self._execute(
@@ -333,6 +337,26 @@ class SupabaseDatabase:
             .in_("id", message_ids)
         )
 
+    def fetch_messages_by_statuses(
+        self,
+        tenant_id: int,
+        statuses: list[str],
+        project_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        if not statuses:
+            return []
+        query = (
+            self._table("messages")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .in_("status", statuses)
+            .order("received_at", desc=False)
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        data = self._execute(query)
+        return list(data or [])
+
     def has_inflight_run(self, tenant_id: int, project_name: str | None = None) -> bool:
         query = (
             self._table("runs")
@@ -390,6 +414,183 @@ class SupabaseDatabase:
         if not data:
             raise RuntimeError("run_create_failed")
         return int(data[0]["id"])
+
+    def create_run_input(
+        self,
+        tenant_id: int,
+        run_id: int | None,
+        project_name: str | None,
+        source: str,
+        provider_message_id: str | None,
+        payload: dict[str, Any],
+        status: str = "queued",
+    ) -> str:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        payload_row = {
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "project_name": project_name,
+            "source": source,
+            "provider_message_id": provider_message_id,
+            "payload_json": payload,
+            "status": status,
+            "claimed_at": None,
+            "handled_at": None,
+            "created_at": now,
+        }
+        data = self._execute(self._table("run_inputs").insert(payload_row))
+        if not data:
+            row = self._select_one(
+                "run_inputs",
+                tenant_id=tenant_id,
+                provider_message_id=provider_message_id,
+            )
+            if not row:
+                raise RuntimeError("run_input_create_failed")
+            return str(row["id"])
+        return str(data[0]["id"])
+
+    def claim_run_inputs_for_project(
+        self, tenant_id: int, project_name: str | None, limit: int = 10
+    ) -> list[dict[str, Any]]:
+        params = {
+            "p_tenant_id": tenant_id,
+            "p_project_name": project_name,
+            "p_limit": limit,
+        }
+        data = self._execute(self.client.rpc("claim_run_inputs_for_project", params))
+        return list(data or [])
+
+    def update_run_inputs_statuses(self, ids: list[str], status: str) -> None:
+        if not ids:
+            return
+        payload: dict[str, Any] = {"status": status}
+        if status == "handled":
+            payload["handled_at"] = datetime.now(tz=timezone.utc).isoformat()
+        if status == "queued":
+            payload["claimed_at"] = None
+        self._execute(self._table("run_inputs").update(payload).in_("id", ids))
+
+    def cancel_run_inputs(self, tenant_id: int, project_name: str | None) -> int:
+        query = (
+            self._table("run_inputs")
+            .update({"status": "cancelled"})
+            .eq("tenant_id", tenant_id)
+            .in_("status", ["queued", "claimed"])
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        data = self._execute(query)
+        return len(data or [])
+
+    def fetch_run_inputs(
+        self,
+        tenant_id: int,
+        project_name: str | None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("run_inputs")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=False)
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        if status:
+            query = query.eq("status", status)
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
+    def fetch_queued_run_input_groups(self, limit: int = 25) -> list[dict[str, Any]]:
+        data = self._execute(
+            self._table("queued_run_input_groups")
+            .select("tenant_id, project_name, oldest_created_at")
+            .order("oldest_created_at", desc=False)
+            .limit(limit)
+        )
+        return list(data or [])
+
+    def enqueue_outbox(
+        self,
+        tenant_id: int,
+        run_id: int | None,
+        project_name: str | None,
+        correlation_id: str,
+        payload: dict[str, Any],
+    ) -> str:
+        payload_row = {
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "project_name": project_name,
+            "correlation_id": correlation_id,
+            "payload_json": payload,
+            "status": "queued",
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "sent_at": None,
+        }
+        data = self._execute(self._table("outbox").insert(payload_row))
+        if not data:
+            row = self._select_one(
+                "outbox",
+                tenant_id=tenant_id,
+                correlation_id=correlation_id,
+            )
+            if not row:
+                raise RuntimeError("outbox_enqueue_failed")
+            return str(row["id"])
+        return str(data[0]["id"])
+
+    def claim_outbox(self, limit: int = 25) -> list[dict[str, Any]]:
+        data = self._execute(self.client.rpc("claim_outbox", {"p_limit": limit}))
+        return list(data or [])
+
+    def update_outbox_statuses(self, ids: list[str], status: str) -> None:
+        if not ids:
+            return
+        payload: dict[str, Any] = {"status": status}
+        if status == "sent":
+            payload["sent_at"] = datetime.now(tz=timezone.utc).isoformat()
+        self._execute(self._table("outbox").update(payload).in_("id", ids))
+
+    def set_active_run(
+        self,
+        tenant_id: int,
+        project_name: str,
+        run_id: int,
+        lease_expires_at: str | None,
+    ) -> None:
+        payload = {
+            "tenant_id": tenant_id,
+            "project_name": project_name,
+            "run_id": run_id,
+            "lease_expires_at": lease_expires_at,
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        self._execute(self._table("active_runs").upsert(payload))
+
+    def get_active_run(
+        self, tenant_id: int, project_name: str | None
+    ) -> dict[str, Any] | None:
+        query = (
+            self._table("active_runs")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .limit(1)
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        data = self._execute(query)
+        return data[0] if data else None
+
+    def clear_active_run(self, tenant_id: int, project_name: str | None) -> None:
+        query = self._table("active_runs").delete().eq("tenant_id", tenant_id)
+        if project_name:
+            query = query.eq("project_name", project_name)
+        self._execute(query)
 
     def update_run_lease(
         self,

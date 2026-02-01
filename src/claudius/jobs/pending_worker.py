@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timezone
 from dataclasses import dataclass
 import sqlite3
 from typing import Any
@@ -52,9 +51,8 @@ class PendingWorker:
         try:
             while self._running:
                 try:
-                    await self._requeue_processing_groups()
                     groups = await self._db_call(
-                        self.db.fetch_pending_message_groups,
+                        self.db.fetch_queued_run_input_groups,
                         self.config.batch_size,
                     )
                 except sqlite3.OperationalError as exc:
@@ -102,56 +100,4 @@ class PendingWorker:
             )
             if still_inflight:
                 return
-        await self.orchestrator._drain_pending_messages(tenant, project_name=project_name)
-
-    async def _requeue_processing_groups(self) -> None:
-        groups = await self._db_call(
-            self.db.fetch_processing_message_groups,
-            self.config.batch_size,
-        )
-        if not groups:
-            return
-        now = self.orchestrator._now()
-        for group in groups:
-            tenant_id = int(group.get("tenant_id") or 0)
-            if not tenant_id:
-                continue
-            tenant = await self._db_call(self.db.get_tenant_by_id, tenant_id)
-            if tenant is None:
-                continue
-            project_name = group.get("project_name")
-            await self._db_call(
-                self.db.expire_stale_runs,
-                tenant.id,
-                project_name,
-                now,
-            )
-            inflight = await self._db_call(self.db.get_inflight_run, tenant.id, project_name)
-            if inflight:
-                still_inflight = await self._resolve_inflight_run(
-                    tenant, project_name, inflight
-                )
-                if still_inflight:
-                    continue
-            oldest_raw = group.get("oldest_received_at")
-            if not oldest_raw:
-                continue
-            try:
-                oldest = datetime.fromisoformat(str(oldest_raw))
-            except ValueError:
-                continue
-            if oldest.tzinfo is None:
-                oldest = oldest.replace(tzinfo=timezone.utc)
-            age = (now - oldest).total_seconds()
-            if age < self.config.processing_grace_seconds:
-                continue
-            requeued = await self._db_call(
-                self.db.requeue_processing_messages,
-                tenant.id,
-                project_name,
-            )
-            if requeued:
-                await self.orchestrator._drain_pending_messages(
-                    tenant,
-                    project_name=project_name,
-                )
+        await self.orchestrator._drain_run_inputs(tenant, project_name=project_name)

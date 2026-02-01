@@ -104,7 +104,8 @@ Example (high-level)
 - A short-lived installation token is provided at runtime via `GITHUB_TOKEN`.
   Repo hints are available in: `GITHUB_REPO_FULL_NAME`, `GITHUB_REPO_HTTP_URL`,
   `GITHUB_REPO_SSH_URL`, and `GITHUB_REPO_DEFAULT_BRANCH` when configured.
-- You decide if/when to initialize git, commit, and push. Do not assume every run must commit.
+- When you modify files in the workspace, always commit and push the changes.
+- Initialize git if needed. Use clear, short commit messages describing the change.
 - Never write tokens to disk, logs, or chat messages. Keep secrets only in env vars.
 - If you push, prefer HTTPS remote without embedded credentials and pass the token via headers:
   `git -c http.extraheader="Authorization: Bearer $GITHUB_TOKEN" push`.
@@ -313,8 +314,11 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 ## Chat History + Compaction
 
 - Read tasks/chat_history.md and (if present) tasks/chat_summary.md to avoid repeats.
-- If tasks/summary_prompt.md exists, use it to update tasks/chat_summary.md, then trim
-  tasks/chat_log.jsonl to keep only the most recent 10 entries and delete summary_prompt.md.
+- If tasks/summary_prompt.md exists, use it to update tasks/chat_summary.md, then append a new
+  assistant_message entry to tasks/chat_log.jsonl that contains the summary (label it as
+  "Summary — no action needed"). After that, trim tasks/chat_log.jsonl so it starts at this
+  summary entry and keeps only the most recent 10 entries after it. Delete summary_prompt.md.
+- When rereading chat history, do not go earlier than the last summary entry.
 
 ## Memory Updates
 
@@ -324,15 +328,8 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 
 ## In-Flight Updates
 
-- If tasks/inflight_updates.jsonl exists, read it before heavy steps (Gemini/build/deploy) and after each major phase.
-- When you receive an IN-FLIGHT UPDATE (streamed or from the file), immediately ask the interaction-agent
-  to send a short acknowledgment that you received the new request and will handle it after the current work.
-- After reading tasks/inflight_updates.jsonl, call mcp__claudius-chat__ack_inflight_updates with the
-  message_id values from the file to mark them consumed, then clear the file.
-- If updates materially change the request (e.g., "ignore that" or new assets), ask the interaction-agent
-  to send a brief restart notice in your own words, then exit.
-- Never interrupt mid-command; only stop between phases.
-- IN-FLIGHT UPDATE messages may be new requests; capture them as queued follow-ups and incorporate when safe.
+- New user messages are queued by the orchestrator and handled in a follow-up run.
+- Do not look for or act on inflight_updates.jsonl; finish the current task.
 
 ## Completion
 

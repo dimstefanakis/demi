@@ -114,3 +114,58 @@ def test_should_send_message_blocks_after_final(tmp_path):
     payload = json.loads(result["content"][0]["text"])
 
     assert payload["send"] is False
+
+
+def test_send_message_blocks_on_reply_to_mismatch(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / "run_request.json").write_text(
+        json.dumps({"message": {"provider_message_id": "msg-9", "text": "Ping?"}})
+    )
+    messenger = FakeMessenger()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+        )
+    )
+    send_tool = next(tool for tool in tools if tool.name == "send_message")
+
+    asyncio.run(
+        send_tool.handler(
+            {
+                "text": "Working on it.",
+                "reply_to_message_id": "msg-9",
+                "reply_to_text": "Different",
+            }
+        )
+    )
+
+    assert len(messenger.sent) == 0
+
+
+def test_should_send_message_blocks_on_reply_to_mismatch(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    (tasks_dir / "run_request.json").write_text(
+        json.dumps({"message": {"provider_message_id": "msg-7", "text": "Status?"}})
+    )
+    messenger = FakeMessenger()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+        )
+    )
+    should_tool = next(tool for tool in tools if tool.name == "should_send_message")
+
+    result = asyncio.run(
+        should_tool.handler(
+            {
+                "text": "On it now.",
+                "reply_to_message_id": "msg-7",
+                "reply_to_text": "Other",
+            }
+        )
+    )
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["send"] is False
