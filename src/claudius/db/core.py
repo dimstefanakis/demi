@@ -1191,6 +1191,89 @@ class Database:
         )
         conn.commit()
 
+    @staticmethod
+    def _looks_like_raw_usage(payload: dict[str, Any]) -> bool:
+        token_keys = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "service_tier",
+            "server_tool_use",
+            "cache_creation",
+        }
+        return any(key in payload for key in token_keys)
+
+    @classmethod
+    def _wrap_usage_payload(cls, payload: Any | None) -> dict[str, Any]:
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            return {"primary": payload}
+        if any(key in payload for key in ("primary", "interaction", "interactions")):
+            return dict(payload)
+        if cls._looks_like_raw_usage(payload):
+            return {"primary": payload}
+        return dict(payload)
+
+    @classmethod
+    def _merge_usage_payload(
+        cls,
+        existing: Any | None,
+        additional: dict[str, Any],
+        usage_key: str | None,
+    ) -> dict[str, Any]:
+        payload = cls._wrap_usage_payload(existing)
+        if usage_key:
+            bucket = payload.get(usage_key)
+            if bucket is None:
+                payload[usage_key] = [additional]
+            elif isinstance(bucket, list):
+                bucket.append(additional)
+            else:
+                payload[usage_key] = [bucket, additional]
+        else:
+            payload["additional"] = additional
+        return payload
+
+    def add_run_usage(
+        self,
+        run_id: int,
+        total_cost_usd: float | None = None,
+        usage: dict | None = None,
+        usage_key: str | None = "interaction",
+    ) -> None:
+        if total_cost_usd is None and not usage:
+            return
+        conn = self.connect()
+        row = conn.execute(
+            "SELECT total_cost_usd, usage_json FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+        if row is None:
+            return
+        existing_total = row["total_cost_usd"]
+        new_total = existing_total
+        if total_cost_usd is not None:
+            base = existing_total or 0.0
+            new_total = base + total_cost_usd
+        existing_usage = None
+        raw_usage = row["usage_json"]
+        if raw_usage:
+            try:
+                existing_usage = json.loads(raw_usage)
+            except json.JSONDecodeError:
+                existing_usage = None
+        merged_usage = existing_usage
+        if usage is not None:
+            merged_usage = self._merge_usage_payload(existing_usage, usage, usage_key)
+        usage_json = json.dumps(merged_usage) if merged_usage is not None else None
+        conn.execute(
+            "UPDATE runs SET total_cost_usd = ?, usage_json = ? WHERE id = ?",
+            (new_total, usage_json, run_id),
+        )
+        conn.commit()
+
     def create_billing_order(
         self,
         tenant_id: int,
@@ -1340,6 +1423,32 @@ class Database:
         return conn.execute(
             "SELECT * FROM billing_orders WHERE stripe_session_id = ?",
             (session_id,),
+        ).fetchone()
+
+    def get_latest_billing_order(
+        self,
+        tenant_id: int,
+        order_type: str | None = None,
+    ) -> sqlite3.Row | None:
+        conn = self.connect()
+        if order_type:
+            return conn.execute(
+                """
+                SELECT * FROM billing_orders
+                WHERE tenant_id = ? AND order_type = ?
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (tenant_id, order_type),
+            ).fetchone()
+        return conn.execute(
+            """
+            SELECT * FROM billing_orders
+            WHERE tenant_id = ?
+            ORDER BY id DESC
+            LIMIT 1
+            """,
+            (tenant_id,),
         ).fetchone()
 
     def upsert_supabase_project(

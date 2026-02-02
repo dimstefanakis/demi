@@ -23,7 +23,10 @@ def test_send_message_tool_dedupes(tmp_path):
     messenger = FakeMessenger()
     tools = build_chat_tools(
         ChatToolContext(
-            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_message")
@@ -39,7 +42,10 @@ def test_send_message_tool_sends_once_for_new_text(tmp_path):
     messenger = FakeMessenger()
     tools = build_chat_tools(
         ChatToolContext(
-            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_message")
@@ -61,7 +67,10 @@ def test_send_payment_link_uses_quote_file(tmp_path):
     messenger = FakeMessenger()
     tools = build_chat_tools(
         ChatToolContext(
-            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_payment_link")
@@ -82,7 +91,10 @@ def test_send_payment_link_uses_tenant_db(tmp_path):
     messenger = FakeMessenger()
     tools = build_chat_tools(
         ChatToolContext(
-            messenger=messenger, tenant_external_id="tenant-1", tasks_dir=tasks_dir
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_payment_link")

@@ -33,6 +33,7 @@ class ChatToolContext:
     db: Database | None = None
     tenant_id: int | None = None
     payments: Any | None = None
+    role: str = "primary"
 
 
 def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
@@ -65,6 +66,36 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             error=error,
             duration_ms=duration_ms,
         )
+
+    def _payment_required() -> bool:
+        path = context.tasks_dir / "billing_status.json"
+        if not path.exists():
+            return False
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("payment_required"))
+
+    def _queue_interaction_request(payload: dict[str, Any]) -> None:
+        path = context.tasks_dir / "interaction_request.json"
+        existing = None
+        if path.exists():
+            try:
+                existing = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError):
+                existing = None
+        if isinstance(existing, dict):
+            existing_type = str(existing.get("type") or "").strip().lower()
+            incoming_type = str(payload.get("type") or "").strip().lower()
+            if existing_type == "send_payment_link" and incoming_type == "send_message":
+                return
+        try:
+            path.write_text(json.dumps(payload, indent=2))
+        except OSError:
+            return
 
     @tool(
         "should_send_message",
@@ -160,6 +191,22 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     )
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
+        if str(context.role or "primary") != "interaction":
+            _queue_interaction_request(
+                {
+                    "type": "send_message",
+                    "text": str(args.get("text", "")).strip(),
+                    "final": bool(args.get("final", False)),
+                    "reply_to_message_id": str(args.get("reply_to_message_id", "")).strip(),
+                    "reply_to_text": str(args.get("reply_to_text", "")).strip(),
+                }
+            )
+            payload = {"queued": True, "status": "interaction_required"}
+            _log("send_message", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         text = str(args.get("text", "")).strip()
         final = bool(args.get("final", False))
         if not text:
@@ -310,6 +357,22 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     )
     async def send_payment_link(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
+        if str(context.role or "primary") != "interaction":
+            _queue_interaction_request(
+                {
+                    "type": "send_payment_link",
+                    "order_id": args.get("order_id"),
+                    "source": str(args.get("source") or "").strip(),
+                    "text": str(args.get("text", "")).strip(),
+                    "final": bool(args.get("final", False)),
+                }
+            )
+            payload = {"queued": True, "status": "interaction_required"}
+            _log("send_payment_link", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         final = bool(args.get("final", False))
         order_id = None
         if args.get("order_id") is not None:
@@ -889,6 +952,18 @@ def _reply_to_matches(
     reply_to_message_id: str,
     reply_to_text: str,
 ) -> tuple[bool, str]:
+    def _normalize(text: str) -> str:
+        if not text:
+            return ""
+        normalized = (
+            text.replace("\u2019", "'")
+            .replace("\u2018", "'")
+            .replace("\u201c", '"')
+            .replace("\u201d", '"')
+        )
+        normalized = re.sub(r"\s+", " ", normalized).strip()
+        return normalized
+
     current = _current_run_message(tasks_dir)
     if current is None:
         return False, "run_request_missing"
@@ -896,7 +971,7 @@ def _reply_to_matches(
     current_text = str(current.get("text") or "").strip()
     if reply_to_message_id and reply_to_message_id != current_id:
         return False, "reply_to_message_id_mismatch"
-    if reply_to_text and reply_to_text.strip() != current_text:
+    if reply_to_text and _normalize(reply_to_text) != _normalize(current_text):
         return False, "reply_to_text_mismatch"
     return True, "ok"
 
@@ -943,6 +1018,27 @@ def _load_payment_url(
     source: str | None = None,
     order_id: int | None = None,
 ) -> str | None:
+    billing_status = tasks_dir / "billing_status.json"
+    if billing_status.exists():
+        try:
+            payload = json.loads(billing_status.read_text())
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        if isinstance(payload, dict):
+            if order_id is not None:
+                try:
+                    stored_id = int(payload.get("order_id"))
+                except (TypeError, ValueError):
+                    stored_id = None
+                if stored_id == order_id:
+                    url = str(payload.get("payment_url") or "").strip()
+                    if url:
+                        return url
+            else:
+                url = str(payload.get("payment_url") or "").strip()
+                if url:
+                    return url
+
     candidates: list[Path] = []
     keys: list[str] = []
     if source == "backend":

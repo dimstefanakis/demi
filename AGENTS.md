@@ -12,6 +12,10 @@
 - `prompts/` holds agent prompt files used at runtime.
 - `tests/` contains pytest suites (e.g., `test_orchestrator_flow.py`, `test_telegram_parser.py`).
 - Root docs (`PRODUCT.md`, `PRD.md`, `IMPLEMENTATION.md`, `DESIGN.md`) define product scope and prompt contracts.
+- `docs/SPEC.md` is the living architecture spec for Claudius.
+
+## Documentation Hygiene
+- Update `docs/SPEC.md` whenever changes affect architecture, message flow, storage, runtimes, or deployment.
 
 ## Build, Test, and Development Commands
 - Install Python deps with uv:

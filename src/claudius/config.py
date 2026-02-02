@@ -100,6 +100,15 @@ class Settings(BaseSettings):
     stripe_success_url: str | None = None
     stripe_cancel_url: str | None = None
 
+    billing_status_url: str | None = None
+    billing_status_token: str | None = None
+    billing_status_timeout_seconds: float = 3.0
+
+    assistant_stripe_price_id: str | None = None
+    assistant_product_name: str = "Hire me"
+    assistant_price_usd: float | None = None
+    assistant_currency: str = "USD"
+
     def resolved_data_dir(self) -> Path:
         return (self.root_dir / self.data_dir).resolve()
 

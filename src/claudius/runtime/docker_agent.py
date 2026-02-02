@@ -89,9 +89,9 @@ class DockerAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
-    ) -> None:
+    ) -> AgentResult | None:
         interaction_agent = ClaudeAgent()
-        await interaction_agent.send_interaction_message(
+        return await interaction_agent.send_interaction_message(
             workspace=workspace,
             text=text,
             messenger=messenger,
@@ -114,9 +114,9 @@ class DockerAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
-    ) -> None:
+    ) -> AgentResult | None:
         interaction_agent = ClaudeAgent()
-        await interaction_agent.send_interaction_instruction(
+        return await interaction_agent.send_interaction_instruction(
             workspace=workspace,
             instruction=instruction,
             messenger=messenger,

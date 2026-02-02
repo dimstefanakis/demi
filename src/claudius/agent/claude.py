@@ -151,6 +151,7 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                role="primary",
             )
         )
         settings = Settings()
@@ -285,7 +286,7 @@ class ClaudeAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
-    ) -> None:
+    ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
             ChatToolContext(
@@ -299,6 +300,7 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                role="interaction",
             )
         )
         options = ClaudeAgentOptions(
@@ -323,6 +325,8 @@ class ClaudeAgent:
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
+        total_cost_usd = None
+        usage: dict[str, Any] | None = None
         try:
             prompt = (
                 "Send the following user update if it fits the current context. "
@@ -332,9 +336,17 @@ class ClaudeAgent:
             await client.query(prompt, session_id=session_id or "interaction")
             async for msg in client.receive_messages():
                 if isinstance(msg, ResultMessage):
+                    total_cost_usd = msg.total_cost_usd
+                    usage = msg.usage
                     break
         finally:
             await client.disconnect()
+        return AgentResult(
+            session_id=None,
+            summary=None,
+            total_cost_usd=total_cost_usd,
+            usage=usage,
+        )
 
     async def send_interaction_instruction(
         self,
@@ -347,7 +359,7 @@ class ClaudeAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
-    ) -> None:
+    ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
             ChatToolContext(
@@ -361,6 +373,7 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                role="interaction",
             )
         )
         options = ClaudeAgentOptions(
@@ -385,6 +398,8 @@ class ClaudeAgent:
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
+        total_cost_usd = None
+        usage: dict[str, Any] | None = None
         try:
             prompt = (
                 "Follow the instruction below. If sending a message would be redundant, "
@@ -394,9 +409,17 @@ class ClaudeAgent:
             await client.query(prompt, session_id=session_id or "interaction")
             async for msg in client.receive_messages():
                 if isinstance(msg, ResultMessage):
+                    total_cost_usd = msg.total_cost_usd
+                    usage = msg.usage
                     break
         finally:
             await client.disconnect()
+        return AgentResult(
+            session_id=None,
+            summary=None,
+            total_cost_usd=total_cost_usd,
+            usage=usage,
+        )
 
     def _build_supabase_mcp_config(
         self, workspace: Workspace, settings: Settings

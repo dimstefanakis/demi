@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 from contextlib import suppress
 import json
 from typing import Any
@@ -236,6 +237,24 @@ def create_app() -> FastAPI:
         db.create_event_job(tenant.id, job_type="event", payload=job_payload)
 
         return {"status": "accepted"}
+
+    @app.post("/billing/status")
+    async def billing_status(request: Request):
+        payload = await request.json()
+        payload = _merge_event_identity(payload, request)
+        tenant = _resolve_tenant_for_event(db, payload)
+        if tenant is None:
+            return {"status": "unknown", "payment_required": False, "message": "tenant_not_found"}
+        purpose = payload.get("purpose")
+        purpose_label = payload.get("purpose_label")
+        return await _build_assistant_billing_status(
+            db=db,
+            tenant=tenant,
+            settings=settings,
+            stripe_client=stripe_client,
+            purpose=purpose,
+            purpose_label=purpose_label,
+        )
 
     @app.get("/health")
     async def health():
@@ -564,8 +583,11 @@ def _handle_subscription_updated(db: Database, subscription: dict[str, Any]) -> 
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] != "managed_backend":
-        return
+    if order_row is None or order_row["order_type"] not in {
+        "managed_backend",
+    }:
+        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
+            return
     order_id = int(order_row["id"])
     cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
     cancel_at = subscription.get("cancel_at")
@@ -603,8 +625,11 @@ def _handle_subscription_deleted(db: Database, subscription: dict[str, Any]) -> 
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] != "managed_backend":
-        return
+    if order_row is None or order_row["order_type"] not in {
+        "managed_backend",
+    }:
+        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
+            return
     order_id = int(order_row["id"])
     metadata = {
         "subscription_status": subscription.get("status"),
@@ -624,8 +649,11 @@ def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] != "managed_backend":
-        return
+    if order_row is None or order_row["order_type"] not in {
+        "managed_backend",
+    }:
+        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
+            return
     order_id = int(order_row["id"])
     if event_type == "invoice.payment_failed":
         db.update_billing_order_status(order_id, "payment_failed")
@@ -668,6 +696,242 @@ def _emit_billing_event(db: Database, order_row: Any, event_type: str, intent: s
             },
         },
     )
+
+
+def _assistant_allow_first_build(tenant: Any) -> bool:
+    return not getattr(tenant, "last_deploy_url", None)
+
+
+def _assistant_paid_statuses() -> set[str]:
+    return {"paid", "active", "cancel_scheduled"}
+
+
+def _assistant_order_type() -> str:
+    return "assistant_subscription"
+
+
+def _assistant_plan_name(settings: Settings) -> str:
+    return "assistant_monthly"
+
+
+def _assistant_currency(settings: Settings) -> str:
+    return (settings.assistant_currency or "USD").upper()
+
+
+def _assistant_order_type_for_purpose(purpose: str | None) -> str:
+    if purpose:
+        return f"assistant_subscription:{purpose}"
+    return _assistant_order_type()
+
+
+def _is_assistant_order_type(order_type: str | None) -> bool:
+    return bool(order_type and order_type.startswith("assistant_subscription"))
+
+
+def _normalize_billing_purpose(value: Any | None) -> str | None:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return None
+    slug = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-_")
+    return slug[:60] if slug else None
+
+
+def _row_value(row: Any, key: str) -> Any | None:
+    if row is None:
+        return None
+    if hasattr(row, "get"):
+        try:
+            return row.get(key)
+        except Exception:
+            return None
+    try:
+        return row[key]
+    except Exception:
+        return None
+
+
+async def _build_assistant_billing_status(
+    *,
+    db: Database,
+    tenant: Any,
+    settings: Settings,
+    stripe_client: StripeClient | None,
+    purpose: str | None = None,
+    purpose_label: str | None = None,
+) -> dict[str, Any]:
+    allow_first_build = _assistant_allow_first_build(tenant)
+    normalized_purpose = _normalize_billing_purpose(purpose or purpose_label)
+    order_type = _assistant_order_type_for_purpose(normalized_purpose)
+    order_row = db.get_latest_billing_order(int(tenant.id), order_type)
+    cached_label = purpose_label
+    default_currency = _assistant_currency(settings)
+    default_price = settings.assistant_price_usd
+    if order_row is not None:
+        status = str(_row_value(order_row, "status") or "").strip().lower()
+        order_id = int(_row_value(order_row, "id") or 0)
+        metadata = _extract_order_metadata(order_row)
+        cached_label = cached_label or metadata.get("purpose_label")
+        normalized_purpose = normalized_purpose or metadata.get("purpose")
+        price_usd = _row_value(order_row, "price_usd") or default_price
+        currency = _row_value(order_row, "currency") or default_currency
+        if status in _assistant_paid_statuses():
+            return {
+                "status": status,
+                "payment_required": False,
+                "allow_first_build": False,
+                "plan": _assistant_plan_name(settings),
+                "order_id": order_id,
+                "purpose": normalized_purpose,
+                "purpose_label": cached_label,
+                "price_usd": price_usd,
+                "currency": currency,
+            }
+        session_id = str(_row_value(order_row, "stripe_session_id") or "").strip() or None
+        payment_url = str(_row_value(order_row, "stripe_payment_url") or "").strip() or None
+        if status in {"pending_payment", "quoted"} and session_id and stripe_client is not None:
+            try:
+                session = await stripe_client.get_checkout_session(session_id)
+            except Exception:
+                session = None
+            if session:
+                session_status = str(session.get("status") or "").strip().lower()
+                if session_status == "complete":
+                    subscription_id = session.get("subscription")
+                    db.mark_billing_order_paid(
+                        order_id,
+                        stripe_session_id=session_id,
+                        stripe_subscription_id=subscription_id,
+                    )
+                    return {
+                        "status": "paid",
+                        "payment_required": False,
+                        "allow_first_build": False,
+                        "plan": _assistant_plan_name(settings),
+                        "order_id": order_id,
+                        "purpose": normalized_purpose,
+                        "purpose_label": cached_label,
+                        "price_usd": price_usd,
+                        "currency": currency,
+                    }
+                if session_status == "expired":
+                    db.update_billing_order_status(order_id, "checkout_expired")
+                    order_row = None
+                elif session_status and session_status != "open":
+                    db.update_billing_order_status(
+                        order_id, f"checkout_{session_status}"
+                    )
+                    order_row = None
+
+        if order_row is not None and payment_url and status in {"pending_payment", "quoted"}:
+            return {
+                "status": status,
+                "payment_required": True,
+                "allow_first_build": allow_first_build,
+                "plan": _assistant_plan_name(settings),
+                "order_id": order_id,
+                "payment_url": payment_url,
+                "purpose": normalized_purpose,
+                "purpose_label": cached_label,
+                "price_usd": price_usd,
+                "currency": currency,
+            }
+
+    if stripe_client is None:
+        return {
+            "status": "unconfigured",
+            "payment_required": False,
+            "allow_first_build": allow_first_build,
+            "plan": _assistant_plan_name(settings),
+            "message": "stripe_not_configured",
+            "purpose": normalized_purpose,
+            "purpose_label": cached_label,
+            "price_usd": default_price,
+            "currency": default_currency,
+        }
+
+    price_id = (settings.assistant_stripe_price_id or "").strip()
+    price_usd = settings.assistant_price_usd
+    product_name = (settings.assistant_product_name or "Hire me").strip() or "Hire me"
+    currency = _assistant_currency(settings)
+
+    if not price_id and price_usd is None:
+        return {
+            "status": "unconfigured",
+            "payment_required": False,
+            "allow_first_build": allow_first_build,
+            "plan": _assistant_plan_name(settings),
+            "message": "assistant_pricing_missing",
+            "purpose": normalized_purpose,
+            "purpose_label": cached_label,
+            "price_usd": default_price,
+            "currency": default_currency,
+        }
+
+    order_id = db.create_billing_order(
+        tenant_id=int(tenant.id),
+        order_type=order_type,
+        status="quoted",
+        price_usd=price_usd,
+        currency=currency,
+        metadata={
+            "plan": _assistant_plan_name(settings),
+            "price_id": price_id or None,
+            "product_name": product_name,
+            "purpose": normalized_purpose,
+            "purpose_label": cached_label,
+        },
+    )
+    metadata = {
+        "billing_order_id": str(order_id),
+        "order_type": order_type,
+        "plan": _assistant_plan_name(settings),
+        "price_usd": f"{price_usd:.2f}" if price_usd is not None else "",
+        "currency": currency,
+        "purpose": normalized_purpose or "",
+        "purpose_label": cached_label or "",
+    }
+    if getattr(tenant, "id", None) is not None:
+        metadata["tenant_id"] = str(tenant.id)
+    if getattr(tenant, "key", None):
+        metadata["tenant_key"] = str(tenant.key)
+    if getattr(tenant, "provider", None):
+        metadata["provider"] = str(tenant.provider)
+    if getattr(tenant, "external_id", None):
+        metadata["tenant_external_id"] = str(tenant.external_id)
+
+    if price_id:
+        session = await stripe_client.create_subscription_checkout_session_for_price(
+            price_id=price_id,
+            metadata=metadata,
+        )
+    else:
+        amount_cents = int(round(float(price_usd or 0) * 100))
+        session = await stripe_client.create_recurring_checkout_session(
+            amount_cents=amount_cents,
+            currency=currency.lower(),
+            product_name=product_name,
+            interval="month",
+            metadata=metadata,
+        )
+
+    db.update_billing_order_payment(
+        order_id,
+        stripe_session_id=session.session_id,
+        stripe_payment_url=session.url,
+        status="pending_payment",
+    )
+    return {
+        "status": "pending_payment",
+        "payment_required": True,
+        "allow_first_build": allow_first_build,
+        "plan": _assistant_plan_name(settings),
+        "order_id": order_id,
+        "payment_url": session.url,
+        "purpose": normalized_purpose,
+        "purpose_label": cached_label,
+        "price_usd": price_usd,
+        "currency": currency,
+    }
 
 
 app = create_app()

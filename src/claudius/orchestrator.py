@@ -7,6 +7,7 @@ from typing import Any
 import json
 import re
 import asyncio
+import httpx
 
 from claudius.db.core import Database
 from claudius.models import Attachment, NormalizedMessage, OrchestratorResult
@@ -239,7 +240,18 @@ class Orchestrator:
         if msg.images and hasattr(self.messenger, "download_images"):
             asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
 
-        task_content = self._build_task_content(msg, asset_paths)
+        billing_status = None
+        if msg.provider != "event":
+            billing_status = await self._fetch_billing_status(
+                tenant=tenant,
+                msg=msg,
+                project_name=workspace.project_name,
+                tasks_dir=workspace.tasks_dir,
+            )
+            if billing_status is not None:
+                self._write_billing_status(workspace.tasks_dir, billing_status)
+
+        task_content = self._build_task_content(msg, asset_paths, billing_status)
         task_path = workspace.write_task(task_content)
 
         self._clear_run_artifacts(workspace.tasks_dir)
@@ -295,6 +307,7 @@ class Orchestrator:
                 self.db.update_run_inputs_statuses(run_input_ids, "handled")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
+            await self._maybe_send_interaction_request(workspace, tenant, msg, run_id=run_id)
             if process_queue:
                 await self._drain_run_inputs(tenant, project_name=workspace.project_name)
             self._write_request_status(workspace, tenant)
@@ -398,7 +411,11 @@ class Orchestrator:
         self._clear_inflight_stream(tenant.key, project_name)
 
     @staticmethod
-    def _build_task_content(msg: NormalizedMessage, asset_paths: list[str] | None = None) -> str:
+    def _build_task_content(
+        msg: NormalizedMessage,
+        asset_paths: list[str] | None = None,
+        billing_status: dict[str, Any] | None = None,
+    ) -> str:
         message_text = (msg.text or "").strip()
         if not message_text and msg.images:
             message_text = "(attachment only)"
@@ -415,6 +432,33 @@ class Orchestrator:
             lines.append("\n## Saved Assets")
             for path in asset_paths:
                 lines.append(f"- {path}")
+        if billing_status:
+            lines.append("\n## Billing")
+            status = billing_status.get("status")
+            if status:
+                lines.append(f"Status: {status}")
+            purpose = billing_status.get("purpose")
+            if purpose:
+                lines.append(f"Purpose: {purpose}")
+            purpose_label = billing_status.get("purpose_label")
+            if purpose_label:
+                lines.append(f"Purpose label: {purpose_label}")
+            payment_required = billing_status.get("payment_required")
+            if payment_required is not None:
+                lines.append(f"Payment required: {payment_required}")
+            allow_first_build = billing_status.get("allow_first_build")
+            if allow_first_build is not None:
+                lines.append(f"Allow first build: {allow_first_build}")
+            plan = billing_status.get("plan") or billing_status.get("tier")
+            if plan:
+                lines.append(f"Plan: {plan}")
+            payment_url = billing_status.get("payment_url")
+            if payment_url:
+                lines.append(f"Payment URL: {payment_url}")
+            message = billing_status.get("message")
+            if message:
+                lines.append(f"Message: {message}")
+            lines.append("Full payload: tasks/billing_status.json")
         return "\n".join(lines) + "\n"
 
     def _resolve_project_from_message(
@@ -635,6 +679,7 @@ class Orchestrator:
             tenant=tenant,
             msg=msg,
             instruction=instruction,
+            run_id=None,
         )
         if sent:
             return
@@ -654,12 +699,13 @@ class Orchestrator:
         tenant: Any,
         msg: NormalizedMessage | None,
         instruction: str,
+        run_id: int | None = None,
     ) -> bool:
         sender = getattr(self.agent, "send_interaction_instruction", None)
         if sender is None:
             return False
         try:
-            await sender(
+            result = await sender(
                 workspace=workspace,
                 instruction=instruction,
                 messenger=self.messenger,
@@ -671,6 +717,7 @@ class Orchestrator:
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
             )
+            self._record_interaction_usage(run_id, result, workspace.tasks_dir)
             return True
         except Exception as exc:  # noqa: BLE001
             try:
@@ -714,12 +761,13 @@ class Orchestrator:
         tenant: Any,
         msg: NormalizedMessage | None,
         text: str,
+        run_id: int | None = None,
     ) -> None:
         sender = getattr(self.agent, "send_interaction_message", None)
         if sender is None:
             return
         try:
-            await sender(
+            result = await sender(
                 workspace=workspace,
                 text=text,
                 messenger=self.messenger,
@@ -731,12 +779,114 @@ class Orchestrator:
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
             )
+            self._record_interaction_usage(run_id, result, workspace.tasks_dir)
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(
                     workspace.tasks_dir,
                     "system",
                     f"interaction_send_failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+
+    async def _maybe_send_interaction_request(
+        self,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage,
+        run_id: int | None = None,
+    ) -> None:
+        path = workspace.tasks_dir / "interaction_request.json"
+        if not path.exists():
+            return
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            payload = None
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if not isinstance(payload, dict):
+            return
+        kind = str(payload.get("type") or "").strip().lower()
+        if kind == "send_message":
+            text = str(payload.get("text") or "").strip()
+            if not text:
+                return
+            final = bool(payload.get("final", False))
+            instruction = (
+                "Send the message below to the user. "
+                f"Set final to {str(final).lower()}.\n\n"
+                f"MESSAGE:\n{text}"
+            )
+            await self._send_interaction_instruction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                instruction=instruction,
+                run_id=run_id,
+            )
+            return
+        if kind == "send_payment_link":
+            text = str(payload.get("text") or "").strip()
+            order_id = payload.get("order_id")
+            source = str(payload.get("source") or "").strip()
+            final = bool(payload.get("final", False))
+            parts = [
+                "Send a payment link to the user using send_payment_link.",
+                f"Set final to {str(final).lower()}.",
+            ]
+            if order_id is not None:
+                parts.append(f"Order ID: {order_id}")
+            if source:
+                parts.append(f"Source: {source}")
+            if text:
+                parts.append(f"Message text:\n{text}")
+            instruction = "\n".join(parts)
+            await self._send_interaction_instruction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                instruction=instruction,
+                run_id=run_id,
+            )
+            return
+
+    def _record_interaction_usage(
+        self,
+        run_id: int | None,
+        result: Any,
+        tasks_dir: Path,
+    ) -> None:
+        if run_id is None or result is None:
+            return
+        total_cost = getattr(result, "total_cost_usd", None)
+        usage = getattr(result, "usage", None)
+        if total_cost is None and not usage:
+            return
+        if isinstance(usage, dict):
+            usage_payload = dict(usage)
+        elif usage is None:
+            usage_payload = {}
+        else:
+            usage_payload = {"raw": usage}
+        if total_cost is not None:
+            usage_payload["total_cost_usd"] = total_cost
+        try:
+            self.db.add_run_usage(
+                run_id,
+                total_cost_usd=total_cost,
+                usage=usage_payload,
+                usage_key="interaction",
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                append_log(
+                    tasks_dir,
+                    "system",
+                    f"interaction_usage_failed: {type(exc).__name__}: {exc}",
                 )
             except Exception:
                 pass
@@ -1293,6 +1443,7 @@ class Orchestrator:
             "result_summary.md",
             "summary_prompt.md",
             "memory_prompt.md",
+            "interaction_request.json",
         ):
             path = tasks_dir / name
             if path.exists():
@@ -1329,6 +1480,93 @@ class Orchestrator:
         tasks_dir: Path, role: str, text: str, timestamp: Any | None = None
     ) -> None:
         append_log(tasks_dir, f"{role}_message", text, timestamp=timestamp)
+
+    async def _fetch_billing_status(
+        self,
+        *,
+        tenant: Any,
+        msg: NormalizedMessage,
+        project_name: str | None,
+        tasks_dir: Path,
+    ) -> dict[str, Any] | None:
+        settings = Settings()
+        url = settings.billing_status_url
+        if not url and settings.public_base_url:
+            base = settings.public_base_url.rstrip("/")
+            url = f"{base}/billing/status"
+        if not url:
+            return None
+        purpose_payload = self._derive_billing_purpose(msg)
+        payload = {
+            "tenant_id": getattr(tenant, "id", None),
+            "tenant_key": getattr(tenant, "key", None),
+            "provider": getattr(msg, "provider", None),
+            "tenant_external_id": getattr(msg, "tenant_external_id", None),
+            "project_name": project_name,
+            "provider_message_id": getattr(msg, "provider_message_id", None),
+            "received_at": msg.received_at.isoformat() if msg.received_at else None,
+        }
+        if purpose_payload:
+            payload.update(purpose_payload)
+        headers = {}
+        if settings.billing_status_token:
+            headers["Authorization"] = f"Bearer {settings.billing_status_token}"
+        try:
+            async with httpx.AsyncClient(
+                timeout=settings.billing_status_timeout_seconds
+            ) as client:
+                response = await client.post(url, json=payload, headers=headers)
+            if response.status_code >= 400:
+                append_log(
+                    tasks_dir,
+                    "system",
+                    f"billing_status_http_error: {response.status_code}",
+                )
+                return None
+            data = response.json()
+            if not isinstance(data, dict):
+                append_log(tasks_dir, "system", "billing_status_invalid_response")
+                return None
+            return data
+        except Exception as exc:  # noqa: BLE001
+            append_log(
+                tasks_dir,
+                "system",
+                f"billing_status_failed: {type(exc).__name__}: {exc}",
+            )
+            return None
+
+    @staticmethod
+    def _write_billing_status(tasks_dir: Path, payload: dict[str, Any]) -> None:
+        try:
+            path = tasks_dir / "billing_status.json"
+            path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
+        except OSError:
+            return
+
+    @staticmethod
+    def _derive_billing_purpose(msg: NormalizedMessage) -> dict[str, str] | None:
+        text = (msg.text or "").strip()
+        if not text:
+            if msg.images:
+                label = "attachment"
+            else:
+                return None
+        else:
+            label = text.splitlines()[0].strip()
+        label = re.sub(r"\\s+", " ", label).strip()
+        if not label:
+            return None
+        label = label[:160]
+        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
+        if not slug:
+            slug = "request"
+        suffix = str(getattr(msg, "provider_message_id", "") or "").strip()
+        purpose = f"{slug}-{suffix}" if suffix else slug
+        return {
+            "purpose": purpose[:80],
+            "purpose_label": label,
+        }
 
     @staticmethod
     def _maybe_prepare_compaction(

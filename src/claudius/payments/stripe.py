@@ -106,6 +106,54 @@ class StripeClient:
         payload = response.json()
         return StripeSession(session_id=payload["id"], url=payload["url"])
 
+    async def create_subscription_checkout_session_for_price(
+        self,
+        *,
+        price_id: str,
+        metadata: dict[str, str] | None = None,
+    ) -> StripeSession:
+        data = {
+            "mode": "subscription",
+            "success_url": self.config.success_url,
+            "cancel_url": self.config.cancel_url,
+            "line_items[0][quantity]": "1",
+            "line_items[0][price]": price_id,
+        }
+        if metadata:
+            for key, value in metadata.items():
+                data[f"metadata[{key}]"] = str(value)
+
+        headers = {
+            "Authorization": f"Bearer {self.config.secret_key}",
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.post(
+                "https://api.stripe.com/v1/checkout/sessions",
+                data=data,
+                headers=headers,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"Stripe error: {response.status_code} {response.text}")
+        payload = response.json()
+        return StripeSession(session_id=payload["id"], url=payload["url"])
+
+    async def get_checkout_session(self, session_id: str) -> dict[str, Any]:
+        headers = {
+            "Authorization": f"Bearer {self.config.secret_key}",
+        }
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            response = await client.get(
+                f"https://api.stripe.com/v1/checkout/sessions/{session_id}",
+                headers=headers,
+            )
+        if response.status_code != 200:
+            raise RuntimeError(f"Stripe error: {response.status_code} {response.text}")
+        payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("stripe_invalid_response")
+        return payload
+
     def verify_webhook(
         self, payload: bytes, signature_header: str, tolerance: int = 300
     ) -> dict[str, Any]:

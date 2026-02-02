@@ -639,6 +639,75 @@ class SupabaseDatabase:
         payload: dict[str, Any] = {"total_cost_usd": total_cost_usd, "usage_json": usage}
         self._execute(self._table("runs").update(payload).eq("id", run_id))
 
+    @staticmethod
+    def _looks_like_raw_usage(payload: dict[str, Any]) -> bool:
+        token_keys = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "service_tier",
+            "server_tool_use",
+            "cache_creation",
+        }
+        return any(key in payload for key in token_keys)
+
+    @classmethod
+    def _wrap_usage_payload(cls, payload: Any | None) -> dict[str, Any]:
+        if payload is None:
+            return {}
+        if not isinstance(payload, dict):
+            return {"primary": payload}
+        if any(key in payload for key in ("primary", "interaction", "interactions")):
+            return dict(payload)
+        if cls._looks_like_raw_usage(payload):
+            return {"primary": payload}
+        return dict(payload)
+
+    @classmethod
+    def _merge_usage_payload(
+        cls,
+        existing: Any | None,
+        additional: dict[str, Any],
+        usage_key: str | None,
+    ) -> dict[str, Any]:
+        payload = cls._wrap_usage_payload(existing)
+        if usage_key:
+            bucket = payload.get(usage_key)
+            if bucket is None:
+                payload[usage_key] = [additional]
+            elif isinstance(bucket, list):
+                bucket.append(additional)
+            else:
+                payload[usage_key] = [bucket, additional]
+        else:
+            payload["additional"] = additional
+        return payload
+
+    def add_run_usage(
+        self,
+        run_id: int,
+        total_cost_usd: float | None = None,
+        usage: dict | None = None,
+        usage_key: str | None = "interaction",
+    ) -> None:
+        if total_cost_usd is None and not usage:
+            return
+        row = self._select_one("runs", id=run_id)
+        if not row:
+            return
+        existing_total = row.get("total_cost_usd")
+        new_total = existing_total
+        if total_cost_usd is not None:
+            base = existing_total or 0.0
+            new_total = base + total_cost_usd
+        existing_usage = row.get("usage_json")
+        merged_usage = existing_usage
+        if usage is not None:
+            merged_usage = self._merge_usage_payload(existing_usage, usage, usage_key)
+        payload: dict[str, Any] = {"total_cost_usd": new_total, "usage_json": merged_usage}
+        self._execute(self._table("runs").update(payload).eq("id", run_id))
+
     def create_billing_order(
         self,
         tenant_id: int,
@@ -739,6 +808,19 @@ class SupabaseDatabase:
 
     def get_billing_order_by_session(self, session_id: str) -> dict[str, Any] | None:
         return self._select_one("billing_orders", stripe_session_id=session_id)
+
+    def get_latest_billing_order(
+        self,
+        tenant_id: int,
+        order_type: str | None = None,
+    ) -> dict[str, Any] | None:
+        query = self._table("billing_orders").select("*").eq("tenant_id", tenant_id)
+        if order_type:
+            query = query.eq("order_type", order_type)
+        data = self._execute(query.order("id", desc=True).limit(1))
+        if data:
+            return data[0]
+        return None
 
     def upsert_supabase_project(
         self,
