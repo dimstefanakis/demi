@@ -1,6 +1,6 @@
 import json
 
-from claudius.agent.claude import ClaudeAgent, _sdk_message_log_data
+from demi.agent.claude import ClaudeAgent, _sdk_message_log_data
 
 
 def test_default_allowed_tools():
@@ -11,11 +11,11 @@ def test_default_allowed_tools():
     assert "AskUserQuestion" in agent.allowed_tools
     assert "Task" in agent.allowed_tools
     assert "Skill" in agent.allowed_tools
-    assert "mcp__claudius-chat__send_message" in agent.allowed_tools
-    assert "mcp__claudius-chat__send_payment_link" in agent.allowed_tools
-    assert "mcp__claudius-chat__record_deploy" in agent.allowed_tools
-    assert "mcp__claudius-chat__record_domain_quote" in agent.allowed_tools
-    assert "mcp__claudius-unsplash__search_photos" in agent.allowed_tools
+    assert "mcp__demi-chat__send_message" in agent.allowed_tools
+    assert "mcp__demi-chat__send_payment_link" in agent.allowed_tools
+    assert "mcp__demi-chat__record_deploy" in agent.allowed_tools
+    assert "mcp__demi-chat__record_domain_quote" in agent.allowed_tools
+    assert "mcp__demi-unsplash__search_photos" in agent.allowed_tools
 
 
 def test_default_setting_sources():
@@ -27,7 +27,7 @@ def test_default_subagents_configured():
     agent = ClaudeAgent()
     assert "interaction-agent" in agent.agents
     tools = agent.agents["interaction-agent"].tools or []
-    assert "mcp__claudius-chat__send_payment_link" in tools
+    assert "mcp__demi-chat__send_payment_link" in tools
 
 
 def test_sdk_message_log_data_does_not_include_repr():

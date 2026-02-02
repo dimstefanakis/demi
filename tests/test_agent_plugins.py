@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from claudius.agent.claude import ClaudeAgent
+from demi.agent.claude import ClaudeAgent
 
 
 def test_plugins_loaded_from_env(monkeypatch, tmp_path):

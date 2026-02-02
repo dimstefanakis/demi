@@ -11,7 +11,7 @@ CONF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/deploy/nginx/conf.d"
 UPSTREAM_FILE="${CONF_DIR}/upstream.conf"
 
 cat > "${UPSTREAM_FILE}" <<EOF
-upstream claudius_upstream {
+upstream demi_upstream {
     server api_${COLOR}:8000;
 }
 EOF

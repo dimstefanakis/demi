@@ -8,7 +8,7 @@ including Supabase main DB usage and a worker container that is isolated from th
 ### 1) Prereqs
 - A GCE VM (Ubuntu 22.04 or Debian) with inbound HTTP (port 80) allowed.
 - Supabase project (remote) for the main DB.
-- Repo cloned on the VM (recommended path: `/opt/claudius`).
+- Repo cloned on the VM (recommended path: `/opt/demi`).
 - Docker + Docker Compose installed on the VM.
 
 ### 2) GCE network setup (static IP + firewall)
@@ -16,30 +16,30 @@ You can do this in the GCP Console or via `gcloud`. Example CLI flow:
 
 ```bash
 # Reserve a static external IP
-gcloud compute addresses create claudius-ip --region=YOUR_REGION
-gcloud compute addresses describe claudius-ip --region=YOUR_REGION --format="get(address)"
+gcloud compute addresses create demi-ip --region=YOUR_REGION
+gcloud compute addresses describe demi-ip --region=YOUR_REGION --format="get(address)"
 
 # Add an HTTP firewall rule (tagged)
-gcloud compute firewall-rules create claudius-http \
+gcloud compute firewall-rules create demi-http \
   --allow tcp:80 \
-  --target-tags claudius
+  --target-tags demi
 
 # (Optional) add HTTPS as well
-gcloud compute firewall-rules create claudius-https \
+gcloud compute firewall-rules create demi-https \
   --allow tcp:443 \
-  --target-tags claudius
+  --target-tags demi
 ```
 
 When creating the VM:
 - Assign the reserved static IP.
-- Add the network tag: `claudius`.
+- Add the network tag: `demi`.
 
-If you already have a VM, attach the static IP and add the `claudius` tag in the
+If you already have a VM, attach the static IP and add the `demi` tag in the
 instance settings, or via CLI:
 
 ```bash
 gcloud compute instances add-tags YOUR_INSTANCE \
-  --tags claudius \
+  --tags demi \
   --zone=YOUR_ZONE
 
 gcloud compute instances delete-access-config YOUR_INSTANCE \
@@ -48,7 +48,7 @@ gcloud compute instances delete-access-config YOUR_INSTANCE \
 
 gcloud compute instances add-access-config YOUR_INSTANCE \
   --access-config-name="External NAT" \
-  --address=claudius-ip \
+  --address=demi-ip \
   --zone=YOUR_ZONE
 ```
 
@@ -64,10 +64,10 @@ newgrp docker
 
 ### 4) Clone the repo
 ```bash
-sudo mkdir -p /opt/claudius
-sudo chown $USER:$USER /opt/claudius
-git clone git@github.com:YOUR_ORG/claudius.git /opt/claudius
-cd /opt/claudius
+sudo mkdir -p /opt/demi
+sudo chown $USER:$USER /opt/demi
+git clone git@github.com:YOUR_ORG/demi.git /opt/demi
+cd /opt/demi
 ```
 
 ### 5) Configure environment
@@ -86,7 +86,7 @@ into tenant containers.
 
 ### 6) Build the agent image
 ```bash
-docker build -f docker/agent.Dockerfile -t claudius-agent:local .
+docker build -f docker/agent.Dockerfile -t demi-agent:local .
 ```
 
 ### 7) Start the stack
@@ -109,7 +109,7 @@ Required GitHub Secrets:
 
 Optional GitHub Secrets:
 - `DEPLOY_PORT` (default `22`)
-- `DEPLOY_PATH` (default `/opt/claudius`)
+- `DEPLOY_PATH` (default `/opt/demi`)
 - `DEPLOY_BRANCH` (default `main`)
 
 Pushes to `main` run the deploy script on the VM.
@@ -121,7 +121,7 @@ Pushes to `main` run the deploy script on the VM.
 - Switching: `scripts/switch_blue_green.sh` updates the upstream and reloads nginx.
 - Deploy: `scripts/deploy_blue_green.sh` builds the next color, waits for
   `GET /health`, then switches traffic.
-- Worker isolation: `worker` runs `claudius.worker_entrypoint` and is separate from
+- Worker isolation: `worker` runs `demi.worker_entrypoint` and is separate from
   API containers, so deployments do not interrupt request handling.
 - Main DB: The orchestrator/worker use Supabase Postgres via
   `MAIN_DB_BACKEND=supabase`. This keeps runs/messages shared across containers.

@@ -1,4 +1,4 @@
-import claudius.runtime.agent_entrypoint as agent_entrypoint
+import demi.runtime.agent_entrypoint as agent_entrypoint
 
 
 def test_load_runtime_env_from_process_collects_github_runtime_keys(monkeypatch):

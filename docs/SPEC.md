@@ -1,4 +1,4 @@
-# Claudius Specification
+# Demi Specification
 
 A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB websites via conversation. It combines a FastAPI orchestrator, per-tenant workspaces, and a Claude Agent SDK runtime that drives Gemini and Vercel tooling.
 
@@ -55,7 +55,7 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
     ┌──────────────────────────────┐
     │ Agent Runtime                │
     │ - Local Claude Agent SDK     │
-    │ - or Docker (claudius-agent) │
+    │ - or Docker (demi-agent) │
     └──────────────┬───────────────┘
                    ▼
     ┌──────────────────────────────┐
@@ -86,8 +86,8 @@ Background workers (poll main DB):
 
 ### Technology Stack
 
-- API: FastAPI (`src/claudius/app.py`)
-- Orchestration: Python (`src/claudius/orchestrator.py`)
+- API: FastAPI (`src/demi/app.py`)
+- Orchestration: Python (`src/demi/orchestrator.py`)
 - Agent runtime: Claude Agent SDK (`claude_agent_sdk`) with optional Docker isolation
 - Design: Gemini CLI driven by `DESIGN.md`
 - Deploy: Vercel CLI
@@ -99,7 +99,7 @@ Background workers (poll main DB):
 ## Folder Structure
 
 ```
-claudius/
+demi/
 ├── AGENTS.md
 ├── PRODUCT.md / PRD.md / IMPLEMENTATION.md / DESIGN.md
 ├── docs/
@@ -108,7 +108,7 @@ claudius/
 │   ├── claude_agent.md
 │   └── interaction_agent.md
 ├── src/
-│   └── claudius/
+│   └── demi/
 │       ├── app.py                     # FastAPI entrypoint
 │       ├── orchestrator.py            # Message routing + task flow
 │       ├── agent/                     # Claude Agent SDK + MCP tools
@@ -131,7 +131,7 @@ claudius/
 
 ## Configuration
 
-Configuration is managed by `src/claudius/config.py` (`Settings`). Environment variables are read from `.env`.
+Configuration is managed by `src/demi/config.py` (`Settings`). Environment variables are read from `.env`.
 
 **Required**
 - `TELEGRAM_BOT_TOKEN`
@@ -153,7 +153,7 @@ Configuration is managed by `src/claudius/config.py` (`Settings`). Environment v
 
 **Agent runtime mode**
 - `AGENT_RUNTIME=local` (default) runs Claude in-process
-- `AGENT_RUNTIME=docker` runs Claude inside `claudius-agent` containers
+- `AGENT_RUNTIME=docker` runs Claude inside `demi-agent` containers
 - `DOCKER_ENV_ALLOWLIST` controls which env vars can be forwarded to containers
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
@@ -316,10 +316,10 @@ Background workers poll the main DB and run in the API process or the worker con
 
 MCP servers are registered per agent run.
 
-- `claudius-chat`: `send_message`, `should_send_message`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `decide_project`
-- `claudius-unsplash`: `search_photos` (Unsplash sourcing)
-- `claudius-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
-- `claudius-github`: `prepare_repo` (GitHub App provisioning)
+- `demi-chat`: `send_message`, `should_send_message`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `decide_project`
+- `demi-unsplash`: `search_photos` (Unsplash sourcing)
+- `demi-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
+- `demi-github`: `prepare_repo` (GitHub App provisioning)
 - `supabase` (remote MCP): Enabled when configured for Supabase MCP access
 - `chrome-devtools` (optional): Browser automation via Chrome DevTools MCP
 
@@ -329,10 +329,10 @@ MCP servers are registered per agent run.
 
 Primary deployment target is a single VM with Docker Compose and optional blue/green routing.
 
-- API: `uv run uvicorn claudius.app:app --reload` for local dev
-- Worker: `python -m claudius.worker_entrypoint`
+- API: `uv run uvicorn demi.app:app --reload` for local dev
+- Worker: `python -m demi.worker_entrypoint`
 - Production: Docker Compose with `nginx`, `api_blue`, `api_green`, `worker`
-- Agent runtime uses Docker socket to run `claudius-agent` images
+- Agent runtime uses Docker socket to run `demi-agent` images
 
 See `DEPLOY.md` for the full GCE blue/green process and required secrets.
 

@@ -17,7 +17,7 @@ fi
 
 echo "Current: ${current_color}. Deploying ${target_color}."
 
-docker build -f docker/agent.Dockerfile -t claudius-agent:local .
+docker build -f docker/agent.Dockerfile -t demi-agent:local .
 docker compose up -d --build nginx worker
 docker compose up -d --build "api_${target_color}"
 

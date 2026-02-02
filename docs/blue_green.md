@@ -9,7 +9,7 @@ The active color is controlled by `deploy/nginx/conf.d/upstream.conf` and reload
 - `data/` directory persisted on disk
 - Build the agent image used by the orchestrator:
   ```
-  docker build -f docker/agent.Dockerfile -t claudius-agent:local .
+  docker build -f docker/agent.Dockerfile -t demi-agent:local .
   ```
 
 ## Start
@@ -32,7 +32,7 @@ Required secrets:
 
 Optional secrets:
 - `DEPLOY_PORT` (defaults to 22)
-- `DEPLOY_PATH` (defaults to `/opt/claudius`)
+- `DEPLOY_PATH` (defaults to `/opt/demi`)
 - `DEPLOY_BRANCH` (defaults to `main`)
 
 ## Manually switch
@@ -42,6 +42,6 @@ Optional secrets:
 ```
 
 ## Notes
-- `worker` runs `claudius.worker_entrypoint` (no HTTP server).
+- `worker` runs `demi.worker_entrypoint` (no HTTP server).
 - Agent containers still run on the host via the Docker socket.
 - `MAIN_DB_BACKEND=supabase` is required for multi-instance safety.

@@ -261,7 +261,7 @@ Minimum approach:
 - Store last processed message timestamp or ID
 
 ## Chatty UX (MVP)
-- Agent sends a context-aware “on it” message via the `mcp__claudius-chat__send_message` tool.
+- Agent sends a context-aware “on it” message via the `mcp__demi-chat__send_message` tool.
 - Agent may send interim updates using the same tool (after checking `should_send_message`).
 - After deploy, agent records the URL via `record_deploy` and sends the live link itself.
 - Chatty subagent reads `tasks/chat_history.md` and `tasks/chat_summary.md` to avoid duplicate replies.

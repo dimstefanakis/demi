@@ -1,8 +1,8 @@
 import asyncio
 import json
 
-import claudius.agent.github_tools as github_tools_module
-from claudius.agent.github_tools import GitHubToolContext, build_github_tools
+import demi.agent.github_tools as github_tools_module
+from demi.agent.github_tools import GitHubToolContext, build_github_tools
 
 
 def _prepare_repo_tool(tmp_path, runtime_env=None):

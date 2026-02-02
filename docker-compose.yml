@@ -14,7 +14,7 @@ services:
     build:
       context: .
       dockerfile: docker/app.Dockerfile
-    image: claudius-api:blue
+    image: demi-api:blue
     env_file:
       - .env
     environment:
@@ -33,7 +33,7 @@ services:
     build:
       context: .
       dockerfile: docker/app.Dockerfile
-    image: claudius-api:green
+    image: demi-api:green
     env_file:
       - .env
     environment:
@@ -52,7 +52,7 @@ services:
     build:
       context: .
       dockerfile: docker/app.Dockerfile
-    image: claudius-worker:latest
+    image: demi-worker:latest
     env_file:
       - .env
     environment:
@@ -62,7 +62,7 @@ services:
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
       - EVENTS_WORKER_ENABLED=true
       - PENDING_WORKER_ENABLED=true
-    command: ["python", "-m", "claudius.worker_entrypoint"]
+    command: ["python", "-m", "demi.worker_entrypoint"]
     volumes:
       - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock

@@ -8,11 +8,11 @@
 - Product constraints to preserve: no templates, fast first result, edit-by-chat loop, Unsplash-sourced images (no AI art).
 
 ## Project Structure & Module Organization
-- `src/claudius/` is the main package: `app.py` (FastAPI), `orchestrator.py`, `agent/`, `messaging/`, `workspace/`, `db/`, `domains/`, `payments/`.
+- `src/demi/` is the main package: `app.py` (FastAPI), `orchestrator.py`, `agent/`, `messaging/`, `workspace/`, `db/`, `domains/`, `payments/`.
 - `prompts/` holds agent prompt files used at runtime.
 - `tests/` contains pytest suites (e.g., `test_orchestrator_flow.py`, `test_telegram_parser.py`).
 - Root docs (`PRODUCT.md`, `PRD.md`, `IMPLEMENTATION.md`, `DESIGN.md`) define product scope and prompt contracts.
-- `docs/SPEC.md` is the living architecture spec for Claudius.
+- `docs/SPEC.md` is the living architecture spec for Demi.
 
 ## Documentation Hygiene
 - Update `docs/SPEC.md` whenever changes affect architecture, message flow, storage, runtimes, or deployment.
@@ -23,7 +23,7 @@
 - Install CLI tooling for Gemini/Vercel (local `node_modules/.bin`):
   - `bun install`
 - Run the API locally (via uv):
-  - `uv run uvicorn claudius.app:app --reload`
+  - `uv run uvicorn demi.app:app --reload`
   - Requires `TELEGRAM_BOT_TOKEN` in `.env`.
 - Run tests:
   - `uv run pytest`
@@ -32,7 +32,7 @@
 - Python 3.10+, 4-space indentation, max line length 100 (`pyproject.toml`).
 - Prefer type hints and `from __future__ import annotations` as used in existing modules.
 - Files in `snake_case.py`, classes in `PascalCase`, constants in `UPPER_SNAKE_CASE`.
-- Centralize settings in `src/claudius/config.py` (`Settings`), avoid ad-hoc env reads.
+- Centralize settings in `src/demi/config.py` (`Settings`), avoid ad-hoc env reads.
 - Tooling policy: use `bun` for JS tooling and `uv` for Python; do not use `npm`/`pip`.
 
 ## Testing Guidelines

@@ -1,8 +1,8 @@
-from claudius.db.core import Database
+from demi.db.core import Database
 
 
 def test_outbox_deduplicates_by_correlation(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     tenant = db.get_or_create_tenant("telegram", "555")
 

@@ -149,7 +149,7 @@ Minimum approach:
 - Ignore duplicates once processed
 
 ## Chatty UX (MVP)
-- Claude sends a context-aware “on it” message via `mcp__claudius-chat__send_message`.
+- Claude sends a context-aware “on it” message via `mcp__demi-chat__send_message`.
 - Claude can send interim updates using the same tool (after `should_send_message`).
 - Claude sends the final completion + live URL itself (after calling `record_deploy`).
 - Orchestrator maintains `tasks/chat_history.md` (last N messages) and `tasks/chat_summary.md` (compact memory).

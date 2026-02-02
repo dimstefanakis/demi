@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from claudius.failure_guard import get_block, record_hard_failure
+from demi.failure_guard import get_block, record_hard_failure
 
 
 def test_failure_guard_blocks_after_two(tmp_path):

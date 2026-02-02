@@ -23,7 +23,7 @@ except ImportError:  # pragma: no cover - guided install
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SQLITE_PATH = REPO_ROOT / "data" / "claudius.sqlite"
+DEFAULT_SQLITE_PATH = REPO_ROOT / "data" / "main.sqlite"
 DEFAULT_MIGRATIONS_DIR = REPO_ROOT / "supabase" / "migrations"
 
 
@@ -76,20 +76,34 @@ def load_sqlite_rows(conn: sqlite3.Connection, table: str) -> list[dict[str, Any
 def resolve_sqlite_path(cli_value: str | None) -> Path:
     if cli_value:
         return Path(cli_value)
-    env_path = os.getenv("CLAUDIUS_SQLITE_PATH")
-    if env_path:
-        return Path(env_path)
+    for key in ("DEMI_SQLITE_PATH", "CLAUDIUS_SQLITE_PATH"):
+        env_path = os.getenv(key)
+        if env_path:
+            return Path(env_path)
+    candidates = [
+        DEFAULT_SQLITE_PATH,
+        REPO_ROOT / "data" / "main.sqlite",
+        REPO_ROOT / "data" / "claudius.sqlite",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
     return DEFAULT_SQLITE_PATH
 
 
 def resolve_postgres_url(cli_value: str | None) -> str:
     if cli_value:
         return cli_value
-    for key in ("CLAUDIUS_MAIN_DB_URL", "MAIN_DB_URL", "DATABASE_URL"):
+    for key in (
+        "DEMI_MAIN_DB_URL",
+        "CLAUDIUS_MAIN_DB_URL",
+        "MAIN_DB_URL",
+        "DATABASE_URL",
+    ):
         value = os.getenv(key)
         if value:
             return value
-    raise SystemExit("Postgres URL not set. Use --postgres-url or CLAUDIUS_MAIN_DB_URL.")
+    raise SystemExit("Postgres URL not set. Use --postgres-url or DEMI_MAIN_DB_URL.")
 
 
 def split_sql(script: str) -> list[str]:
@@ -100,7 +114,7 @@ def split_sql(script: str) -> list[str]:
 def apply_migrations(conn: psycopg.Connection, migrations_dir: Path) -> list[str]:
     conn.execute(
         """
-        CREATE TABLE IF NOT EXISTS claudius_migrations (
+        CREATE TABLE IF NOT EXISTS demi_migrations (
             version TEXT PRIMARY KEY,
             applied_at TIMESTAMPTZ NOT NULL
         );
@@ -108,7 +122,7 @@ def apply_migrations(conn: psycopg.Connection, migrations_dir: Path) -> list[str
     )
     applied = {
         row[0]
-        for row in conn.execute("SELECT version FROM claudius_migrations").fetchall()
+        for row in conn.execute("SELECT version FROM demi_migrations").fetchall()
     }
     applied_now: list[str] = []
     for path in sorted(migrations_dir.glob("*.sql")):
@@ -123,7 +137,7 @@ def apply_migrations(conn: psycopg.Connection, migrations_dir: Path) -> list[str
             for statement in statements:
                 conn.execute(statement)
             conn.execute(
-                "INSERT INTO claudius_migrations (version, applied_at) VALUES (%s, %s)",
+                "INSERT INTO demi_migrations (version, applied_at) VALUES (%s, %s)",
                 (version, datetime.utcnow()),
             )
         applied_now.append(version)
@@ -321,7 +335,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Migrate the main SQLite DB to Postgres/Supabase",
     )
-    parser.add_argument("--sqlite-path", help="Path to claudius.sqlite")
+    parser.add_argument("--sqlite-path", help="Path to main.sqlite")
     parser.add_argument("--postgres-url", help="Postgres connection string")
     parser.add_argument(
         "--migrations-dir",

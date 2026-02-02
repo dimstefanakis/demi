@@ -1,5 +1,5 @@
 {
-  "name": "claudius-tools",
+  "name": "demi-tools",
   "private": true,
   "devDependencies": {
     "@google/gemini-cli": "latest",

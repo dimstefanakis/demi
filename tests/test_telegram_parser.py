@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 
-from claudius.messaging.telegram import TelegramUpdateParser
+from demi.messaging.telegram import TelegramUpdateParser
 
 
 def test_parse_text_message():

@@ -3,12 +3,12 @@ import json
 
 import pytest
 
-import claudius.orchestrator as orchestrator_module
-from claudius.db.core import Database
-from claudius.domains.github_app import GitHubAppConfig
-from claudius.models import NormalizedMessage
-from claudius.orchestrator import Orchestrator
-from claudius.workspace.core import WorkspaceManager
+import demi.orchestrator as orchestrator_module
+from demi.db.core import Database
+from demi.domains.github_app import GitHubAppConfig
+from demi.models import NormalizedMessage
+from demi.orchestrator import Orchestrator
+from demi.workspace.core import WorkspaceManager
 
 
 class FakeAgent:
@@ -50,7 +50,7 @@ class FakeMessenger:
 
 @pytest.mark.asyncio
 async def test_orchestrator_new_site_flow(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -81,7 +81,7 @@ async def test_orchestrator_new_site_flow(tmp_path):
 
 @pytest.mark.asyncio
 async def test_orchestrator_passes_github_runtime_env(tmp_path, monkeypatch):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -124,7 +124,7 @@ async def test_orchestrator_passes_github_runtime_env(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypatch):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -153,10 +153,10 @@ async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypa
                 "Repo",
                 (),
                 {
-                    "full_name": "acme/claudius-1000-main",
-                    "name": "claudius-1000-main",
-                    "clone_url": "https://github.com/acme/claudius-1000-main.git",
-                    "ssh_url": "git@github.com:acme/claudius-1000-main.git",
+                    "full_name": "acme/site-1000-main",
+                    "name": "site-1000-main",
+                    "clone_url": "https://github.com/acme/site-1000-main.git",
+                    "ssh_url": "git@github.com:acme/site-1000-main.git",
                     "default_branch": "main",
                 },
             )()
@@ -179,7 +179,7 @@ async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypa
 
     assert runtime_env is not None
     assert runtime_env["GITHUB_TOKEN"] == "ghs_short_lived_token"
-    assert runtime_env["GITHUB_REPO_FULL_NAME"] == "acme/claudius-1000-main"
+    assert runtime_env["GITHUB_REPO_FULL_NAME"] == "acme/site-1000-main"
     assert "GITHUB_APP_PRIVATE_KEY" not in runtime_env
     assert "GITHUB_APP_ID" not in runtime_env
     assert "GITHUB_APP_INSTALLATION_ID" not in runtime_env
@@ -187,7 +187,7 @@ async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypa
 
 @pytest.mark.asyncio
 async def test_orchestrator_reconciles_run_result(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -242,7 +242,7 @@ async def test_orchestrator_reconciles_run_result(tmp_path):
 
 @pytest.mark.asyncio
 async def test_orchestrator_blocks_after_two_hard_failures(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -292,7 +292,7 @@ async def test_orchestrator_blocks_after_two_hard_failures(tmp_path):
 
 @pytest.mark.asyncio
 async def test_orchestrator_clears_block_on_retry(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -354,7 +354,7 @@ async def test_orchestrator_clears_block_on_retry(tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("directive", ["project: beta", "/project beta"])
 async def test_orchestrator_allows_parallel_projects(tmp_path, directive):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -392,7 +392,7 @@ async def test_orchestrator_allows_parallel_projects(tmp_path, directive):
 
 @pytest.mark.asyncio
 async def test_orchestrator_updates_request_status_for_pending(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -429,7 +429,7 @@ async def test_orchestrator_updates_request_status_for_pending(tmp_path):
 
 @pytest.mark.asyncio
 async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FakeAgent()
@@ -467,7 +467,7 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
 
 @pytest.mark.asyncio
 async def test_orchestrator_expires_stale_run(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -511,7 +511,7 @@ async def test_orchestrator_expires_stale_run(tmp_path):
     ["/reset", "/reset now", "/reset@mybot", "/reset@mybot now"],
 )
 async def test_orchestrator_reset_clears_state(tmp_path, reset_text):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -581,7 +581,7 @@ async def test_orchestrator_reset_clears_state(tmp_path, reset_text):
 
 @pytest.mark.asyncio
 async def test_orchestrator_infers_project_from_description(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 

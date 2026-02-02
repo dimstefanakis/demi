@@ -2,10 +2,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from claudius.db.core import Database
-from claudius.models import NormalizedMessage
-from claudius.orchestrator import Orchestrator
-from claudius.workspace.core import WorkspaceManager
+from demi.db.core import Database
+from demi.models import NormalizedMessage
+from demi.orchestrator import Orchestrator
+from demi.workspace.core import WorkspaceManager
 
 
 class FakeAgent:
@@ -47,7 +47,7 @@ def _raw_update(message_id: str, text: str):
 
 @pytest.mark.asyncio
 async def test_pending_messages_coalesced(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     tenant = db.get_or_create_tenant("telegram", "123")
 

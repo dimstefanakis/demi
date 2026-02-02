@@ -1,4 +1,4 @@
-from claudius.workspace.core import WorkspaceManager
+from demi.workspace.core import WorkspaceManager
 
 
 def test_workspace_created(tmp_path):

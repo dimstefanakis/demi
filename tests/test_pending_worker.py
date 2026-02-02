@@ -2,11 +2,11 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from claudius.db.core import Database
-from claudius.jobs.pending_worker import PendingWorker, PendingWorkerConfig
-from claudius.models import NormalizedMessage
-from claudius.orchestrator import Orchestrator
-from claudius.workspace.core import WorkspaceManager
+from demi.db.core import Database
+from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
+from demi.models import NormalizedMessage
+from demi.orchestrator import Orchestrator
+from demi.workspace.core import WorkspaceManager
 
 
 class FakeAgent:
@@ -51,7 +51,7 @@ class FakeMessenger:
 
 @pytest.mark.asyncio
 async def test_pending_worker_drains_queue(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FakeAgent()
@@ -117,7 +117,7 @@ async def test_pending_worker_drains_queue(tmp_path):
 
 @pytest.mark.asyncio
 async def test_pending_worker_clears_stale_inflight_run(tmp_path):
-    db = Database(tmp_path / "claudius.sqlite")
+    db = Database(tmp_path / "main.sqlite")
     db.init()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FakeAgent()

@@ -2,9 +2,9 @@ import asyncio
 import json
 from pathlib import Path
 
-from claudius.agent.chat_tools import ChatToolContext, build_chat_tools
-from claudius.tenant_db import ensure_tenant_db
-from claudius.memory import append_log
+from demi.agent.chat_tools import ChatToolContext, build_chat_tools
+from demi.tenant_db import ensure_tenant_db
+from demi.memory import append_log
 
 
 class FakeMessenger:

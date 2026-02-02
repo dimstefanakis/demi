@@ -1,10 +1,10 @@
-from claudius.db.core import Database
-from claudius.models import NormalizedMessage
+from demi.db.core import Database
+from demi.models import NormalizedMessage
 from datetime import datetime, timezone
 
 
 def test_record_message_idempotency(tmp_path):
-    db_path = tmp_path / "claudius.sqlite"
+    db_path = tmp_path / "main.sqlite"
     db = Database(db_path)
     db.init()
 
@@ -29,7 +29,7 @@ def test_record_message_idempotency(tmp_path):
 
 
 def test_same_message_id_across_tenants(tmp_path):
-    db_path = tmp_path / "claudius.sqlite"
+    db_path = tmp_path / "main.sqlite"
     db = Database(db_path)
     db.init()
 

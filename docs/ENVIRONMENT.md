@@ -52,7 +52,7 @@ Default env allowlist includes:
 - CLAUDE_PLUGINS / ANTHROPIC_API_KEY / CLAUDE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 
 Main DB credentials (e.g., `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`,
-`CLAUDIUS_MAIN_DB_URL`) are intentionally excluded from the tenant container allowlist.
+`DEMI_MAIN_DB_URL`) are intentionally excluded from the tenant container allowlist.
 Keep them only in the orchestrator/worker environment.
 
 ## Operational Notes

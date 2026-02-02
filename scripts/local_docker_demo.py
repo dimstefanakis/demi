@@ -4,13 +4,13 @@ import argparse
 import asyncio
 from datetime import datetime, timezone
 
-from claudius.config import Settings
-from claudius.db.core import Database
-from claudius.models import NormalizedMessage
-from claudius.orchestrator import Orchestrator
-from claudius.runtime.docker_agent import DockerAgent
-from claudius.runtime.docker_pool import DockerPool, DockerPoolConfig
-from claudius.workspace.core import WorkspaceManager
+from demi.config import Settings
+from demi.db.core import Database
+from demi.models import NormalizedMessage
+from demi.orchestrator import Orchestrator
+from demi.runtime.docker_agent import DockerAgent
+from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
+from demi.workspace.core import WorkspaceManager
 
 
 class NoopMessenger:

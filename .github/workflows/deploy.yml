@@ -32,7 +32,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
           DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
           DEPLOY_PORT: ${{ secrets.DEPLOY_PORT || '22' }}
-          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/claudius' }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH || '/opt/demi' }}
           DEPLOY_BRANCH: ${{ secrets.DEPLOY_BRANCH || 'main' }}
         run: |
           ssh -p "$DEPLOY_PORT" "$DEPLOY_USER@$DEPLOY_HOST" \

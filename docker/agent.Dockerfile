@@ -24,4 +24,4 @@ RUN printf '#!/bin/sh\nexec bunx --bun @google/gemini-cli "$@"\n' > /usr/local/b
 COPY . .
 ENV PYTHONPATH="/app/src"
 
-CMD ["python", "-m", "claudius.runtime.agent_entrypoint"]
+CMD ["python", "-m", "demi.runtime.agent_entrypoint"]

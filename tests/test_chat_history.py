@@ -1,7 +1,7 @@
 from datetime import datetime, timezone
 
-from claudius.memory.logs import append_log, read_logs, write_chat_history
-from claudius.orchestrator import Orchestrator
+from demi.memory.logs import append_log, read_logs, write_chat_history
+from demi.orchestrator import Orchestrator
 
 
 def test_chat_history_written(tmp_path):

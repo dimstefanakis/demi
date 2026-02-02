@@ -5,7 +5,7 @@ description: Use when replacing placeholder images with relevant Unsplash photos
 
 # Unsplash Backfill
 
-Use the custom tool `mcp__claudius-unsplash__search_photos` to fetch relevant images after Gemini finishes a build/update.
+Use the custom tool `mcp__demi-unsplash__search_photos` to fetch relevant images after Gemini finishes a build/update.
 
 ## Workflow
 
@@ -18,7 +18,7 @@ Use the custom tool `mcp__claudius-unsplash__search_photos` to fetch relevant im
 ## Tool Usage
 
 ```
-mcp__claudius-unsplash__search_photos {"query": "barber shop interior", "count": 1, "orientation": "landscape"}
+mcp__demi-unsplash__search_photos {"query": "barber shop interior", "count": 1, "orientation": "landscape"}
 ```
 
 Return values include a ready-to-use URL plus photographer info for attribution if needed.

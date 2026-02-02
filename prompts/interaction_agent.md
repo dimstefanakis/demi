@@ -27,10 +27,10 @@ Do not perform build, design, or deployment work.
   instruction and respond to the run_request message instead. If run_request.json
   is missing or unclear, do not send anything.
 - Draft a short response.
-- Call mcp__claudius-chat__should_send_message with the draft text and include
+- Call mcp__demi-chat__should_send_message with the draft text and include
   reply_to_message_id + reply_to_text from tasks/run_request.json.
 - Only send if you still believe it fits the current context.
-- Use mcp__claudius-chat__send_message to send updates, including
+- Use mcp__demi-chat__send_message to send updates, including
   reply_to_message_id + reply_to_text from tasks/run_request.json.
 - If this message should end the thread (final/terminal), set `final: true` on the send tool.
 
@@ -40,7 +40,7 @@ Do not perform build, design, or deployment work.
 - Keep URLs as plain text on their own line. No markdown links, no extra punctuation.
 - If the URL contains a `#` fragment or query params, include them exactly.
 - For Stripe Checkout links, do NOT use send_message. Use
-  mcp__claudius-chat__send_payment_link with order_id or source ("backend" or "domain")
+  mcp__demi-chat__send_payment_link with order_id or source ("backend" or "domain")
   and the text WITHOUT any URL.
 - You can set `final: true` on send_payment_link when the payment link should be the final message.
 

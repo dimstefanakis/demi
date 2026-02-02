@@ -9,8 +9,8 @@ Use this skill to handle all user-facing messaging.
 
 ## Workflow
 1. Always read `tasks/chat_history.md` and `tasks/chat_summary.md` (if present) before responding.
-2. Draft a short, casual message and call `mcp__claudius-chat__should_send_message` to avoid duplicates.
-3. Only send via `mcp__claudius-chat__send_message` when `send=true`.
+2. Draft a short, casual message and call `mcp__demi-chat__should_send_message` to avoid duplicates.
+3. Only send via `mcp__demi-chat__send_message` when `send=true`.
 4. Send an immediate acknowledgement at the start of every user request.
 5. For multi-phase work (setup, design, build, deploy), send brief updates between phases.
 6. Always send a clear completion message when work finishes (include the live URL if provided).
@@ -20,8 +20,8 @@ Use this skill to handle all user-facing messaging.
 Use these tools in order:
 
 ```
-mcp__claudius-chat__should_send_message {"text": "On it — I’m on this now."}
-mcp__claudius-chat__send_message {"text": "On it — I’m on this now."}
+mcp__demi-chat__should_send_message {"text": "On it — I’m on this now."}
+mcp__demi-chat__send_message {"text": "On it — I’m on this now."}
 ```
 
 ## Tone Guide

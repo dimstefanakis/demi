@@ -2,7 +2,7 @@ import asyncio
 
 import pytest
 
-from claudius.domains.github_app import GitHubAppConfig, GitHubRepo, GitHubRepoManager
+from demi.domains.github_app import GitHubAppConfig, GitHubRepo, GitHubRepoManager
 
 
 def _config(*, auto_create_repo: bool = True) -> GitHubAppConfig:
