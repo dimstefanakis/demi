@@ -3,7 +3,9 @@ import json
 
 import pytest
 
+import claudius.orchestrator as orchestrator_module
 from claudius.db.core import Database
+from claudius.domains.github_app import GitHubAppConfig
 from claudius.models import NormalizedMessage
 from claudius.orchestrator import Orchestrator
 from claudius.workspace.core import WorkspaceManager
@@ -27,7 +29,7 @@ class FakeAgent:
         session_id=None,
         runtime_env=None,
     ):
-        self.calls.append((workspace.root, task_path, session_id))
+        self.calls.append((workspace.root, task_path, session_id, runtime_env))
         if db is not None and tenant_id is not None:
             db.update_tenant_deploy_url(tenant_id, self.deploy_url)
         if messenger is not None:
@@ -75,6 +77,112 @@ async def test_orchestrator_new_site_flow(tmp_path):
     tenant = db.get_or_create_tenant("telegram", "987654")
     assert tenant.last_deploy_url == "https://example.com/site"
     assert "https://example.com/site" in orchestrator.messenger.sent[0][1]
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_passes_github_runtime_env(tmp_path, monkeypatch):
+    db = Database(tmp_path / "claudius.sqlite")
+    db.init()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+    runtime_env_payload = {
+        "GITHUB_TOKEN": "ghs_short_lived",
+        "GITHUB_REPO_FULL_NAME": "acme/test-repo",
+        "GITHUB_REPO_NAME": "test-repo",
+    }
+
+    async def _fake_runtime_env(_settings, _workspace, _tenant):
+        return runtime_env_payload
+
+    monkeypatch.setattr(orchestrator, "_github_runtime_env", _fake_runtime_env)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="52",
+        tenant_external_id="987655",
+        received_at=datetime.now(tz=timezone.utc),
+        text="Create a marketing site",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    assert agent.calls
+    runtime_env = agent.calls[-1][3]
+    assert runtime_env == runtime_env_payload
+    assert "GITHUB_APP_PRIVATE_KEY" not in runtime_env
+
+
+@pytest.mark.asyncio
+async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypatch):
+    db = Database(tmp_path / "claudius.sqlite")
+    db.init()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = db.get_or_create_tenant("telegram", "1000")
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+
+    config = GitHubAppConfig(
+        org="acme",
+        app_id="123",
+        installation_id="456",
+        private_key="very-secret-private-key",
+    )
+
+    class FakeManager:
+        def __init__(self, _config):
+            self.config = _config
+
+        async def ensure_repo(self, project_root, repo_name=None):
+            return type(
+                "Repo",
+                (),
+                {
+                    "full_name": "acme/claudius-1000-main",
+                    "name": "claudius-1000-main",
+                    "clone_url": "https://github.com/acme/claudius-1000-main.git",
+                    "ssh_url": "git@github.com:acme/claudius-1000-main.git",
+                    "default_branch": "main",
+                },
+            )()
+
+        async def create_repo_token(self, repo):
+            return "ghs_short_lived_token"
+
+    monkeypatch.setattr(
+        orchestrator_module.GitHubAppConfig,
+        "from_settings",
+        staticmethod(lambda _settings: config),
+    )
+    monkeypatch.setattr(orchestrator_module, "GitHubRepoManager", FakeManager)
+
+    runtime_env = await orchestrator._github_runtime_env(
+        orchestrator_module.Settings(),
+        workspace,
+        tenant,
+    )
+
+    assert runtime_env is not None
+    assert runtime_env["GITHUB_TOKEN"] == "ghs_short_lived_token"
+    assert runtime_env["GITHUB_REPO_FULL_NAME"] == "acme/claudius-1000-main"
+    assert "GITHUB_APP_PRIVATE_KEY" not in runtime_env
+    assert "GITHUB_APP_ID" not in runtime_env
+    assert "GITHUB_APP_INSTALLATION_ID" not in runtime_env
 
 
 @pytest.mark.asyncio

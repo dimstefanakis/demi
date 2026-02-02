@@ -29,6 +29,11 @@ from claudius.agent.supabase_tools import (
     SupabaseToolContext,
     build_supabase_server,
 )
+from claudius.agent.github_tools import (
+    GITHUB_SERVER_NAME,
+    GitHubToolContext,
+    build_github_server,
+)
 from claudius.agent.tool_logging import log_agent_event
 from claudius.config import Settings
 from claudius.agent.inflight import InflightTextStream
@@ -66,6 +71,13 @@ class AgentResult:
     usage: dict[str, Any] | None = None
 
 
+def _sdk_message_log_data(msg: Any) -> dict[str, Any]:
+    return {
+        "class": msg.__class__.__name__,
+        "subtype": getattr(msg, "subtype", None),
+    }
+
+
 class ClaudeAgent:
     supports_inflight_stream = True
     SUPABASE_MCP_SERVER_NAME = "supabase"
@@ -93,6 +105,7 @@ class ClaudeAgent:
         f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
         f"mcp__{CHAT_SERVER_NAME}__record_billing_status",
         f"mcp__{CHAT_SERVER_NAME}__request_backend_subscription",
+        f"mcp__{GITHUB_SERVER_NAME}__prepare_repo",
         f"mcp__{SUPABASE_SERVER_NAME}__provision_managed_backend",
         f"mcp__{SUPABASE_SERVER_NAME}__upgrade_managed_backend",
         f"mcp__{SUPABASE_MCP_SERVER_NAME}__*",
@@ -154,10 +167,17 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
             )
         )
+        github_server = build_github_server(
+            GitHubToolContext(
+                tasks_dir=workspace.tasks_dir,
+                runtime_env=runtime_env,
+            )
+        )
         mcp_servers = {
             CHAT_SERVER_NAME: chat_server,
             UNSPLASH_SERVER_NAME: unsplash_server,
             SUPABASE_SERVER_NAME: supabase_server,
+            GITHUB_SERVER_NAME: github_server,
         }
         supabase_mcp = self._build_supabase_mcp_config(workspace, settings)
         if supabase_mcp:
@@ -222,11 +242,7 @@ class ClaudeAgent:
                     log_agent_event(
                         workspace.tasks_dir,
                         "sdk_message",
-                        {
-                            "class": msg.__class__.__name__,
-                            "subtype": getattr(msg, "subtype", None),
-                            "repr": repr(msg)[:1000],
-                        },
+                        _sdk_message_log_data(msg),
                     )
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)

@@ -1,4 +1,6 @@
-from claudius.agent.claude import ClaudeAgent
+import json
+
+from claudius.agent.claude import ClaudeAgent, _sdk_message_log_data
 
 
 def test_default_allowed_tools():
@@ -26,3 +28,18 @@ def test_default_subagents_configured():
     assert "interaction-agent" in agent.agents
     tools = agent.agents["interaction-agent"].tools or []
     assert "mcp__claudius-chat__send_payment_link" in tools
+
+
+def test_sdk_message_log_data_does_not_include_repr():
+    class FakeSdkMessage:
+        subtype = "tool_result"
+
+        def __repr__(self) -> str:
+            return "ToolResult(token='ghs_secret_token')"
+
+    payload = _sdk_message_log_data(FakeSdkMessage())
+
+    assert payload["class"] == "FakeSdkMessage"
+    assert payload["subtype"] == "tool_result"
+    assert "repr" not in payload
+    assert "ghs_secret_token" not in json.dumps(payload)

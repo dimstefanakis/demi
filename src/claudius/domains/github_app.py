@@ -243,22 +243,10 @@ class GitHubRepoManager:
         except OSError:
             pass
 
-    def build_repo_name(self, tenant_id: int, project_name: str) -> str:
-        prefix = _slug(self.config.repo_prefix) or "claudius"
-        project_slug = _slug(project_name) or "project"
-        base_prefix = f"{prefix}-{tenant_id}-"
-        max_project_len = MAX_REPO_NAME_LENGTH - len(base_prefix)
-        if max_project_len <= 0:
-            return f"{prefix}-{tenant_id}"
-        if len(project_slug) > max_project_len:
-            project_slug = project_slug[:max_project_len].rstrip("-_")
-        return f"{prefix}-{tenant_id}-{project_slug}" if project_slug else f"{prefix}-{tenant_id}"
-
     async def ensure_repo(
         self,
         project_root: Path,
-        tenant_id: int,
-        project_name: str,
+        repo_name: str | None = None,
     ) -> GitHubRepo:
         existing = self.load_repo(project_root)
         if existing:
@@ -266,14 +254,30 @@ class GitHubRepoManager:
             if remote:
                 self.write_repo(project_root, remote)
                 return remote
-
-        repo_name = self.build_repo_name(tenant_id, project_name)
-        full_name = f"{self.config.org}/{repo_name}"
-        repo = await self.client.get_repo(full_name)
-        if repo is None:
+            # The local metadata is stale if the remote repo no longer exists.
+            # Drop it so we can recover by creating a new repo.
+            try:
+                self.repo_file_path(project_root).unlink(missing_ok=True)
+            except OSError:
+                pass
+            existing = None
+        repo_name = _slug(repo_name or "")
+        if not repo_name:
             if not self.config.auto_create_repo:
                 raise RuntimeError("github_repo_missing")
-            repo = await self.client.create_repo(repo_name, private=self.config.repo_is_private())
+            raise RuntimeError("github_repo_name_required")
+        if len(repo_name) > MAX_REPO_NAME_LENGTH:
+            repo_name = repo_name[:MAX_REPO_NAME_LENGTH].rstrip("-_")
+        full_name = f"{self.config.org}/{repo_name}"
+        remote = await self.client.get_repo(full_name)
+        if remote:
+            if existing and existing.full_name == full_name:
+                self.write_repo(project_root, remote)
+                return remote
+            raise RuntimeError("github_repo_name_conflict")
+        if not self.config.auto_create_repo:
+            raise RuntimeError("github_repo_missing")
+        repo = await self.client.create_repo(repo_name, private=self.config.repo_is_private())
         self.write_repo(project_root, repo)
         return repo
 

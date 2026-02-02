@@ -5,6 +5,7 @@ import asyncio
 from dataclasses import asdict
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
 
 from claudius.agent.claude import ClaudeAgent
@@ -13,6 +14,19 @@ from claudius.messaging.file import FileMessenger
 from claudius.messaging.telegram import TelegramClient, TelegramConfig
 from claudius.models import Attachment, NormalizedMessage
 from claudius.workspace.core import WorkspaceManager
+
+
+_GITHUB_RUNTIME_ENV_KEYS = (
+    "GITHUB_TOKEN",
+    "GITHUB_REPO_FULL_NAME",
+    "GITHUB_REPO_NAME",
+    "GITHUB_REPO_OWNER",
+    "GITHUB_REPO_URL",
+    "GITHUB_REPO_HTTP_URL",
+    "GITHUB_REPO_HTML_URL",
+    "GITHUB_REPO_SSH_URL",
+    "GITHUB_REPO_DEFAULT_BRANCH",
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -49,6 +63,15 @@ def _load_message(payload: dict) -> NormalizedMessage:
     )
 
 
+def _load_runtime_env_from_process() -> dict[str, str] | None:
+    runtime_env: dict[str, str] = {}
+    for key in _GITHUB_RUNTIME_ENV_KEYS:
+        value = str(os.getenv(key) or "").strip()
+        if value:
+            runtime_env[key] = value
+    return runtime_env or None
+
+
 async def _run(request_path: Path) -> int:
     payload = json.loads(request_path.read_text())
     workspace_root = Path(payload.get("workspace_root") or "/workspace")
@@ -67,6 +90,7 @@ async def _run(request_path: Path) -> int:
         messenger = FileMessenger(tasks_dir=workspace.tasks_dir)
 
     agent = ClaudeAgent()
+    runtime_env = _load_runtime_env_from_process()
     result = await agent.prepare_context(
         workspace=workspace,
         task_path=task_path,
@@ -77,6 +101,7 @@ async def _run(request_path: Path) -> int:
         db=None,
         payments=None,
         session_id=session_id,
+        runtime_env=runtime_env,
     )
 
     result_path = workspace.tasks_dir / "run_result.json"

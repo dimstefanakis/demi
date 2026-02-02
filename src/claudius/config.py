@@ -38,7 +38,7 @@ class Settings(BaseSettings):
     github_app_client_id: str | None = None
     github_app_installation_id: str | None = None
     github_app_private_key: str | None = None
-    github_repo_prefix: str = "claudius"
+    github_repo_prefix: str = ""
     github_repo_visibility: str = "private"
     github_api_base_url: str = "https://api.github.com"
 

@@ -268,7 +268,7 @@ class Orchestrator:
                 poll_interval=settings.run_activity_poll_interval,
             )
             monitor_task = asyncio.create_task(monitor.run())
-            github_env = await self._prepare_github_env(workspace, tenant)
+            runtime_env = await self._github_runtime_env(settings, workspace, tenant)
             agent_result = await self.agent.prepare_context(
                 workspace=workspace,
                 task_path=task_path,
@@ -279,7 +279,7 @@ class Orchestrator:
                 db=self.db,
                 payments=self.payments,
                 session_id=tenant.session_id,
-                runtime_env=github_env,
+                runtime_env=runtime_env,
             )
             if agent_result.session_id:
                 self.db.update_tenant_session(tenant.id, agent_result.session_id)
@@ -1028,45 +1028,6 @@ class Orchestrator:
             tenant.workspace_path = str(workspace.tenant_root)
         return workspace
 
-    async def _prepare_github_env(
-        self,
-        workspace: Workspace,
-        tenant: Any,
-    ) -> dict[str, str]:
-        settings = Settings()
-        config = GitHubAppConfig.from_settings(settings)
-        if not config or not config.enabled:
-            return {}
-        manager = GitHubRepoManager(config)
-        try:
-            repo = await manager.ensure_repo(
-                project_root=workspace.root,
-                tenant_id=int(tenant.id),
-                project_name=workspace.project_name,
-            )
-            token = await manager.create_repo_token(repo)
-        except Exception as exc:  # noqa: BLE001
-            append_log(
-                workspace.tasks_dir,
-                "system",
-                f"github_setup_failed: {type(exc).__name__}: {exc}",
-            )
-            return {}
-        env: dict[str, str] = {
-            "GITHUB_TOKEN": token,
-            "GITHUB_REPO_FULL_NAME": repo.full_name,
-            "GITHUB_REPO_NAME": repo.name,
-            "GITHUB_REPO_OWNER": config.org,
-        }
-        if repo.clone_url:
-            env["GITHUB_REPO_HTTP_URL"] = repo.clone_url
-            env["GITHUB_REPO_URL"] = repo.clone_url
-        if repo.ssh_url:
-            env["GITHUB_REPO_SSH_URL"] = repo.ssh_url
-        if repo.default_branch:
-            env["GITHUB_REPO_DEFAULT_BRANCH"] = repo.default_branch
-        return env
-
     async def _allocate_workspace(self, tenant) -> Path:
         allocator = self.workspace_allocator
         if allocator is None:
@@ -1204,6 +1165,61 @@ class Orchestrator:
 
     def _supports_inflight_stream(self) -> bool:
         return bool(getattr(self.agent, "supports_inflight_stream", False))
+
+    async def _github_runtime_env(
+        self,
+        settings: Settings,
+        workspace: Workspace,
+        tenant: Any,
+    ) -> dict[str, str] | None:
+        config = GitHubAppConfig.from_settings(settings)
+        if not config or not config.enabled:
+            return None
+        manager = GitHubRepoManager(config)
+        repo_name = self._default_repo_name(
+            prefix=config.repo_prefix,
+            tenant_id=getattr(tenant, "id", None),
+            project_name=workspace.project_name,
+        )
+        try:
+            repo = await manager.ensure_repo(
+                project_root=workspace.root,
+                repo_name=repo_name,
+            )
+            token = await manager.create_repo_token(repo)
+        except Exception as exc:  # noqa: BLE001
+            append_log(
+                workspace.tasks_dir,
+                "system",
+                f"github_setup_failed: {type(exc).__name__}: {exc}",
+            )
+            return None
+        env: dict[str, str] = {
+            "GITHUB_TOKEN": token,
+            "GITHUB_REPO_FULL_NAME": repo.full_name,
+            "GITHUB_REPO_NAME": repo.name,
+            "GITHUB_REPO_OWNER": config.org,
+        }
+        if repo.clone_url:
+            env["GITHUB_REPO_HTTP_URL"] = repo.clone_url
+            env["GITHUB_REPO_URL"] = repo.clone_url
+        if repo.ssh_url:
+            env["GITHUB_REPO_SSH_URL"] = repo.ssh_url
+        if repo.default_branch:
+            env["GITHUB_REPO_DEFAULT_BRANCH"] = repo.default_branch
+        return env
+
+    @staticmethod
+    def _default_repo_name(
+        *,
+        prefix: str | None,
+        tenant_id: Any,
+        project_name: str | None,
+    ) -> str:
+        base_prefix = (prefix or "claudius").strip() or "claudius"
+        tenant_part = str(tenant_id or "tenant")
+        project_part = (project_name or "main").strip() or "main"
+        return f"{base_prefix}-{tenant_part}-{project_part}"
 
     def _ingest_tool_failures(self, tasks_dir: Path) -> None:
         path = tasks_dir / "tool_runs.jsonl"

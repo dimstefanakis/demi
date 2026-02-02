@@ -101,14 +101,16 @@ Example (high-level)
 
 - Each project has a dedicated GitHub repo in the org. Repo metadata lives at `github_repo.json`
   in the project root (non-secret).
-- A short-lived installation token is provided at runtime via `GITHUB_TOKEN`.
-  Repo hints are available in: `GITHUB_REPO_FULL_NAME`, `GITHUB_REPO_HTTP_URL`,
-  `GITHUB_REPO_SSH_URL`, and `GITHUB_REPO_DEFAULT_BRANCH` when configured.
+- Use `mcp__claudius-github__prepare_repo` to create/locate the repo and get a short-lived token
+  + repo URLs before pushing.
+- When creating a repo, invent a short, human-readable name (not "main"). If a name is taken,
+  invent another and retry until it succeeds.
+- Avoid tenant-specific prefixes or IDs in repo names.
 - When you modify files in the workspace, always commit and push the changes.
 - Initialize git if needed. Use clear, short commit messages describing the change.
-- Never write tokens to disk, logs, or chat messages. Keep secrets only in env vars.
+- Never write tokens to disk, logs, or chat messages. Keep secrets only in-memory.
 - If you push, prefer HTTPS remote without embedded credentials and pass the token via headers:
-  `git -c http.extraheader="Authorization: Bearer $GITHUB_TOKEN" push`.
+  `git -c http.extraheader="Authorization: Bearer <token>" push`.
 - If the request needs auth, complex data models, or multi-user access, use the managed backend flow below (do not mention vendor names).
   - When wiring a site to events, ensure the tenant's Vercel project has `EVENT_URL` set.
 
@@ -305,9 +307,14 @@ ALWAYS RE-READ CHAT HISTORY + SUMMARY BEFORE SENDING ANY FINAL MESSAGE.
 
 ### Questions
 
-- If you need more details from the user, ask the interaction-agent to send a single clear question.
+- If you need more details from the user, ask the interaction-agent to send a compact set of
+  direct questions in one message.
 - No greetings, no internal notes, no technical jargon.
-- Ask only for missing info; do not ask generic questions that repeat what the user just told you.
+- Ask only for missing, high-impact info; do not ask generic questions that repeat what the user
+  just told you.
+- If the request is ambiguous, err slightly toward asking rather than guessing.
+- Prefer questions that reduce back-and-forth (give options when helpful).
+- If safe defaults are reasonable, state the assumption briefly and proceed instead of asking.
 - If the user asks for status or reassurance, have the interaction-agent answer immediately
   and keep it short (no technical detail unless asked).
 
