@@ -41,7 +41,7 @@ done
 
 echo "Pruning unused Docker resources..."
 docker container prune -f || true
-docker image prune -af || true
+docker image prune -f || true
 docker builder prune -af || true
 
 echo "Deploy complete."
