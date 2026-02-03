@@ -4,5 +4,6 @@ __pycache__/
 node_modules/
 *.sqlite
 .env
+.env.production
 .DS_Store
 data/
