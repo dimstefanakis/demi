@@ -288,7 +288,7 @@ Flow:
    reuses it when running containerized agents).
 8. If a run is in flight for the same project, the message is queued in `run_inputs` and a short acknowledgment is sent via the interaction agent.
 9. Otherwise a new run is created and leased.
-10. The agent runtime executes, reads `memory.md`, `DESCRIPTION.md`, `tasks/latest.md`, `DESIGN.md`, uses Gemini CLI and Vercel CLI as needed, and sends user-facing messages through MCP tools.
+10. The agent runtime executes. The primary agent first triggers the interaction agent to send a short acknowledgment of the latest user message before any tool calls. It then reads `memory.md`, `DESCRIPTION.md`, `tasks/latest.md`, `DESIGN.md`, uses Gemini CLI and Vercel CLI as needed, and sends user-facing messages through MCP tools.
    - If billing requires payment, primary-agent send requests are queued in `tasks/interaction_request.json`
      and delivered via the interaction agent after the run.
    - The agent can create an assistant subscription order by calling `request_assistant_subscription`
