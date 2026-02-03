@@ -723,15 +723,14 @@ class Orchestrator:
         )
         if sent:
             return
-        text = "Got it — I’ll handle this after I finish the current task."
-        correlation_id = f"busy_ack:{tenant.id}:{msg.provider_message_id}"
-        self._enqueue_outbox_message(
-            tenant=tenant,
-            text=text,
-            correlation_id=correlation_id,
-            run_id=None,
-            project_name=workspace.project_name,
-        )
+        try:
+            append_log(
+                workspace.tasks_dir,
+                "system",
+                "busy_ack_failed: interaction_agent_unavailable",
+            )
+        except Exception:
+            pass
 
     async def _send_interaction_instruction(
         self,
