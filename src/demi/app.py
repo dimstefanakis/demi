@@ -247,6 +247,7 @@ def create_app() -> FastAPI:
             return {"status": "unknown", "payment_required": False, "message": "tenant_not_found"}
         purpose = payload.get("purpose")
         purpose_label = payload.get("purpose_label")
+        create_if_missing = bool(payload.get("create_if_missing", False))
         return await _build_assistant_billing_status(
             db=db,
             tenant=tenant,
@@ -254,6 +255,7 @@ def create_app() -> FastAPI:
             stripe_client=stripe_client,
             purpose=purpose,
             purpose_label=purpose_label,
+            create_if_missing=create_if_missing,
         )
 
     @app.get("/health")
@@ -750,15 +752,16 @@ def _row_value(row: Any, key: str) -> Any | None:
         return None
 
 
-async def _build_assistant_billing_status(
-    *,
-    db: Database,
-    tenant: Any,
-    settings: Settings,
-    stripe_client: StripeClient | None,
-    purpose: str | None = None,
-    purpose_label: str | None = None,
-) -> dict[str, Any]:
+    async def _build_assistant_billing_status(
+        *,
+        db: Database,
+        tenant: Any,
+        settings: Settings,
+        stripe_client: StripeClient | None,
+        purpose: str | None = None,
+        purpose_label: str | None = None,
+        create_if_missing: bool = False,
+    ) -> dict[str, Any]:
     allow_first_build = _assistant_allow_first_build(tenant)
     normalized_purpose = _normalize_billing_purpose(purpose or purpose_label)
     order_type = _assistant_order_type_for_purpose(normalized_purpose)
@@ -835,6 +838,19 @@ async def _build_assistant_billing_status(
                 "price_usd": price_usd,
                 "currency": currency,
             }
+
+    if not create_if_missing:
+        return {
+            "status": "ready",
+            "payment_required": False,
+            "allow_first_build": allow_first_build,
+            "plan": _assistant_plan_name(settings),
+            "message": "billing_deferred",
+            "purpose": normalized_purpose,
+            "purpose_label": cached_label,
+            "price_usd": default_price,
+            "currency": default_currency,
+        }
 
     if stripe_client is None:
         return {

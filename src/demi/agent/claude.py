@@ -105,6 +105,7 @@ class ClaudeAgent:
         f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
         f"mcp__{CHAT_SERVER_NAME}__record_billing_status",
         f"mcp__{CHAT_SERVER_NAME}__request_backend_subscription",
+        f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
         f"mcp__{GITHUB_SERVER_NAME}__prepare_repo",
         f"mcp__{SUPABASE_SERVER_NAME}__provision_managed_backend",
         f"mcp__{SUPABASE_SERVER_NAME}__upgrade_managed_backend",

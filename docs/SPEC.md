@@ -282,14 +282,19 @@ Flow:
 3. The orchestrator records the message (idempotent by `provider_message_id`).
 4. Project selection is resolved (explicit directive or inferred from context).
 5. If configured, the orchestrator calls the billing status endpoint and writes `tasks/billing_status.json`.
+   Billing status no longer creates assistant orders by default; the agent explicitly requests payment links.
 6. A task brief is written to `tasks/` and logs are updated.
-7. If a run is in flight for the same project, the message is queued in `run_inputs` and a short acknowledgment is sent via the interaction agent.
-8. Otherwise a new run is created and leased.
-9. The agent runtime executes, reads `memory.md`, `DESCRIPTION.md`, `tasks/latest.md`, `DESIGN.md`, uses Gemini CLI and Vercel CLI as needed, and sends user-facing messages through MCP tools.
+7. The orchestrator writes `tasks/run_request.json` for interaction-agent reply matching (and the Docker runtime
+   reuses it when running containerized agents).
+8. If a run is in flight for the same project, the message is queued in `run_inputs` and a short acknowledgment is sent via the interaction agent.
+9. Otherwise a new run is created and leased.
+10. The agent runtime executes, reads `memory.md`, `DESCRIPTION.md`, `tasks/latest.md`, `DESIGN.md`, uses Gemini CLI and Vercel CLI as needed, and sends user-facing messages through MCP tools.
    - If billing requires payment, primary-agent send requests are queued in `tasks/interaction_request.json`
      and delivered via the interaction agent after the run.
-10. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
-11. Any queued `run_inputs` are drained into the next run.
+   - The agent can create an assistant subscription order by calling `request_assistant_subscription`
+     after delivering value, then sends the payment link via the interaction agent.
+11. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
+12. Any queued `run_inputs` are drained into the next run.
 
 ---
 
@@ -316,7 +321,7 @@ Background workers poll the main DB and run in the API process or the worker con
 
 MCP servers are registered per agent run.
 
-- `demi-chat`: `send_message`, `should_send_message`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `decide_project`
+- `demi-chat`: `send_message`, `should_send_message`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
 - `demi-unsplash`: `search_photos` (Unsplash sourcing)
 - `demi-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
 - `demi-github`: `prepare_repo` (GitHub App provisioning)
