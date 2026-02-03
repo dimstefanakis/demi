@@ -39,4 +39,9 @@ done
 # Optional: stop old api container to save resources
 # docker compose stop "api_${current_color}"
 
+echo "Pruning unused Docker resources..."
+docker container prune -f || true
+docker image prune -af || true
+docker builder prune -af || true
+
 echo "Deploy complete."
