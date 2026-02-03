@@ -752,16 +752,16 @@ def _row_value(row: Any, key: str) -> Any | None:
         return None
 
 
-    async def _build_assistant_billing_status(
-        *,
-        db: Database,
-        tenant: Any,
-        settings: Settings,
-        stripe_client: StripeClient | None,
-        purpose: str | None = None,
-        purpose_label: str | None = None,
-        create_if_missing: bool = False,
-    ) -> dict[str, Any]:
+async def _build_assistant_billing_status(
+    *,
+    db: Database,
+    tenant: Any,
+    settings: Settings,
+    stripe_client: StripeClient | None,
+    purpose: str | None = None,
+    purpose_label: str | None = None,
+    create_if_missing: bool = False,
+) -> dict[str, Any]:
     allow_first_build = _assistant_allow_first_build(tenant)
     normalized_purpose = _normalize_billing_purpose(purpose or purpose_label)
     order_type = _assistant_order_type_for_purpose(normalized_purpose)
