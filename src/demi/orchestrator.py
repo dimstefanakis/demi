@@ -253,6 +253,12 @@ class Orchestrator:
 
         task_content = self._build_task_content(msg, asset_paths, billing_status)
         task_path = workspace.write_task(task_content)
+        self._write_run_request(
+            workspace=workspace,
+            task_path=task_path,
+            msg=msg,
+            session_id=getattr(tenant, "session_id", None),
+        )
 
         self._clear_run_artifacts(workspace.tasks_dir)
         self._maybe_prepare_compaction(workspace.tasks_dir)
@@ -460,6 +466,40 @@ class Orchestrator:
                 lines.append(f"Message: {message}")
             lines.append("Full payload: tasks/billing_status.json")
         return "\n".join(lines) + "\n"
+
+    @staticmethod
+    def _write_run_request(
+        *,
+        workspace: Workspace,
+        task_path: Path,
+        msg: NormalizedMessage,
+        session_id: str | None,
+    ) -> None:
+        payload = {
+            "workspace_root": str(workspace.root),
+            "task_path": str(task_path),
+            "session_id": session_id,
+            "message": {
+                "provider": msg.provider,
+                "provider_message_id": msg.provider_message_id,
+                "tenant_external_id": msg.tenant_external_id,
+                "received_at": msg.received_at.isoformat(),
+                "text": msg.text,
+                "images": [
+                    {
+                        "provider_file_id": image.provider_file_id,
+                        "width": image.width,
+                        "height": image.height,
+                    }
+                    for image in msg.images
+                ],
+            },
+        }
+        path = workspace.tasks_dir / "run_request.json"
+        try:
+            path.write_text(json.dumps(payload, indent=2))
+        except OSError:
+            return
 
     def _resolve_project_from_message(
         self, msg: NormalizedMessage

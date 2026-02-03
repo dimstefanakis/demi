@@ -48,6 +48,18 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             return None
         return StripeClient(config)
 
+    def _normalize_assistant_purpose(value: Any | None) -> str | None:
+        raw = str(value or "").strip().lower()
+        if not raw:
+            return None
+        slug = re.sub(r"[^a-z0-9_-]+", "-", raw).strip("-_")
+        return slug[:60] if slug else None
+
+    def _assistant_order_type(purpose: str | None) -> str:
+        if purpose:
+            return f"assistant_subscription:{purpose}"
+        return "assistant_subscription"
+
     def _log(
         tool_name: str,
         args: dict[str, Any],
@@ -877,6 +889,188 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "is_error": False,
         }
 
+    @tool(
+        "request_assistant_subscription",
+        "Create a recurring payment link for the assistant subscription. Does not send messages.",
+        {
+            "type": "object",
+            "properties": {
+                "purpose": {"type": "string"},
+                "purpose_label": {"type": "string"},
+            },
+        },
+    )
+    async def request_assistant_subscription(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None or context.tenant_id is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("request_assistant_subscription", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+
+        settings = Settings()
+        price_id = str(settings.assistant_stripe_price_id or "").strip()
+        price_usd = settings.assistant_price_usd
+        currency = (settings.assistant_currency or "USD").upper()
+        product_name = (settings.assistant_product_name or "Hire me").strip() or "Hire me"
+
+        if not price_id and price_usd is None:
+            payload = {
+                "ok": True,
+                "status": "pricing_missing",
+                "message": "Assistant pricing is not configured.",
+            }
+            _log("request_assistant_subscription", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
+
+        payments = _resolve_payments()
+        if payments is None:
+            payload = {
+                "ok": True,
+                "status": "payments_unavailable",
+                "price_usd": price_usd,
+                "currency": currency,
+                "message": "Payments are not configured yet.",
+            }
+            _log("request_assistant_subscription", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
+
+        purpose_label = str(args.get("purpose_label") or "").strip()[:160] or None
+        normalized_purpose = _normalize_assistant_purpose(
+            args.get("purpose") or purpose_label
+        )
+        order_type = _assistant_order_type(normalized_purpose)
+
+        existing = context.db.get_latest_billing_order(context.tenant_id, order_type)
+        if existing is not None:
+            if hasattr(existing, "get"):
+                status_raw = existing.get("status")
+                payment_url_raw = existing.get("stripe_payment_url")
+                price_usd_raw = existing.get("price_usd")
+                currency_raw = existing.get("currency")
+                order_id_raw = existing.get("id")
+            else:
+                status_raw = existing["status"]
+                payment_url_raw = existing["stripe_payment_url"]
+                price_usd_raw = existing["price_usd"]
+                currency_raw = existing["currency"]
+                order_id_raw = existing["id"]
+            status = str(status_raw or "").strip().lower()
+            payment_url = str(payment_url_raw or "").strip()
+            if status in {"pending_payment", "quoted"} and payment_url:
+                payload = {
+                    "ok": True,
+                    "status": "payment_ready",
+                    "order_id": int(order_id_raw),
+                    "price_usd": price_usd_raw,
+                    "currency": currency_raw,
+                    "payment_url": payment_url,
+                }
+                _persist_quote(context.tasks_dir, "assistant_quote", payload)
+                _log("request_assistant_subscription", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": False,
+                }
+
+        order_id = context.db.create_billing_order(
+            tenant_id=context.tenant_id,
+            order_type=order_type,
+            status="quoted",
+            price_usd=price_usd,
+            currency=currency,
+            metadata={
+                "plan": "assistant_monthly",
+                "price_id": price_id or None,
+                "product_name": product_name,
+                "purpose": normalized_purpose,
+                "purpose_label": purpose_label,
+            },
+        )
+
+        metadata = {
+            "billing_order_id": str(order_id),
+            "order_type": order_type,
+            "plan": "assistant_monthly",
+            "price_usd": f"{price_usd:.2f}" if price_usd is not None else "",
+            "currency": currency,
+            "purpose": normalized_purpose or "",
+            "purpose_label": purpose_label or "",
+            "product_name": product_name,
+        }
+        if context.tenant_id is not None:
+            metadata["tenant_id"] = str(context.tenant_id)
+        if context.tenant_key:
+            metadata["tenant_key"] = context.tenant_key
+        if context.provider:
+            metadata["provider"] = context.provider
+        if context.tenant_external_id:
+            metadata["tenant_external_id"] = context.tenant_external_id
+
+        try:
+            if price_id:
+                session = await payments.create_subscription_checkout_session_for_price(
+                    price_id=price_id,
+                    metadata=metadata,
+                )
+            else:
+                amount_cents = int(round(float(price_usd or 0) * 100))
+                session = await payments.create_recurring_checkout_session(
+                    amount_cents=amount_cents,
+                    currency=currency.lower(),
+                    product_name=product_name,
+                    interval="month",
+                    metadata=metadata,
+                )
+        except Exception as exc:  # noqa: BLE001
+            context.db.mark_billing_order_failed(order_id, f"stripe_error: {exc}")
+            payload = {
+                "ok": False,
+                "status": "stripe_error",
+                "order_id": order_id,
+                "message": "I couldn't create the payment link right now. Try again later.",
+            }
+            _log(
+                "request_assistant_subscription",
+                args,
+                result=payload,
+                error=str(exc),
+                start=start,
+            )
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+
+        context.db.update_billing_order_payment(
+            order_id,
+            stripe_session_id=session.session_id,
+            stripe_payment_url=session.url,
+        )
+
+        payload = {
+            "ok": True,
+            "status": "payment_ready",
+            "order_id": order_id,
+            "price_usd": price_usd,
+            "currency": currency,
+            "payment_url": session.url,
+        }
+        _persist_quote(context.tasks_dir, "assistant_quote", payload)
+        _log("request_assistant_subscription", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
     return [
         should_send_message,
         decide_project,
@@ -886,6 +1080,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         record_domain_quote,
         record_billing_status,
         request_backend_subscription,
+        request_assistant_subscription,
     ]
 
 
@@ -1045,8 +1240,10 @@ def _load_payment_url(
         keys.append("backend_quote")
     elif source == "domain":
         keys.append("domain_quote")
+    elif source == "assistant":
+        keys.append("assistant_quote")
     else:
-        keys.extend(["backend_quote", "domain_quote"])
+        keys.extend(["assistant_quote", "backend_quote", "domain_quote"])
 
     try:
         db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
@@ -1071,8 +1268,16 @@ def _load_payment_url(
         candidates.append(tasks_dir / "backend_quote.json")
     elif source == "domain":
         candidates.append(tasks_dir / "domain_quote.json")
+    elif source == "assistant":
+        candidates.append(tasks_dir / "assistant_quote.json")
     else:
-        candidates.extend([tasks_dir / "backend_quote.json", tasks_dir / "domain_quote.json"])
+        candidates.extend(
+            [
+                tasks_dir / "assistant_quote.json",
+                tasks_dir / "backend_quote.json",
+                tasks_dir / "domain_quote.json",
+            ]
+        )
     for path in candidates:
         if not path.exists():
             continue

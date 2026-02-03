@@ -25,7 +25,7 @@ services:
       - EVENTS_WORKER_ENABLED=false
       - PENDING_WORKER_ENABLED=false
     volumes:
-      - ./data:/app/data
+      - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
@@ -44,7 +44,7 @@ services:
       - EVENTS_WORKER_ENABLED=false
       - PENDING_WORKER_ENABLED=false
     volumes:
-      - ./data:/app/data
+      - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped
 
@@ -64,6 +64,6 @@ services:
       - PENDING_WORKER_ENABLED=true
     command: ["python", "-m", "demi.worker_entrypoint"]
     volumes:
-      - ./data:/app/data
+      - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}
       - /var/run/docker.sock:/var/run/docker.sock
     restart: unless-stopped

@@ -125,6 +125,9 @@ Minimum required:
 - `TELEGRAM_BOT_TOKEN=...`
 - `PUBLIC_BASE_URL=https://hiredemi.com`
 - `EVENT_URL=https://hiredemi.com/events`
+ - `HOST_DATA_PATH=/opt/demi/data`
+ - `CONTAINER_DATA_PATH=/opt/demi/data`
+ - `DOCKER_POOL_ROOT=/opt/demi/data/pool`
 
 ## 5) Build + start
 ```bash
@@ -173,3 +176,5 @@ Optional:
 - `worker` runs `demi.worker_entrypoint` and handles outbox + pending runs.
 - Main DB is Supabase; tenant SQLite stays under `/opt/demi/data`.
 - Agent containers run via the Docker socket; main DB secrets are not forwarded into them.
+ - Docker pool paths are configured to use host-absolute paths in production so
+   `docker run --mount` uses a valid host bind path.
