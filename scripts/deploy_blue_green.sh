@@ -32,7 +32,7 @@ for i in {1..30}; do
     exit 1
   fi
   sleep 2
-fi
+done
 
 "${ROOT_DIR}/scripts/switch_blue_green.sh" "${target_color}"
 
