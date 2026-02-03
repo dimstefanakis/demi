@@ -1062,6 +1062,13 @@ class Database:
             ).fetchone()
         return row is not None
 
+    def get_run(self, run_id: int) -> sqlite3.Row | None:
+        conn = self.connect()
+        return conn.execute(
+            "SELECT * FROM runs WHERE id = ?",
+            (run_id,),
+        ).fetchone()
+
     def get_inflight_run(
         self, tenant_id: int, project_name: str | None = None
     ) -> sqlite3.Row | None:

@@ -60,7 +60,7 @@ class Settings(BaseSettings):
     docker_mount_path: str = "/workspace"
     docker_env_allowlist: str | None = None
     docker_forward_messages: bool = False
-    docker_command_timeout_seconds: float = 0.0
+    docker_command_timeout_seconds: float = 1800.0
     docker_pool_warm_timeout_seconds: float = 45.0
 
     anthropic_api_key: str | None = None
@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     billing_status_url: str | None = None
     billing_status_token: str | None = None
     billing_status_timeout_seconds: float = 3.0
+
+    admin_api_token: str | None = None
 
     assistant_stripe_price_id: str | None = None
     assistant_product_name: str = "Hire me"

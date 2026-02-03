@@ -76,7 +76,7 @@ class Orchestrator:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
         if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
-            await self._finalize_stale_run(tenant, inflight_run)
+            await self._finalize_stale_run(tenant, inflight_run, notify=False)
             inflight_run = None
 
         active_run = self.db.get_active_run(tenant.id, project_name)
@@ -152,7 +152,7 @@ class Orchestrator:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
         if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
-            await self._finalize_stale_run(tenant, inflight_run)
+            await self._finalize_stale_run(tenant, inflight_run, notify=False)
             inflight_run = None
 
         active_run = self.db.get_active_run(tenant.id, project_name)
@@ -218,6 +218,47 @@ class Orchestrator:
             process_queue=True,
             project_name=project_name,
         )
+
+    async def cancel_run(
+        self,
+        run_id: int,
+        *,
+        reason: str = "admin_cancelled",
+        notify: bool = True,
+    ) -> OrchestratorResult:
+        run = self.db.get_run(run_id)
+        if not run:
+            return OrchestratorResult(status="not_found", detail="run_not_found")
+        tenant = self.db.get_tenant_by_id(int(run["tenant_id"]))
+        if tenant is None:
+            return OrchestratorResult(status="not_found", detail="tenant_not_found")
+        project_name = run["project_name"] if run and "project_name" in run.keys() else None
+        self.db.finish_run(run_id, status="cancelled", error=reason)
+        message_id = run.get("message_id") if hasattr(run, "get") else run["message_id"]
+        if message_id:
+            self.db.update_message_status(int(message_id), "processed")
+        self.db.clear_active_run(tenant.id, project_name)
+        self._clear_inflight_stream(tenant.key, project_name)
+        self.db.cancel_run_inputs(tenant.id, project_name)
+        workspace = await self._resolve_workspace(tenant, project_name=project_name)
+        if hasattr(self.agent, "cancel_run"):
+            try:
+                await self.agent.cancel_run(workspace)
+            except Exception:
+                pass
+        if notify:
+            sent = await self._maybe_send_interaction_request(
+                workspace, tenant, None, run_id=run_id
+            )
+            if not sent:
+                await self._send_interaction_message(
+                    workspace,
+                    tenant,
+                    None,
+                    "I stopped the current run. Send your request again when ready.",
+                    run_id=run_id,
+                )
+        return OrchestratorResult(status="accepted", detail="run_cancelled")
 
     async def _run_message(
         self,
@@ -326,6 +367,18 @@ class Orchestrator:
                 self.db.update_run_inputs_statuses(run_input_ids, "queued")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
+            sent = await self._maybe_send_interaction_request(
+                workspace, tenant, msg, run_id=run_id
+            )
+            if not sent and msg.provider != "event":
+                await self._send_interaction_message(
+                    workspace,
+                    tenant,
+                    msg,
+                    "I hit a problem while working on that. "
+                    "Please try again in a moment.",
+                    run_id=run_id,
+                )
             self._write_request_status(workspace, tenant)
             raise
         finally:
@@ -408,13 +461,42 @@ class Orchestrator:
             return age > max_age_seconds
         return False
 
-    async def _finalize_stale_run(self, tenant, row: Any) -> None:
-        self.db.finish_run(row["id"], status="failed", error="stale_run_timeout")
+    async def _finalize_stale_run(
+        self, tenant, row: Any, *, notify: bool = True
+    ) -> None:
+        run_id = row["id"]
+        self.db.finish_run(run_id, status="failed", error="stale_run_timeout")
         message_id = row.get("message_id") if hasattr(row, "get") else row["message_id"]
         if message_id:
             self.db.update_message_status(int(message_id), "processed")
         project_name = row["project_name"] if row and "project_name" in row.keys() else None
+        self.db.clear_active_run(tenant.id, project_name)
         self._clear_inflight_stream(tenant.key, project_name)
+        self.db.cancel_run_inputs(tenant.id, project_name)
+        workspace = None
+        try:
+            workspace = await self._resolve_workspace(tenant, project_name=project_name)
+        except Exception:
+            workspace = None
+        if workspace is not None:
+            if hasattr(self.agent, "cancel_run"):
+                try:
+                    await self.agent.cancel_run(workspace)
+                except Exception:
+                    pass
+            if notify:
+                sent = await self._maybe_send_interaction_request(
+                    workspace, tenant, None, run_id=run_id
+                )
+                if not sent:
+                    await self._send_interaction_message(
+                        workspace,
+                        tenant,
+                        None,
+                        "That run took too long and was stopped. "
+                        "Please try again.",
+                        run_id=run_id,
+                    )
 
     @staticmethod
     def _build_task_content(
@@ -833,12 +915,12 @@ class Orchestrator:
         self,
         workspace: Workspace,
         tenant: Any,
-        msg: NormalizedMessage,
+        msg: NormalizedMessage | None,
         run_id: int | None = None,
-    ) -> None:
+    ) -> bool:
         path = workspace.tasks_dir / "interaction_request.json"
         if not path.exists():
-            return
+            return False
         try:
             payload = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
@@ -848,26 +930,26 @@ class Orchestrator:
         except OSError:
             pass
         if not isinstance(payload, dict):
-            return
+            return False
         kind = str(payload.get("type") or "").strip().lower()
         if kind == "send_message":
             text = str(payload.get("text") or "").strip()
             if not text:
-                return
+                return False
             final = bool(payload.get("final", False))
             instruction = (
                 "Send the message below to the user. "
                 f"Set final to {str(final).lower()}.\n\n"
                 f"MESSAGE:\n{text}"
             )
-            await self._send_interaction_instruction(
+            sent = await self._send_interaction_instruction(
                 workspace=workspace,
                 tenant=tenant,
                 msg=msg,
                 instruction=instruction,
                 run_id=run_id,
             )
-            return
+            return sent
         if kind == "send_payment_link":
             text = str(payload.get("text") or "").strip()
             order_id = payload.get("order_id")
@@ -884,14 +966,15 @@ class Orchestrator:
             if text:
                 parts.append(f"Message text:\n{text}")
             instruction = "\n".join(parts)
-            await self._send_interaction_instruction(
+            sent = await self._send_interaction_instruction(
                 workspace=workspace,
                 tenant=tenant,
                 msg=msg,
                 instruction=instruction,
                 run_id=run_id,
             )
-            return
+            return sent
+        return False
 
     def _record_interaction_usage(
         self,

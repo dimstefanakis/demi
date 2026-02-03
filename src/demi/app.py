@@ -6,7 +6,7 @@ import re
 from contextlib import suppress
 import json
 from typing import Any
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 
 from demi.agent.claude import ClaudeAgent
 from demi.config import Settings
@@ -110,6 +110,19 @@ def create_app() -> FastAPI:
         )
 
     app = FastAPI()
+
+    def _require_admin(request: Request) -> None:
+        token = settings.admin_api_token
+        if not token:
+            raise HTTPException(status_code=404, detail="not_found")
+        auth = request.headers.get("Authorization", "")
+        candidate = ""
+        if auth.lower().startswith("bearer "):
+            candidate = auth.split(" ", 1)[1].strip()
+        if not candidate:
+            candidate = request.headers.get("X-Admin-Token", "").strip()
+        if candidate != token:
+            raise HTTPException(status_code=403, detail="forbidden")
 
     @app.on_event("startup")
     async def _migrate_legacy_queue() -> None:
@@ -261,6 +274,21 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.post("/admin/runs/{run_id}/cancel")
+    async def cancel_run(run_id: int, request: Request):
+        _require_admin(request)
+        reason = "admin_cancelled"
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            provided = str(payload.get("reason") or "").strip()
+            if provided:
+                reason = provided
+        result = await orchestrator.cancel_run(run_id, reason=reason, notify=True)
+        return {"status": result.status, "detail": result.detail}
 
     @app.post("/stripe/webhook")
     async def stripe_webhook(request: Request):

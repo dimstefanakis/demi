@@ -29,7 +29,7 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
                                                       ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                         API (FastAPI)                                      │
-│  /telegram/webhook, /events, /stripe/webhook, /health                       │
+│  /telegram/webhook, /events, /stripe/webhook, /health, /admin/runs/:id/cancel│
 └───────────────────────────────┬───────────────────────────────────────────┘
                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -150,6 +150,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Supabase managed backend: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_ORG_*`
 - GitHub App: `GITHUB_ORG`, `GITHUB_APP_*`
 - Chrome DevTools MCP: `CHROME_DEVTOOLS_MCP_*`
+- Admin API: `ADMIN_API_TOKEN` (required for `/admin/runs/:id/cancel`)
 
 **Agent runtime mode**
 - `AGENT_RUNTIME=local` (default) runs Claude in-process
@@ -348,5 +349,6 @@ See `DEPLOY.md` for the full GCE blue/green process and required secrets.
 - Docker isolation for agent runs when `AGENT_RUNTIME=docker` is enabled.
 - Environment forwarding into agent containers is allowlist-based.
 - Event webhook signatures are verified when `EVENTS_SIGNING_SECRET` is set.
+- Admin run-cancel endpoint is protected by `ADMIN_API_TOKEN`.
 - Runs are lease-based with heartbeats to prevent stuck tasks.
 - Tenant workspaces are isolated by path and only mounted per run.

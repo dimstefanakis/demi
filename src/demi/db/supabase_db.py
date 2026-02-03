@@ -369,6 +369,9 @@ class SupabaseDatabase:
         data = self._execute(query.limit(1))
         return bool(data)
 
+    def get_run(self, run_id: int) -> dict[str, Any] | None:
+        return self._select_one("runs", id=run_id)
+
     def get_inflight_run(
         self, tenant_id: int, project_name: str | None = None
     ) -> dict[str, Any] | None:

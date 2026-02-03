@@ -46,12 +46,14 @@ class DockerAgent:
         env = self._build_env(runtime_env)
         slot = self.pool.pop_container_for_workspace(tenant_root)
         if slot:
-            await self.pool.exec_in_container(
-                slot,
-                self._entrypoint_command(tenant_root, request_path),
-                env=env,
-            )
-            await self.pool.retire_container(slot)
+            try:
+                await self.pool.exec_in_container(
+                    slot,
+                    self._entrypoint_command(tenant_root, request_path),
+                    env=env,
+                )
+            finally:
+                await self.pool.retire_container(slot)
         else:
             await self.pool.run_in_fresh_container(
                 tenant_root,
@@ -77,6 +79,10 @@ class DockerAgent:
             total_cost_usd=result.get("total_cost_usd"),
             usage=result.get("usage"),
         )
+
+    async def cancel_run(self, workspace) -> int:
+        tenant_root = getattr(workspace, "tenant_root", workspace.root)
+        return await self.pool.cancel_workspace(tenant_root)
 
     async def send_interaction_message(
         self,
