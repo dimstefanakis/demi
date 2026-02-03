@@ -1320,6 +1320,11 @@ def _set_active_project(tenant_root: Path, project_name: str) -> bool:
 
 def _migrate_current_task_context(tasks_dir: Path, target_tasks_dir: Path) -> bool:
     try:
+        if tasks_dir.resolve() == target_tasks_dir.resolve():
+            return False
+    except OSError:
+        return False
+    try:
         target_tasks_dir.mkdir(parents=True, exist_ok=True)
     except OSError:
         return False
