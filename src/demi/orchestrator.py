@@ -1558,13 +1558,32 @@ class Orchestrator:
         if not label:
             return None
         label = label[:160]
-        slug = re.sub(r"[^a-z0-9]+", "-", label.lower()).strip("-")
-        if not slug:
-            slug = "request"
+        lower = label.lower()
+        if not re.search(
+            r"\\b(link|checkout|invoice|subscribe|subscription|hire|card)\\b",
+            lower,
+        ):
+            return None
+        if "link" in lower:
+            category = "link"
+        elif "invoice" in lower:
+            category = "invoice"
+        elif "checkout" in lower:
+            category = "checkout"
+        elif "subscribe" in lower or "subscription" in lower:
+            category = "subscription"
+        elif "price" in lower or "pricing" in lower or "cost" in lower:
+            category = "pricing"
+        elif "hire" in lower:
+            category = "hire"
+        elif "card" in lower:
+            category = "card"
+        else:
+            category = "payment"
         suffix = str(getattr(msg, "provider_message_id", "") or "").strip()
-        purpose = f"{slug}-{suffix}" if suffix else slug
+        purpose = f"{category}-{suffix}" if suffix else category
         return {
-            "purpose": purpose[:80],
+            "purpose": purpose[:40],
             "purpose_label": label,
         }
 
