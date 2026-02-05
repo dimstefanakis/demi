@@ -2,11 +2,11 @@ from datetime import datetime, timezone, timedelta
 
 import pytest
 
-from demi.db.core import Database
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.models import NormalizedMessage
 from demi.orchestrator import Orchestrator
 from demi.workspace.core import WorkspaceManager
+from tests.utils import build_test_db, create_test_tenant
 
 
 class FakeAgent:
@@ -24,6 +24,7 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        run_id=None,
         runtime_env=None,
     ):
         self.calls.append((workspace.root, task_path))
@@ -40,19 +41,20 @@ class FakeAgent:
         session_id=None,
         provider=None,
         tenant_external_id=None,
+        run_id=None,
+        message_id=None,
     ) -> None:
         return None
 
 
 class FakeMessenger:
-    async def send_text(self, tenant_external_id, text):
+    async def send_text(self, tenant_external_id, text, reply_to_message_id=None):
         return None
 
 
 @pytest.mark.asyncio
-async def test_pending_worker_drains_queue(tmp_path):
-    db = Database(tmp_path / "main.sqlite")
-    db.init()
+async def test_pending_worker_sleeps_when_inflight(tmp_path, monkeypatch):
+    db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FakeAgent()
     orchestrator = Orchestrator(
@@ -62,7 +64,72 @@ async def test_pending_worker_drains_queue(tmp_path):
         messenger=FakeMessenger(),
     )
 
-    tenant = db.get_or_create_tenant("telegram", "222")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="inflight-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Queued request",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.create_run(
+        tenant.id,
+        message_id=message_id,
+        project_name=workspace.project_name,
+        lease_seconds=3600,
+    )
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=workspace.project_name,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    slept: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    monkeypatch.setattr("demi.jobs.pending_worker.asyncio.sleep", fake_sleep)
+
+    worker = PendingWorker(
+        db=db,
+        orchestrator=orchestrator,
+        config=PendingWorkerConfig(
+            poll_interval=0.05,
+            batch_size=5,
+            processing_grace_seconds=0,
+        ),
+    )
+
+    groups = db.fetch_queued_run_input_groups(limit=5)
+    assert groups
+    await worker._handle_group(groups[0])
+
+    assert slept
+
+
+@pytest.mark.asyncio
+async def test_pending_worker_drains_queue(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
     workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
 
     raw = {
@@ -76,7 +143,7 @@ async def test_pending_worker_drains_queue(tmp_path):
     msg = NormalizedMessage(
         provider="telegram",
         provider_message_id="123",
-        tenant_external_id="222",
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="How would you connect stripe?",
         images=[],
@@ -107,18 +174,15 @@ async def test_pending_worker_drains_queue(tmp_path):
     assert groups
     await worker._handle_group(groups[0])
 
-    row = db.connect().execute(
-        "SELECT status FROM messages WHERE id = ?",
-        (message_id,),
-    ).fetchone()
+    row = db.get_message(message_id)
+    assert row is not None
     assert row["status"] == "processed"
     assert agent.calls
 
 
 @pytest.mark.asyncio
 async def test_pending_worker_clears_stale_inflight_run(tmp_path):
-    db = Database(tmp_path / "main.sqlite")
-    db.init()
+    db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FakeAgent()
     orchestrator = Orchestrator(
@@ -128,13 +192,13 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
         messenger=FakeMessenger(),
     )
 
-    tenant = db.get_or_create_tenant("telegram", "333")
+    tenant = create_test_tenant(db)
     workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
 
     msg = NormalizedMessage(
         provider="telegram",
         provider_message_id="stale-1",
-        tenant_external_id="333",
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Hello",
         images=[],
@@ -151,12 +215,11 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     )
     past = datetime.now(tz=timezone.utc) - timedelta(seconds=901)
     expired = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
-    conn = db.connect()
-    conn.execute(
-        "UPDATE runs SET started_at = ?, lease_expires_at = ? WHERE id = ?",
-        (past.isoformat(), expired.isoformat(), run_id),
+    db.update_run_timestamps(
+        run_id,
+        started_at=past.isoformat(),
+        lease_expires_at=expired.isoformat(),
     )
-    conn.commit()
 
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
@@ -182,14 +245,9 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     assert groups
     await worker._handle_group(groups[0])
 
-    run = db.connect().execute(
-        "SELECT status, error FROM runs WHERE id = ?",
-        (run_id,),
-    ).fetchone()
+    run = db.get_run(run_id)
+    assert run is not None
     assert run["status"] == "failed"
     assert run["error"] == "lease_expired"
-    row = db.connect().execute(
-        "SELECT status FROM messages WHERE id = ?",
-        (message_id,),
-    ).fetchone()
+    row = db.get_message(message_id)
     assert row["status"] == "processed"

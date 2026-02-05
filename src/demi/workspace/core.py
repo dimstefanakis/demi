@@ -112,11 +112,16 @@ class WorkspaceManager:
             if not target.exists():
                 shutil.copy2(claude_md, target)
 
-        design_md = self.template_root / "DESIGN.md"
-        if design_md.exists():
-            target = workspace_root / "DESIGN.md"
-            if not target.exists():
-                shutil.copy2(design_md, target)
+        design_candidates = [
+            self.template_root / "DESIGN.md",
+            self.template_root / "docs" / "DESIGN.md",
+        ]
+        for design_md in design_candidates:
+            if design_md.exists():
+                target = workspace_root / "DESIGN.md"
+                if not target.exists():
+                    shutil.copy2(design_md, target)
+                break
 
         env_example = self.template_root / ".env.example"
         if env_example.exists():
@@ -195,7 +200,6 @@ class WorkspaceManager:
             "site",
             "memory.md",
             "DESCRIPTION.md",
-            "tenant.sqlite",
             ".claude",
             "CLAUDE.md",
             "DESIGN.md",

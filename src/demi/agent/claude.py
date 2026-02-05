@@ -38,7 +38,6 @@ from demi.agent.tool_logging import log_agent_event
 from demi.config import Settings
 from demi.agent.inflight import InflightTextStream
 from demi.models import NormalizedMessage
-from demi.tenant_db import ensure_tenant_db
 from demi.workspace.core import Workspace
 
 
@@ -71,6 +70,13 @@ class AgentResult:
     usage: dict[str, Any] | None = None
 
 
+@dataclass
+class InteractionRouteResult:
+    decision: dict[str, Any]
+    total_cost_usd: float | None = None
+    usage: dict[str, Any] | None = None
+
+
 def _sdk_message_log_data(msg: Any) -> dict[str, Any]:
     return {
         "class": msg.__class__.__name__,
@@ -98,6 +104,7 @@ class ClaudeAgent:
         UNSPLASH_SEARCH_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__decide_project",
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+        f"mcp__{CHAT_SERVER_NAME}__check_for_status",
         f"mcp__{CHAT_SERVER_NAME}__ack_inflight_updates",
         SEND_MESSAGE_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
@@ -140,6 +147,7 @@ class ClaudeAgent:
         db: Any | None = None,
         payments: Any | None = None,
         session_id: str | None = None,
+        run_id: int | None = None,
         runtime_env: dict[str, str] | None = None,
     ) -> AgentResult:
         chat_server = build_chat_server(
@@ -153,6 +161,7 @@ class ClaudeAgent:
                 db=db,
                 payments=payments,
                 role="primary",
+                run_id=run_id,
             )
         )
         settings = Settings()
@@ -181,7 +190,9 @@ class ClaudeAgent:
             SUPABASE_SERVER_NAME: supabase_server,
             GITHUB_SERVER_NAME: github_server,
         }
-        supabase_mcp = self._build_supabase_mcp_config(workspace, settings)
+        supabase_mcp = self._build_supabase_mcp_config(
+            workspace, settings, db=db, tenant_id=tenant_id
+        )
         if supabase_mcp:
             mcp_servers[self.SUPABASE_MCP_SERVER_NAME] = supabase_mcp
         chrome_mcp = self._build_chrome_devtools_mcp_config(
@@ -287,6 +298,10 @@ class ClaudeAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
+        run_id: int | None = None,
+        message_id: int | None = None,
+        reply_to_message_id: str | None = None,
+        reply_to_text: str | None = None,
     ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
@@ -302,6 +317,8 @@ class ClaudeAgent:
                 db=db,
                 payments=payments,
                 role="interaction",
+                run_id=run_id,
+                message_id=message_id,
             )
         )
         options = ClaudeAgentOptions(
@@ -311,6 +328,7 @@ class ClaudeAgent:
                 "Edit",
                 "Grep",
                 "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
@@ -329,11 +347,20 @@ class ClaudeAgent:
         total_cost_usd = None
         usage: dict[str, Any] | None = None
         try:
+            reply_to_message_id = str(reply_to_message_id or "").strip()
+            reply_to_text = str(reply_to_text or "").strip()
             prompt = (
                 "Send the following user update if it fits the current context. "
-                "If it would be redundant, do not send.\n\n"
-                f"UPDATE:\n{text}"
+                "If it would be redundant, do not send.\n"
             )
+            if reply_to_message_id or reply_to_text:
+                prompt += (
+                    "If you send a message, use send_message with reply_to_message_id/reply_to_text "
+                    "from the reply context.\n"
+                    f"Reply context: id={reply_to_message_id or 'n/a'} "
+                    f"text={reply_to_text or 'n/a'}\n"
+                )
+            prompt += f"\nUPDATE:\n{text}"
             await client.query(prompt, session_id=session_id or "interaction")
             async for msg in client.receive_messages():
                 if isinstance(msg, ResultMessage):
@@ -349,6 +376,116 @@ class ClaudeAgent:
             usage=usage,
         )
 
+    async def route_interaction(
+        self,
+        *,
+        workspace: Workspace,
+        message: NormalizedMessage,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+        message_id: int | None = None,
+        billing_checked: bool = False,
+    ) -> InteractionRouteResult:
+        settings = Settings()
+        interaction_prompt = self._load_prompt_file(settings.interaction_router_prompt_path)
+        chat_server = build_chat_server(
+            ChatToolContext(
+                messenger=messenger,
+                tenant_external_id=str(tenant_external_id or ""),
+                tenant_key=(
+                    f"{provider}:{tenant_external_id}" if provider and tenant_external_id else None
+                ),
+                provider=provider,
+                tasks_dir=workspace.tasks_dir,
+                tenant_id=tenant_id,
+                db=db,
+                payments=payments,
+                role="interaction",
+                message_id=message_id,
+            )
+        )
+        options = ClaudeAgentOptions(
+            allowed_tools=[
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__decide_project",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+            ],
+            permission_mode=self.permission_mode,
+            system_prompt=interaction_prompt,
+            setting_sources=self.setting_sources,
+            cwd=workspace.root,
+            add_dirs=[Path.cwd()],
+            plugins=self.plugins,
+            agents=None,
+            mcp_servers={CHAT_SERVER_NAME: chat_server},
+        )
+        total_cost_usd = None
+        usage: dict[str, Any] | None = None
+        decision: dict[str, Any] = {}
+        raw_output: str | None = None
+
+        def _decision_valid(payload: dict[str, Any]) -> bool:
+            if not isinstance(payload, dict):
+                return False
+            if "should_run" not in payload:
+                return False
+            return isinstance(payload.get("should_run"), bool)
+
+        async def _query_router(retry_note: str | None = None) -> None:
+            nonlocal total_cost_usd, usage, decision, raw_output
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            try:
+                prompt = (
+                    "ROUTING MODE\n"
+                    "Handle the incoming user message. "
+                    "Send any user reply if needed, then output only the routing JSON decision.\n"
+                    "Use the interaction context files and tools as needed.\n\n"
+                    f"Billing check already performed: {billing_checked}.\n"
+                )
+                if retry_note:
+                    prompt += f"\n{retry_note}\n"
+                await client.query(prompt, session_id=session_id or "interaction-router")
+                async for msg in client.receive_messages():
+                    if isinstance(msg, ResultMessage):
+                        total_cost_usd = msg.total_cost_usd
+                        usage = msg.usage
+                        raw_output = msg.result
+                        decision = self._parse_router_json(msg.result)
+                        break
+            finally:
+                await client.disconnect()
+
+        await _query_router()
+        if not _decision_valid(decision):
+            retry_note = (
+                "Your previous output was invalid. "
+                "Return ONLY valid JSON with required boolean field `should_run` "
+                "and do not include any prose or formatting.\n"
+                f"Previous output:\n{raw_output}"
+            )
+            await _query_router(retry_note=retry_note)
+            if not _decision_valid(decision):
+                raise RuntimeError("interaction_router_invalid_output")
+        return InteractionRouteResult(
+            decision=decision,
+            total_cost_usd=total_cost_usd,
+            usage=usage,
+        )
+
     async def send_interaction_instruction(
         self,
         workspace: Workspace,
@@ -360,6 +497,8 @@ class ClaudeAgent:
         session_id: str | None = None,
         provider: str | None = None,
         tenant_external_id: str | None = None,
+        run_id: int | None = None,
+        message_id: int | None = None,
     ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
@@ -375,6 +514,8 @@ class ClaudeAgent:
                 db=db,
                 payments=payments,
                 role="interaction",
+                run_id=run_id,
+                message_id=message_id,
             )
         )
         options = ClaudeAgentOptions(
@@ -384,9 +525,11 @@ class ClaudeAgent:
                 "Edit",
                 "Grep",
                 "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
             ],
             permission_mode=self.permission_mode,
             system_prompt=interaction_prompt,
@@ -422,12 +565,35 @@ class ClaudeAgent:
             usage=usage,
         )
 
+    @staticmethod
+    def _parse_router_json(raw: str | None) -> dict[str, Any]:
+        if not raw:
+            return {}
+        raw = raw.strip()
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+        start = raw.find("{")
+        end = raw.rfind("}")
+        if start >= 0 and end > start:
+            try:
+                return json.loads(raw[start : end + 1])
+            except json.JSONDecodeError:
+                return {}
+        return {}
+
     def _build_supabase_mcp_config(
-        self, workspace: Workspace, settings: Settings
+        self,
+        workspace: Workspace,
+        settings: Settings,
+        *,
+        db: Any | None = None,
+        tenant_id: int | None = None,
     ) -> dict[str, Any] | None:
         if not settings.supabase_access_token:
             return None
-        payload = self._load_supabase_project_state(workspace)
+        payload = self._load_supabase_project_state(workspace, db=db, tenant_id=tenant_id)
         if not payload:
             return None
         project_ref = str(payload.get("project_ref") or "").strip()
@@ -476,11 +642,16 @@ class ClaudeAgent:
         }
 
     @staticmethod
-    def _load_supabase_project_state(workspace: Workspace) -> dict[str, Any] | None:
-        db = ensure_tenant_db(workspace.root / "tenant.sqlite")
-        payload = db.get_kv("supabase", "project")
-        if payload:
-            return payload
+    def _load_supabase_project_state(
+        workspace: Workspace, *, db: Any | None = None, tenant_id: int | None = None
+    ) -> dict[str, Any] | None:
+        if db is not None and tenant_id is not None:
+            try:
+                payload = db.get_tenant_kv(tenant_id, "supabase", "project")
+            except Exception:
+                payload = None
+            if payload:
+                return payload
         path = workspace.tasks_dir / "supabase_project.json"
         if not path.exists():
             return None
@@ -579,6 +750,7 @@ class ClaudeAgent:
                     "Edit",
                     "Grep",
                     "Glob",
+                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                     f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                     SEND_MESSAGE_TOOL,
                     f"mcp__{CHAT_SERVER_NAME}__send_payment_link",

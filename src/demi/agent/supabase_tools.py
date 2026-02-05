@@ -14,7 +14,6 @@ from demi.agent.tool_logging import log_tool_run
 from demi.config import Settings
 from demi.db.core import Database
 from demi.domains.supabase import SupabaseClient, SupabaseError
-from demi.tenant_db import ensure_tenant_db
 from demi.domains.vercel_env import set_env_vars
 
 
@@ -72,7 +71,7 @@ def build_supabase_tools(context: SupabaseToolContext) -> list[SdkMcpTool[Any]]:
         region_selection = str(args.get("region_selection") or "").strip()
         region = str(args.get("region") or "").strip()
         instance_size = str(args.get("instance_size") or "").strip()
-        cached_state = _load_project_state(context.tasks_dir)
+        cached_state = _load_project_state(context)
         db_password = _extract_db_password(cached_state)
 
         if not region_selection and not region:
@@ -234,7 +233,7 @@ def build_supabase_tools(context: SupabaseToolContext) -> list[SdkMcpTool[Any]]:
         }
         if db_password:
             project_state["db_password"] = db_password
-        _persist_project_state(context.tasks_dir, project_state)
+        _persist_project_state(context, project_state)
 
         project_dir = _resolve_app_dir(context.tasks_dir)
         if project_dir is None:
@@ -341,7 +340,7 @@ def build_supabase_tools(context: SupabaseToolContext) -> list[SdkMcpTool[Any]]:
                 str(existing["project_ref"]).strip() if existing and existing["project_ref"] else None
             )
         else:
-            cached = _load_project_state(context.tasks_dir)
+            cached = _load_project_state(context)
             if cached:
                 project_ref = str(cached.get("project_ref") or "").strip() or None
         if not project_ref:
@@ -449,10 +448,6 @@ def _extract_db_password(payload: dict[str, Any] | None) -> str | None:
     return text or None
 
 
-def _tenant_db(tasks_dir: Path):
-    return ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-
-
 def _load_project_file(tasks_dir: Path) -> dict[str, Any] | None:
     path = tasks_dir / "supabase_project.json"
     if not path.exists():
@@ -471,18 +466,18 @@ def _persist_project_file(tasks_dir: Path, payload: dict[str, Any]) -> None:
         return
 
 
-def _load_project_state(tasks_dir: Path) -> dict[str, Any] | None:
-    db = _tenant_db(tasks_dir)
-    payload = db.get_kv("supabase", "project")
-    if payload:
-        return payload
-    return _load_project_file(tasks_dir)
+def _load_project_state(context: SupabaseToolContext) -> dict[str, Any] | None:
+    if context.db is not None and context.tenant_id is not None:
+        payload = context.db.get_tenant_kv(context.tenant_id, "supabase", "project")
+        if payload:
+            return payload
+    return _load_project_file(context.tasks_dir)
 
 
-def _persist_project_state(tasks_dir: Path, payload: dict[str, Any]) -> None:
-    db = _tenant_db(tasks_dir)
-    db.set_kv("supabase", "project", payload)
-    _persist_project_file(tasks_dir, payload)
+def _persist_project_state(context: SupabaseToolContext, payload: dict[str, Any]) -> None:
+    if context.db is not None and context.tenant_id is not None:
+        context.db.set_tenant_kv(context.tenant_id, "supabase", "project", payload)
+    _persist_project_file(context.tasks_dir, payload)
 
 def _generate_db_password(length: int = 24) -> str:
     alphabet = string.ascii_letters + string.digits

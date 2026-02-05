@@ -1,19 +1,17 @@
-from demi.db.core import Database
-from demi.models import NormalizedMessage
 from datetime import datetime, timezone
 
+from demi.models import NormalizedMessage
+from tests.utils import build_test_db, create_test_tenant, unique_external_id
 
-def test_record_message_idempotency(tmp_path):
-    db_path = tmp_path / "main.sqlite"
-    db = Database(db_path)
-    db.init()
 
-    tenant = db.get_or_create_tenant(provider="telegram", external_id="987654")
+def test_record_message_idempotency():
+    db = build_test_db()
+    tenant = create_test_tenant(db, external_id=unique_external_id("tenant"))
 
     msg = NormalizedMessage(
         provider="telegram",
-        provider_message_id="51",
-        tenant_external_id="987654",
+        provider_message_id=unique_external_id("msg"),
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Hello",
         images=[],
@@ -28,18 +26,17 @@ def test_record_message_idempotency(tmp_path):
     assert first_id == second_id
 
 
-def test_same_message_id_across_tenants(tmp_path):
-    db_path = tmp_path / "main.sqlite"
-    db = Database(db_path)
-    db.init()
+def test_same_message_id_across_tenants():
+    db = build_test_db()
+    shared_message_id = unique_external_id("msg")
 
-    tenant_a = db.get_or_create_tenant(provider="telegram", external_id="111")
-    tenant_b = db.get_or_create_tenant(provider="telegram", external_id="222")
+    tenant_a = create_test_tenant(db, external_id=unique_external_id("tenant"))
+    tenant_b = create_test_tenant(db, external_id=unique_external_id("tenant"))
 
     msg_a = NormalizedMessage(
         provider="telegram",
-        provider_message_id="99",
-        tenant_external_id="111",
+        provider_message_id=shared_message_id,
+        tenant_external_id=tenant_a.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Hello",
         images=[],
@@ -47,8 +44,8 @@ def test_same_message_id_across_tenants(tmp_path):
     )
     msg_b = NormalizedMessage(
         provider="telegram",
-        provider_message_id="99",
-        tenant_external_id="222",
+        provider_message_id=shared_message_id,
+        tenant_external_id=tenant_b.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Hello",
         images=[],

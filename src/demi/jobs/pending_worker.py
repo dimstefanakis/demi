@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-import sqlite3
 from typing import Any
 
 from demi.db.core import Database
@@ -50,27 +49,20 @@ class PendingWorker:
         self._running = True
         try:
             while self._running:
-                try:
-                    groups = await self._db_call(
-                        self.db.fetch_queued_run_input_groups,
-                        self.config.batch_size,
-                    )
-                except sqlite3.OperationalError as exc:
-                    if "locked" in str(exc).lower():
-                        await asyncio.sleep(self.config.poll_interval)
-                        continue
-                    raise
+                groups = await self._db_call(
+                    self.db.fetch_queued_run_input_groups,
+                    self.config.batch_size,
+                )
                 if not groups:
+                    await self._check_active_runs()
                     await asyncio.sleep(self.config.poll_interval)
                     continue
                 for group in groups:
                     try:
                         await self._handle_group(group)
-                    except sqlite3.OperationalError as exc:
-                        if "locked" in str(exc).lower():
-                            await asyncio.sleep(self.config.poll_interval)
-                            break
-                        raise
+                    except Exception:
+                        await asyncio.sleep(self.config.poll_interval)
+                        break
         except asyncio.CancelledError:
             pass
         finally:
@@ -99,5 +91,35 @@ class PendingWorker:
                 tenant, project_name, inflight
             )
             if still_inflight:
+                sleep_for = self.config.poll_interval
+                if sleep_for <= 0:
+                    sleep_for = 0.1
+                await asyncio.sleep(sleep_for)
                 return
         await self.orchestrator._drain_run_inputs(tenant, project_name=project_name)
+
+    async def _check_active_runs(self) -> None:
+        rows = await self._db_call(self.db.list_active_runs, self.config.batch_size)
+        if not rows:
+            return
+        for row in rows:
+            tenant_id = row.get("tenant_id")
+            if tenant_id is None:
+                continue
+            tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
+            if tenant is None:
+                continue
+            project_name = row.get("project_name")
+            run_id = row.get("run_id")
+            if run_id is None:
+                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
+                continue
+            run_row = await self._db_call(self.db.get_run, int(run_id))
+            if not run_row:
+                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
+                continue
+            status = run_row.get("status") if hasattr(run_row, "get") else None
+            if status and status != "running":
+                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
+                continue
+            await self._resolve_inflight_run(tenant, project_name, run_row)

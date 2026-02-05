@@ -18,7 +18,6 @@ services:
     env_file:
       - .env
     environment:
-      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
@@ -37,7 +36,6 @@ services:
     env_file:
       - .env
     environment:
-      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
@@ -56,7 +54,6 @@ services:
     env_file:
       - .env
     environment:
-      - MAIN_DB_BACKEND=${MAIN_DB_BACKEND:-sqlite}
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}

@@ -15,7 +15,7 @@ from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.messaging.telegram import TelegramClient, TelegramConfig
 from demi.orchestrator import Orchestrator
 from demi.payments.stripe import StripeClient, build_stripe_config
-from demi.runtime.docker_agent import DockerAgent
+from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
 from demi.workspace.core import WorkspaceManager
 
@@ -41,6 +41,7 @@ async def _run_workers() -> None:
             pool_size=settings.docker_pool_size,
             pool_root=pool_root,
             mount_path=settings.docker_mount_path,
+            extra_env=load_env_file_values(settings),
         )
         pool = DockerPool(pool_config)
         agent = DockerAgent(
@@ -106,6 +107,8 @@ async def _run_workers() -> None:
                 poll_interval=settings.outbox_worker_poll_interval,
                 batch_size=settings.outbox_worker_batch_size,
             ),
+            interaction_agent=orchestrator.agent,
+            workspace_manager=workspace_manager,
         )
         workers.append(outbox_worker)
         tasks.append(

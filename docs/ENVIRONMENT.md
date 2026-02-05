@@ -15,7 +15,8 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - Only `/workspace` persists across runs (bind-mounted tenant volume).
 - Everything outside `/workspace` is ephemeral.
 - Persist state in the project workspace (`/workspace/projects/<project_name>/`)
-  (memory.md, DESCRIPTION.md, tasks/, site/, assets/, tenant.sqlite) or external services.
+  (memory.md, DESCRIPTION.md, tasks/, site/, assets/) or external services.
+- A tenant-local SQLite scratchpad may live at `/workspace/tenant.sqlite` for execution-agent notes/cache.
 
 ## Tools Available in Container
 - Python + uv
@@ -43,6 +44,7 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 ## Environment Variables (allowlist)
 Default env allowlist includes:
 - TELEGRAM_BOT_TOKEN
+- MAIN_DB_SUPABASE_URL / MAIN_DB_SUPABASE_SERVICE_KEY
 - UNSPLASH_ACCESS_KEY / UNSPLASH_SECRET_KEY / UNSPLASH_APP_ID
 - VERCEL_TOKEN / VERCEL_SCOPE
 - EVENT_URL / PUBLIC_BASE_URL
@@ -51,9 +53,8 @@ Default env allowlist includes:
 - SUPABASE_REGION_SELECTION / SUPABASE_REGION / SUPABASE_INSTANCE_SIZE / SUPABASE_PROJECT_PREFIX
 - CLAUDE_PLUGINS / ANTHROPIC_API_KEY / CLAUDE_API_KEY / GEMINI_API_KEY / GOOGLE_API_KEY
 
-Main DB credentials (e.g., `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`,
-`DEMI_MAIN_DB_URL`) are intentionally excluded from the tenant container allowlist.
-Keep them only in the orchestrator/worker environment.
+Main DB credentials are required inside the agent container to fetch run context
+(run/message/task metadata) from Supabase.
 
 ## Operational Notes
 - If you are unsure how to accomplish a task, inspect this file and repo docs

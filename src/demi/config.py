@@ -10,8 +10,6 @@ class Settings(BaseSettings):
 
     root_dir: Path = Path(".")
     data_dir: Path = Path("data")
-    db_path: Path | None = None
-    main_db_backend: str = "sqlite"
     main_db_supabase_url: str | None = None
     main_db_supabase_service_key: str | None = None
 
@@ -58,7 +56,8 @@ class Settings(BaseSettings):
     docker_pool_size: int = 1
     docker_pool_root: Path = Path("data/pool")
     docker_mount_path: str = "/workspace"
-    docker_env_allowlist: str | None = None
+    # NOTE: all secrets are considered safe for agents to consume in this runtime.
+    docker_env_allowlist: str | None = "*"
     docker_forward_messages: bool = False
     docker_command_timeout_seconds: float = 1800.0
     docker_pool_warm_timeout_seconds: float = 45.0
@@ -86,11 +85,6 @@ class Settings(BaseSettings):
     run_lease_seconds: int = 600
     run_activity_poll_interval: float = 2.5
 
-    sqlite_timeout_seconds: float = 0.5
-    sqlite_busy_timeout_ms: int = 500
-    sqlite_journal_mode: str = "WAL"
-    sqlite_synchronous: str = "NORMAL"
-
     unsplash_app_id: str | None = None
     unsplash_access_key: str | None = None
     unsplash_secret_key: str | None = None
@@ -110,25 +104,10 @@ class Settings(BaseSettings):
     assistant_product_name: str = "Hire me"
     assistant_price_usd: float | None = None
     assistant_currency: str = "USD"
+    assistant_usage_threshold_usd: float | None = 3.0
 
     def resolved_data_dir(self) -> Path:
         return (self.root_dir / self.data_dir).resolve()
-
-    def resolved_db_path(self) -> Path:
-        if self.db_path:
-            return self.db_path
-        data_dir = self.resolved_data_dir()
-        default_path = data_dir / "main.sqlite"
-        if default_path.exists():
-            return default_path
-        legacy_paths = [
-            data_dir / "main.sqlite",
-            data_dir / "claudius.sqlite",
-        ]
-        for legacy_path in legacy_paths:
-            if legacy_path.exists():
-                return legacy_path
-        return default_path
 
     def resolved_gemini_cmd(self) -> str:
         local_cmd = (self.root_dir / "node_modules" / ".bin" / "gemini").resolve()

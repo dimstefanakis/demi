@@ -1,7 +1,16 @@
-import sys
-from pathlib import Path
+from __future__ import annotations
 
-ROOT = Path(__file__).resolve().parents[1]
-SRC = ROOT / "src"
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _disable_github_app_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Prevent tests from creating real GitHub repos via .env credentials."""
+    for key in (
+        "GITHUB_ORG",
+        "GITHUB_APP_ID",
+        "GITHUB_APP_CLIENT_ID",
+        "GITHUB_APP_INSTALLATION_ID",
+        "GITHUB_APP_PRIVATE_KEY",
+    ):
+        monkeypatch.setenv(key, "")

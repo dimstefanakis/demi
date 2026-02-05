@@ -1,0 +1,2 @@
+ALTER TABLE runs
+    ADD COLUMN IF NOT EXISTS tool_runs_json JSONB;

@@ -2,10 +2,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from demi.db.core import Database
 from demi.models import NormalizedMessage
 from demi.orchestrator import Orchestrator
 from demi.workspace.core import WorkspaceManager
+from tests.utils import build_test_db, create_test_tenant
 
 
 class FakeAgent:
@@ -20,20 +20,20 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        run_id=None,
         runtime_env=None,
     ):
         return type("AgentResult", (), {"session_id": None, "summary": "ok"})()
 
 
 class FakeMessenger:
-    async def send_text(self, tenant_external_id, text):
+    async def send_text(self, tenant_external_id, text, reply_to_message_id=None):
         return None
 
 
 @pytest.mark.asyncio
 async def test_migrate_legacy_queue_moves_pending_messages(tmp_path):
-    db = Database(tmp_path / "main.sqlite")
-    db.init()
+    db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     orchestrator = Orchestrator(
         db=db,
@@ -42,11 +42,11 @@ async def test_migrate_legacy_queue_moves_pending_messages(tmp_path):
         messenger=FakeMessenger(),
     )
 
-    tenant = db.get_or_create_tenant("telegram", "777")
+    tenant = create_test_tenant(db)
     msg = NormalizedMessage(
         provider="telegram",
         provider_message_id="legacy-1",
-        tenant_external_id="777",
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Legacy pending",
         images=[],
@@ -61,8 +61,5 @@ async def test_migrate_legacy_queue_moves_pending_messages(tmp_path):
     assert migrated == 1
     rows = db.fetch_run_inputs(tenant.id, "main", status="queued")
     assert rows
-    row = db.connect().execute(
-        "SELECT status FROM messages WHERE id = ?",
-        (message_id,),
-    ).fetchone()
+    row = db.get_message(message_id)
     assert row["status"] == "processed"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +9,7 @@ from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_serv
 
 import json
 import re
+import uuid
 
 from demi.db.core import Database
 from demi.memory.logs import append_log, write_chat_history
@@ -16,7 +17,6 @@ from demi.agent.tool_logging import log_tool_run
 from demi.config import Settings
 from demi.workspace.project_decider import decide_project as decide_project_for_tenant
 from demi.payments.stripe import StripeClient, StripeConfig, build_stripe_config
-from demi.tenant_db import ensure_tenant_db
 
 
 CHAT_SERVER_NAME = "demi-chat"
@@ -34,6 +34,8 @@ class ChatToolContext:
     tenant_id: int | None = None
     payments: Any | None = None
     role: str = "primary"
+    run_id: int | None = None
+    message_id: int | None = None
 
 
 def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
@@ -91,23 +93,99 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             return False
         return bool(payload.get("payment_required"))
 
-    def _queue_interaction_request(payload: dict[str, Any]) -> None:
-        path = context.tasks_dir / "interaction_request.json"
-        existing = None
-        if path.exists():
-            try:
-                existing = json.loads(path.read_text())
-            except (OSError, json.JSONDecodeError):
-                existing = None
-        if isinstance(existing, dict):
-            existing_type = str(existing.get("type") or "").strip().lower()
-            incoming_type = str(payload.get("type") or "").strip().lower()
-            if existing_type == "send_payment_link" and incoming_type == "send_message":
-                return
+    def _resolve_tenant_id() -> int | None:
+        if context.tenant_id is not None:
+            return context.tenant_id
+        if context.db is None or not context.provider or not context.tenant_external_id:
+            return None
         try:
-            path.write_text(json.dumps(payload, indent=2))
-        except OSError:
+            tenant = context.db.get_tenant_by_external(context.provider, context.tenant_external_id)
+        except Exception:
+            return None
+        if tenant is None:
+            return None
+        return int(getattr(tenant, "id", None) or tenant["id"])
+
+    def _record_outbound_event(
+        *,
+        text: str,
+        message_type: str,
+        reply_to_message_id: str | None = None,
+        reply_to_text: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if context.db is None:
             return
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            return
+        run_id = _current_run_id(context)
+        current_message = _current_message(context) or {}
+        provider_message_id = current_message.get("provider_message_id")
+        payload = dict(metadata or {})
+        if reply_to_text:
+            payload["reply_to_text"] = reply_to_text
+        if current_message.get("text"):
+            payload.setdefault("context_message_text", current_message.get("text"))
+        try:
+            context.db.record_message_event(
+                tenant_id=tenant_id,
+                direction="outbound",
+                provider=context.provider,
+                tenant_external_id=context.tenant_external_id,
+                message_type=message_type,
+                text=text,
+                project_name=_project_name_from_tasks_dir(context.tasks_dir),
+                run_id=run_id,
+                reply_to_message_id=reply_to_message_id or None,
+                provider_message_id=str(provider_message_id or "") or None,
+                metadata=payload or None,
+            )
+        except Exception:
+            return
+
+    def _enqueue_interaction_update(payload: dict[str, Any]) -> bool:
+        if context.db is None:
+            return _write_interaction_fallback(payload)
+        tenant_id = context.tenant_id
+        if tenant_id is None and context.provider and context.tenant_external_id:
+            try:
+                tenant = context.db.get_tenant_by_external(
+                    context.provider, context.tenant_external_id
+                )
+            except Exception:
+                tenant = None
+            if tenant is not None:
+                tenant_id = tenant.id
+        if tenant_id is None:
+            return _write_interaction_fallback(payload)
+        try:
+            correlation_id = payload.get("correlation_id")
+            if not correlation_id:
+                correlation_id = f"interaction-update:{uuid.uuid4()}"
+                payload["correlation_id"] = correlation_id
+            context.db.enqueue_outbox(
+                tenant_id=tenant_id,
+                run_id=None,
+                project_name=payload.get("project_name"),
+                correlation_id=str(correlation_id),
+                payload=payload,
+            )
+            return True
+        except Exception:
+            return _write_interaction_fallback(payload)
+
+    def _write_interaction_fallback(payload: dict[str, Any]) -> bool:
+        path = context.tasks_dir / "interaction_updates.jsonl"
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if "correlation_id" not in payload:
+                payload["correlation_id"] = f"interaction-update:{uuid.uuid4()}"
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+            return True
+        except OSError:
+            return False
 
     @tool(
         "should_send_message",
@@ -124,22 +202,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": False,
             }
-        reply_to_message_id = str(args.get("reply_to_message_id", "")).strip()
-        reply_to_text = str(args.get("reply_to_text", "")).strip()
-        if reply_to_message_id or reply_to_text:
-            matches, match_reason = _reply_to_matches(
-                context.tasks_dir,
-                reply_to_message_id=reply_to_message_id,
-                reply_to_text=reply_to_text,
-            )
-            if not matches:
-                payload = {"send": False, "reason": match_reason}
-                _log("should_send_message", args, result=payload, start=start)
-                return {
-                    "content": [{"type": "text", "text": json.dumps(payload)}],
-                    "is_error": False,
-                }
-        decision, reason = _should_send(text, context.tasks_dir)
+        # Intentionally ignore reply_to_* to allow late updates from long-running runs.
+        decision, reason = _should_send(text, context)
         payload = {"send": decision, "reason": reason}
         _log("should_send_message", args, result=payload, start=start)
         return {
@@ -197,6 +261,39 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         }
 
     @tool(
+        "check_for_status",
+        "Fetch the current run status and queued inputs for this tenant/project.",
+        {"project_name": str},
+    )
+    async def check_for_status(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None or context.tenant_id is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("check_for_status", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        project_name = str(args.get("project_name") or "").strip() or None
+        run = context.db.get_inflight_run(context.tenant_id, project_name)
+        active = context.db.get_active_run(context.tenant_id, project_name)
+        queued = context.db.count_run_inputs(
+            context.tenant_id, project_name=project_name, status="queued"
+        )
+        payload = {
+            "ok": True,
+            "project_name": project_name,
+            "active_run": dict(active) if active else None,
+            "inflight_run": dict(run) if run else None,
+            "queued_inputs": queued,
+        }
+        _log("check_for_status", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
         "send_message",
         "Send a user-facing chat update via the active messaging provider.",
         {"text": str, "final": bool, "reply_to_message_id": str, "reply_to_text": str},
@@ -204,15 +301,26 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
         if str(context.role or "primary") != "interaction":
-            _queue_interaction_request(
-                {
-                    "type": "send_message",
-                    "text": str(args.get("text", "")).strip(),
-                    "final": bool(args.get("final", False)),
-                    "reply_to_message_id": str(args.get("reply_to_message_id", "")).strip(),
-                    "reply_to_text": str(args.get("reply_to_text", "")).strip(),
+            text = str(args.get("text", "")).strip()
+            update_payload = {
+                "type": "interaction_update",
+                "action": "send_message",
+                "text": text,
+                "final": bool(args.get("final", False)),
+                "reply_to_message_id": str(args.get("reply_to_message_id", "")).strip(),
+                "reply_to_text": str(args.get("reply_to_text", "")).strip(),
+                "tenant_external_id": context.tenant_external_id,
+                "provider": context.provider,
+                "project_name": _project_name_from_tasks_dir(context.tasks_dir),
+                "run_id": _current_run_id(context),
+            }
+            if not _enqueue_interaction_update(update_payload):
+                payload = {"queued": False, "status": "interaction_update_failed"}
+                _log("send_message", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
                 }
-            )
             payload = {"queued": True, "status": "interaction_required"}
             _log("send_message", args, result=payload, start=start)
             return {
@@ -221,19 +329,21 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
         text = str(args.get("text", "")).strip()
         final = bool(args.get("final", False))
+        reply_to_message_id = str(args.get("reply_to_message_id") or "").strip() or None
+        reply_to_text = str(args.get("reply_to_text") or "").strip() or None
+        allowed_reply, _ = _reply_context_allowed(
+            context, reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text
+        )
+        if not allowed_reply:
+            reply_to_message_id = None
+            reply_to_text = None
         if not text:
             _log("send_message", args, result={"skipped": "empty"}, start=start)
             return {
                 "content": [{"type": "text", "text": "Skipped empty message."}],
                 "is_error": False,
             }
-        run_id = _current_run_id(context.tasks_dir)
-        if run_id and _final_sent_for_run(context.tasks_dir, run_id):
-            _log("send_message", args, result={"skipped": "final_already_sent"}, start=start)
-            return {
-                "content": [{"type": "text", "text": "Skipped after final message."}],
-                "is_error": False,
-            }
+        run_id = _current_run_id(context)
         if "checkout.stripe.com" in text:
             payload = {
                 "ok": False,
@@ -245,30 +355,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
-        reply_to_message_id = str(args.get("reply_to_message_id", "")).strip()
-        reply_to_text = str(args.get("reply_to_text", "")).strip()
-        if reply_to_message_id or reply_to_text:
-            matches, match_reason = _reply_to_matches(
-                context.tasks_dir,
-                reply_to_message_id=reply_to_message_id,
-                reply_to_text=reply_to_text,
-            )
-            if not matches:
-                _log(
-                    "send_message",
-                    args,
-                    result={"skipped": match_reason},
-                    start=start,
-                )
-                return {
-                    "content": [
-                        {"type": "text", "text": f"Skipped: {match_reason}."}
-                    ],
-                    "is_error": False,
-                }
-
         try:
-            await context.messenger.send_text(context.tenant_external_id, text)
+            await context.messenger.send_text(
+                context.tenant_external_id, text, reply_to_message_id=reply_to_message_id
+            )
         except Exception as exc:  # noqa: BLE001
             _log("send_message", args, error=str(exc), start=start)
             return {
@@ -279,7 +369,14 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         append_log(context.tasks_dir, "assistant_message", text)
         write_chat_history(context.tasks_dir)
         if final and run_id:
-            _set_final_sent(context.tasks_dir, run_id)
+            _set_final_sent(context, run_id)
+        _record_outbound_event(
+            text=text,
+            message_type="message",
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            metadata={"final": final},
+        )
         _log("send_message", args, result={"sent": True}, start=start)
         return {
             "content": [{"type": "text", "text": "Sent."}],
@@ -363,6 +460,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "source": {"type": "string"},
                 "text": {"type": "string"},
                 "final": {"type": "boolean"},
+                "reply_to_message_id": {"type": "string"},
+                "reply_to_text": {"type": "string"},
             },
             "required": ["text"],
         },
@@ -370,15 +469,27 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     async def send_payment_link(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
         if str(context.role or "primary") != "interaction":
-            _queue_interaction_request(
-                {
-                    "type": "send_payment_link",
-                    "order_id": args.get("order_id"),
-                    "source": str(args.get("source") or "").strip(),
-                    "text": str(args.get("text", "")).strip(),
-                    "final": bool(args.get("final", False)),
+            update_payload = {
+                "type": "interaction_update",
+                "action": "send_payment_link",
+                "order_id": args.get("order_id"),
+                "source": str(args.get("source") or "").strip(),
+                "text": str(args.get("text", "")).strip(),
+                "final": bool(args.get("final", False)),
+                "reply_to_message_id": str(args.get("reply_to_message_id") or "").strip(),
+                "reply_to_text": str(args.get("reply_to_text") or "").strip(),
+                "tenant_external_id": context.tenant_external_id,
+                "provider": context.provider,
+                "project_name": _project_name_from_tasks_dir(context.tasks_dir),
+                "run_id": _current_run_id(context),
+            }
+            if not _enqueue_interaction_update(update_payload):
+                payload = {"queued": False, "status": "interaction_update_failed"}
+                _log("send_payment_link", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
                 }
-            )
             payload = {"queued": True, "status": "interaction_required"}
             _log("send_payment_link", args, result=payload, start=start)
             return {
@@ -386,6 +497,14 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "is_error": False,
             }
         final = bool(args.get("final", False))
+        reply_to_message_id = str(args.get("reply_to_message_id") or "").strip() or None
+        reply_to_text = str(args.get("reply_to_text") or "").strip() or None
+        allowed_reply, _ = _reply_context_allowed(
+            context, reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text
+        )
+        if not allowed_reply:
+            reply_to_message_id = None
+            reply_to_text = None
         order_id = None
         if args.get("order_id") is not None:
             try:
@@ -420,7 +539,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
         source = str(args.get("source") or "").strip().lower()
         if payment_url is None:
-            payment_url = _load_payment_url(context.tasks_dir, source=source, order_id=order_id)
+            payment_url = _load_payment_url(context, source=source, order_id=order_id)
         if not payment_url:
             payload = {"ok": False, "status": "missing_payment_url"}
             _log("send_payment_link", args, result=payload, start=start)
@@ -440,7 +559,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         message = f"{sanitized}\n\n{payment_url}"
 
         try:
-            await context.messenger.send_text(context.tenant_external_id, message)
+            await context.messenger.send_text(
+                context.tenant_external_id,
+                message,
+                reply_to_message_id=reply_to_message_id,
+            )
         except Exception as exc:  # noqa: BLE001
             _log("send_payment_link", args, error=str(exc), start=start)
             return {
@@ -450,9 +573,20 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
         append_log(context.tasks_dir, "assistant_message", message)
         write_chat_history(context.tasks_dir)
-        run_id = _current_run_id(context.tasks_dir)
+        run_id = _current_run_id(context)
         if final and run_id:
-            _set_final_sent(context.tasks_dir, run_id)
+            _set_final_sent(context, run_id)
+        _record_outbound_event(
+            text=message,
+            message_type="payment_link",
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+            metadata={
+                "final": final,
+                "order_id": order_id,
+                "source": source or None,
+            },
+        )
         payload = {"ok": True, "order_id": order_id, "sent": True}
         _log("send_payment_link", args, result=payload, start=start)
         return {
@@ -541,7 +675,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "currency": currency,
                 "message": message or None,
             }
-            _persist_quote(context.tasks_dir, "domain_quote", fallback_payload)
+            _persist_quote(context, "domain_quote", fallback_payload)
             _log("record_domain_quote", args, result=fallback_payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(fallback_payload)}],
@@ -575,7 +709,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "available": False,
                 "message": message,
             }
-            _persist_quote(context.tasks_dir, "domain_quote", payload)
+            _persist_quote(context, "domain_quote", payload)
             _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -591,7 +725,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "available": True,
                 "message": message,
             }
-            _persist_quote(context.tasks_dir, "domain_quote", payload)
+            _persist_quote(context, "domain_quote", payload)
             _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -612,7 +746,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "Payments are not configured yet."
                 ),
             }
-            _persist_quote(context.tasks_dir, "domain_quote", payload)
+            _persist_quote(context, "domain_quote", payload)
             _log("record_domain_quote", args, result=payload, start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -659,7 +793,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "order_id": order_id,
                 "message": "I couldn't create the payment link right now. Try again later.",
             }
-            _persist_quote(context.tasks_dir, "domain_quote", payload)
+            _persist_quote(context, "domain_quote", payload)
             _log("record_domain_quote", args, result=payload, error=str(exc), start=start)
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -684,7 +818,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 f"Pay here to proceed: {session.url}"
             ),
         }
-        _persist_quote(context.tasks_dir, "domain_quote", payload)
+        _persist_quote(context, "domain_quote", payload)
         _log("record_domain_quote", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -882,7 +1016,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "currency": currency,
             "payment_url": session.url,
         }
-        _persist_quote(context.tasks_dir, "backend_quote", payload)
+        _persist_quote(context, "backend_quote", payload)
         _log("request_backend_subscription", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -974,7 +1108,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "currency": currency_raw,
                     "payment_url": payment_url,
                 }
-                _persist_quote(context.tasks_dir, "assistant_quote", payload)
+                _persist_quote(context, "assistant_quote", payload)
                 _log("request_assistant_subscription", args, result=payload, start=start)
                 return {
                     "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -1064,7 +1198,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "currency": currency,
             "payment_url": session.url,
         }
-        _persist_quote(context.tasks_dir, "assistant_quote", payload)
+        _persist_quote(context, "assistant_quote", payload)
         _log("request_assistant_subscription", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
@@ -1074,6 +1208,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     return [
         should_send_message,
         decide_project,
+        check_for_status,
         send_message,
         send_payment_link,
         record_deploy,
@@ -1096,53 +1231,173 @@ def _is_duplicate_message(text: str, tasks_dir: Path, max_entries: int = 12) -> 
     return False
 
 
-def _should_send(text: str, tasks_dir: Path) -> tuple[bool, str]:
+def _project_name_from_tasks_dir(tasks_dir: Path) -> str | None:
+    try:
+        if tasks_dir.name == "tasks":
+            return tasks_dir.parent.name
+    except Exception:
+        return None
+    return None
+
+
+def _should_send(text: str, context: ChatToolContext) -> tuple[bool, str]:
     if not text.strip():
         return False, "empty"
-    run_id = _current_run_id(tasks_dir)
-    if run_id and _final_sent_for_run(tasks_dir, run_id):
-        return False, "final_already_sent"
+    # NOTE: intentionally not blocking sends after a run is finalized.
+    # run_id = _current_run_id(context)
+    # if run_id and _final_sent_for_run(context, run_id):
+    #     return False, "final_already_sent"
     return True, "ok"
 
 
-def _current_run_id(tasks_dir: Path) -> str | None:
-    path = tasks_dir / "run_request.json"
-    if not path.exists():
+def _current_run_id(context: ChatToolContext) -> int | None:
+    if context.run_id is not None:
+        try:
+            return int(context.run_id)
+        except (TypeError, ValueError):
+            return None
+    if context.db is None or context.tenant_id is None:
+        return None
+    project_name = _project_name_from_tasks_dir(context.tasks_dir)
+    active = context.db.get_active_run(context.tenant_id, project_name)
+    if not active:
         return None
     try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
+        return int(active["run_id"])
+    except (TypeError, ValueError, KeyError):
         return None
-    message = data.get("message") if isinstance(data, dict) else None
-    if not isinstance(message, dict):
-        return None
-    run_id = str(message.get("provider_message_id") or "").strip()
-    return run_id or None
 
 
-def _current_run_message(tasks_dir: Path) -> dict[str, Any] | None:
-    path = tasks_dir / "run_request.json"
-    if not path.exists():
+def _current_message(context: ChatToolContext) -> dict[str, Any] | None:
+    row = _current_message_row(context)
+    if not row:
         return None
-    try:
-        data = json.loads(path.read_text())
-    except (OSError, json.JSONDecodeError):
-        return None
-    message = data.get("message") if isinstance(data, dict) else None
-    if not isinstance(message, dict):
-        return None
-    text = str(message.get("text") or "").strip()
-    images = message.get("images") if isinstance(message.get("images"), list) else []
-    if not text and images:
+    text = str(row.get("text") or "").strip()
+    raw = _normalize_raw_message(row.get("raw_json"))
+    if not text and isinstance(raw, dict):
+        text = str(raw.get("text") or "").strip()
+    if not text and isinstance(raw, dict) and raw.get("images"):
         text = "(attachment)"
     return {
-        "provider_message_id": str(message.get("provider_message_id") or "").strip(),
+        "provider_message_id": str(row.get("provider_message_id") or "").strip(),
         "text": text,
     }
 
 
+def _current_message_row(context: ChatToolContext) -> dict[str, Any] | None:
+    if context.db is None:
+        return None
+    message_id = context.message_id
+    if message_id is None and context.run_id is not None:
+        try:
+            run_row = context.db.get_run(int(context.run_id))
+        except Exception:
+            run_row = None
+        if run_row:
+            message_id = run_row.get("message_id")
+    if message_id is None:
+        return None
+    try:
+        return context.db.get_message(int(message_id))
+    except Exception:
+        return None
+
+
+def _normalize_raw_message(raw: Any) -> dict[str, Any] | None:
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw:
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _reply_context_allowed(
+    context: ChatToolContext,
+    reply_to_message_id: str | None,
+    reply_to_text: str | None,
+) -> tuple[bool, str]:
+    if not reply_to_message_id and not reply_to_text:
+        return True, "no_reply_context"
+    if context.db is None or context.tenant_id is None:
+        return False, "missing_db"
+    row = _current_message_row(context)
+    if not row:
+        return False, "message_context_missing"
+    received_at = _parse_datetime_value(row.get("received_at"))
+    if received_at is None:
+        return False, "missing_received_at"
+    last_seen = _latest_activity_timestamp(context)
+    if last_seen is not None:
+        idle_minutes = (datetime.now(tz=timezone.utc) - last_seen).total_seconds() / 60.0
+        if idle_minutes >= 20:
+            return True, "idle_gap"
+    if _message_gap_exceeds(context, received_at, threshold=4):
+        return True, "message_gap"
+    return False, "recent_context"
+
+
+def _parse_datetime_value(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value
+    if isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+    return None
+
+
+def _latest_activity_timestamp(context: ChatToolContext) -> datetime | None:
+    if context.db is None or context.tenant_id is None:
+        return None
+    latest_message = _parse_datetime_value(
+        context.db.get_latest_message_received_at(context.tenant_id)
+    )
+    latest_event = _parse_datetime_value(
+        context.db.get_latest_message_event_at(context.tenant_id)
+    )
+    candidates = [ts for ts in (latest_message, latest_event) if ts is not None]
+    if not candidates:
+        return None
+    return max(candidates)
+
+
+def _message_gap_exceeds(
+    context: ChatToolContext,
+    since: datetime,
+    *,
+    threshold: int,
+) -> bool:
+    if context.db is None or context.tenant_id is None:
+        return False
+    max_needed = threshold + 1
+    since_iso = since.isoformat()
+    inbound = context.db.list_messages_since(
+        context.tenant_id, since_iso, limit=max_needed
+    )
+    if len(inbound) >= max_needed:
+        return True
+    remaining = max_needed - len(inbound)
+    if remaining <= 0:
+        return True
+    outbound = context.db.list_message_events_since(
+        context.tenant_id, since_iso, limit=remaining
+    )
+    return (len(inbound) + len(outbound)) > threshold
+
+
 def _reply_to_matches(
-    tasks_dir: Path,
+    context: ChatToolContext,
     *,
     reply_to_message_id: str,
     reply_to_text: str,
@@ -1159,9 +1414,9 @@ def _reply_to_matches(
         normalized = re.sub(r"\s+", " ", normalized).strip()
         return normalized
 
-    current = _current_run_message(tasks_dir)
+    current = _current_message(context)
     if current is None:
-        return False, "run_request_missing"
+        return False, "message_context_missing"
     current_id = current.get("provider_message_id") or ""
     current_text = str(current.get("text") or "").strip()
     if reply_to_message_id and reply_to_message_id != current_id:
@@ -1171,21 +1426,22 @@ def _reply_to_matches(
     return True, "ok"
 
 
-def _final_sent_for_run(tasks_dir: Path, run_id: str) -> bool:
-    db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-    payload = db.get_kv("system", "final_sent")
-    if not isinstance(payload, dict):
+def _final_sent_for_run(context: ChatToolContext, run_id: int) -> bool:
+    if context.db is None:
         return False
-    return str(payload.get("run_id") or "") == run_id
+    try:
+        return context.db.is_run_final_sent(int(run_id))
+    except Exception:
+        return False
 
 
-def _set_final_sent(tasks_dir: Path, run_id: str) -> None:
-    db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-    db.set_kv(
-        "system",
-        "final_sent",
-        {"run_id": run_id, "at": datetime.now(tz=timezone.utc).isoformat()},
-    )
+def _set_final_sent(context: ChatToolContext, run_id: int) -> None:
+    if context.db is None:
+        return
+    try:
+        context.db.set_run_final_sent(int(run_id))
+    except Exception:
+        return
 
 
 def _strip_urls(text: str) -> str:
@@ -1194,45 +1450,54 @@ def _strip_urls(text: str) -> str:
     return cleaned.strip()
 
 
-def _persist_quote(tasks_dir: Path, key: str, payload: dict[str, Any]) -> None:
-    path = tasks_dir / f"{key}.json"
+def _persist_quote(context: ChatToolContext, key: str, payload: dict[str, Any]) -> None:
+    path = context.tasks_dir / f"{key}.json"
     try:
         path.write_text(json.dumps(payload, indent=2))
     except OSError:
         pass
+    if context.db is None or context.tenant_id is None:
+        return
     try:
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        db.set_kv("billing", key, payload)
+        context.db.set_tenant_kv(context.tenant_id, "billing", key, payload)
     except Exception:
         return
 
 
 def _load_payment_url(
-    tasks_dir: Path,
+    context: ChatToolContext,
     *,
     source: str | None = None,
     order_id: int | None = None,
 ) -> str | None:
-    billing_status = tasks_dir / "billing_status.json"
-    if billing_status.exists():
+    def _extract_payment_url(path: Path) -> str | None:
+        if not path.exists():
+            return None
         try:
-            payload = json.loads(billing_status.read_text())
+            payload = json.loads(path.read_text())
         except (OSError, json.JSONDecodeError):
-            payload = None
-        if isinstance(payload, dict):
-            if order_id is not None:
-                try:
-                    stored_id = int(payload.get("order_id"))
-                except (TypeError, ValueError):
-                    stored_id = None
-                if stored_id == order_id:
-                    url = str(payload.get("payment_url") or "").strip()
-                    if url:
-                        return url
-            else:
-                url = str(payload.get("payment_url") or "").strip()
-                if url:
-                    return url
+            return None
+        if not isinstance(payload, dict):
+            return None
+        if order_id is not None:
+            try:
+                stored_id = int(payload.get("order_id"))
+            except (TypeError, ValueError):
+                stored_id = None
+            if stored_id != order_id:
+                return None
+        url = str(payload.get("payment_url") or "").strip()
+        return url or None
+
+    run_id = _current_run_id(context)
+    if run_id is not None:
+        url = _extract_payment_url(context.tasks_dir / f"billing_status_{run_id}.json")
+        if url:
+            return url
+
+    url = _extract_payment_url(context.tasks_dir / "billing_status.json")
+    if url:
+        return url
 
     candidates: list[Path] = []
     keys: list[str] = []
@@ -1245,37 +1510,37 @@ def _load_payment_url(
     else:
         keys.extend(["assistant_quote", "backend_quote", "domain_quote"])
 
-    try:
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        for key in keys:
-            payload = db.get_kv("billing", key)
-            if not isinstance(payload, dict):
-                continue
-            if order_id is not None:
-                try:
-                    stored_id = int(payload.get("order_id"))
-                except (TypeError, ValueError):
-                    stored_id = None
-                if stored_id is not None and stored_id != order_id:
+    if context.db is not None and context.tenant_id is not None:
+        try:
+            for key in keys:
+                payload = context.db.get_tenant_kv(context.tenant_id, "billing", key)
+                if not isinstance(payload, dict):
                     continue
-            url = str(payload.get("payment_url") or "").strip()
-            if url:
-                return url
-    except Exception:
-        pass
+                if order_id is not None:
+                    try:
+                        stored_id = int(payload.get("order_id"))
+                    except (TypeError, ValueError):
+                        stored_id = None
+                    if stored_id is not None and stored_id != order_id:
+                        continue
+                url = str(payload.get("payment_url") or "").strip()
+                if url:
+                    return url
+        except Exception:
+            pass
 
     if source == "backend":
-        candidates.append(tasks_dir / "backend_quote.json")
+        candidates.append(context.tasks_dir / "backend_quote.json")
     elif source == "domain":
-        candidates.append(tasks_dir / "domain_quote.json")
+        candidates.append(context.tasks_dir / "domain_quote.json")
     elif source == "assistant":
-        candidates.append(tasks_dir / "assistant_quote.json")
+        candidates.append(context.tasks_dir / "assistant_quote.json")
     else:
         candidates.extend(
             [
-                tasks_dir / "assistant_quote.json",
-                tasks_dir / "backend_quote.json",
-                tasks_dir / "domain_quote.json",
+                context.tasks_dir / "assistant_quote.json",
+                context.tasks_dir / "backend_quote.json",
+                context.tasks_dir / "domain_quote.json",
             ]
         )
     for path in candidates:
@@ -1338,7 +1603,8 @@ def _migrate_current_task_context(tasks_dir: Path, target_tasks_dir: Path) -> bo
         "memory_prompt.md",
         "inflight_updates.jsonl",
         "inflight_consumed.jsonl",
-        "run_request.json",
+        "interaction_updates.jsonl",
+        "interaction_request.json",
         "run_result.json",
         "outbound_messages.jsonl",
         "tool_runs.jsonl",

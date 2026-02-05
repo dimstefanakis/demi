@@ -6,6 +6,7 @@ import json
 from typing import Any
 
 from supabase import Client, create_client
+from postgrest.exceptions import APIError
 
 from demi.models import NormalizedMessage, Tenant
 
@@ -36,6 +37,25 @@ class SupabaseDatabase:
         if error:
             raise RuntimeError(str(error))
         return getattr(response, "data", None)
+
+    @staticmethod
+    def _is_unique_violation_error(exc: Exception) -> bool:
+        if isinstance(exc, APIError):
+            try:
+                if exc.code == "23505":
+                    return True
+            except Exception:
+                pass
+        message = str(exc).lower()
+        if "23505" in message:
+            return True
+        if "duplicate key value" in message:
+            return True
+        if "violates unique constraint" in message:
+            return True
+        if "unique constraint" in message:
+            return True
+        return False
 
     def _select_one(self, table: str, **filters: Any) -> dict[str, Any] | None:
         query = self._table(table).select("*")
@@ -160,6 +180,22 @@ class SupabaseDatabase:
         )
         return list(data or [])
 
+    def list_event_jobs(
+        self,
+        tenant_id: int | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = self._table("event_jobs").select("*").order("id", desc=False)
+        if tenant_id is not None:
+            query = query.eq("tenant_id", tenant_id)
+        if status:
+            query = query.eq("status", status)
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
     def mark_event_job_running(self, job_id: int) -> None:
         now = datetime.now(tz=timezone.utc).isoformat()
         self._execute(
@@ -205,14 +241,6 @@ class SupabaseDatabase:
         )
 
     def record_message(self, tenant_id: int, msg: NormalizedMessage) -> tuple[int, bool]:
-        existing = self._select_one(
-            "messages",
-            tenant_id=tenant_id,
-            provider_message_id=msg.provider_message_id,
-        )
-        if existing:
-            return int(existing["id"]), False
-
         payload = {
             "tenant_id": tenant_id,
             "provider": msg.provider,
@@ -223,10 +251,24 @@ class SupabaseDatabase:
             "status": "received",
             "project_name": msg.project_name,
         }
-        data = self._execute(self._table("messages").insert(payload))
-        if not data:
+        try:
+            data = self._execute(self._table("messages").insert(payload))
+        except (APIError, RuntimeError) as exc:
+            if self._is_unique_violation_error(exc):
+                data = None
+            else:
+                raise
+        if data:
+            return int(data[0]["id"]), True
+
+        existing = self._select_one(
+            "messages",
+            tenant_id=tenant_id,
+            provider_message_id=msg.provider_message_id,
+        )
+        if not existing:
             raise RuntimeError("message_insert_failed")
-        return int(data[0]["id"]), True
+        return int(existing["id"]), False
 
     def update_message_status(self, message_id: int, status: str) -> None:
         self._execute(
@@ -239,6 +281,116 @@ class SupabaseDatabase:
             .update({"project_name": project_name})
             .eq("id", message_id)
         )
+
+    def record_message_event(
+        self,
+        *,
+        tenant_id: int,
+        direction: str,
+        provider: str | None,
+        tenant_external_id: str | None,
+        message_type: str | None,
+        text: str | None,
+        project_name: str | None,
+        run_id: int | None,
+        reply_to_message_id: str | None,
+        provider_message_id: str | None,
+        metadata: dict[str, Any] | None = None,
+        created_at: str | None = None,
+    ) -> None:
+        now = created_at or datetime.now(tz=timezone.utc).isoformat()
+        payload = {
+            "tenant_id": tenant_id,
+            "direction": direction,
+            "provider": provider,
+            "tenant_external_id": tenant_external_id,
+            "message_type": message_type,
+            "text": text,
+            "project_name": project_name,
+            "run_id": run_id,
+            "reply_to_message_id": reply_to_message_id,
+            "provider_message_id": provider_message_id,
+            "metadata_json": metadata,
+            "created_at": now,
+        }
+        self._execute(self._table("message_events").insert(payload))
+
+    def list_message_events(
+        self,
+        tenant_id: int | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = self._table("message_events").select("*").order("created_at", desc=False)
+        if tenant_id is not None:
+            query = query.eq("tenant_id", tenant_id)
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
+    def list_messages_since(
+        self,
+        tenant_id: int,
+        since: str,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("messages")
+            .select("id, received_at")
+            .eq("tenant_id", tenant_id)
+            .gt("received_at", since)
+            .order("received_at", desc=False)
+        )
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
+    def list_message_events_since(
+        self,
+        tenant_id: int,
+        since: str,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("message_events")
+            .select("id, created_at")
+            .eq("tenant_id", tenant_id)
+            .gt("created_at", since)
+            .order("created_at", desc=False)
+        )
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
+    def get_latest_message_received_at(self, tenant_id: int) -> str | None:
+        query = (
+            self._table("messages")
+            .select("received_at")
+            .eq("tenant_id", tenant_id)
+            .order("received_at", desc=True)
+            .limit(1)
+        )
+        data = self._execute(query)
+        if not data:
+            return None
+        value = data[0].get("received_at")
+        return str(value) if value else None
+
+    def get_latest_message_event_at(self, tenant_id: int) -> str | None:
+        query = (
+            self._table("message_events")
+            .select("created_at")
+            .eq("tenant_id", tenant_id)
+            .order("created_at", desc=True)
+            .limit(1)
+        )
+        data = self._execute(query)
+        if not data:
+            return None
+        value = data[0].get("created_at")
+        return str(value) if value else None
 
     def get_next_pending_message(
         self, tenant_id: int, project_name: str | None = None
@@ -388,12 +540,34 @@ class SupabaseDatabase:
         data = self._execute(query)
         return data[0] if data else None
 
+    def list_recent_runs(
+        self,
+        tenant_id: int,
+        project_name: str | None = None,
+        limit: int = 5,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("runs")
+            .select(
+                "id, status, started_at, finished_at, error, result_summary, tool_summary_json"
+            )
+            .eq("tenant_id", tenant_id)
+            .order("started_at", desc=True)
+            .limit(limit)
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        data = self._execute(query)
+        return list(data or [])
+
     def create_run(
         self,
         tenant_id: int,
         message_id: int | None = None,
         project_name: str | None = None,
         lease_seconds: int | None = None,
+        task_path: str | None = None,
+        session_id: str | None = None,
     ) -> int:
         now_dt = datetime.now(tz=timezone.utc)
         lease_expires = None
@@ -409,6 +583,8 @@ class SupabaseDatabase:
             "total_cost_usd": None,
             "usage_json": None,
             "project_name": project_name,
+            "task_path": task_path,
+            "session_id": session_id,
             "lease_expires_at": lease_expires,
             "last_heartbeat_at": now_dt.isoformat(),
             "last_activity_at": now_dt.isoformat(),
@@ -416,6 +592,113 @@ class SupabaseDatabase:
         data = self._execute(self._table("runs").insert(payload))
         if not data:
             raise RuntimeError("run_create_failed")
+        return int(data[0]["id"])
+
+    def update_run_context(
+        self,
+        run_id: int,
+        *,
+        task_path: str | None = None,
+        session_id: str | None = None,
+    ) -> None:
+        updates: dict[str, Any] = {}
+        if task_path is not None:
+            updates["task_path"] = task_path
+        if session_id is not None:
+            updates["session_id"] = session_id
+        if not updates:
+            return
+        self._execute(self._table("runs").update(updates).eq("id", run_id))
+
+    def update_run_timestamps(
+        self,
+        run_id: int,
+        *,
+        started_at: str | None = None,
+        lease_expires_at: str | None = None,
+        last_heartbeat_at: str | None = None,
+        last_activity_at: str | None = None,
+    ) -> None:
+        updates: dict[str, Any] = {}
+        if started_at is not None:
+            updates["started_at"] = started_at
+        if lease_expires_at is not None:
+            updates["lease_expires_at"] = lease_expires_at
+        if last_heartbeat_at is not None:
+            updates["last_heartbeat_at"] = last_heartbeat_at
+        if last_activity_at is not None:
+            updates["last_activity_at"] = last_activity_at
+        if not updates:
+            return
+        self._execute(self._table("runs").update(updates).eq("id", run_id))
+
+    def set_run_final_sent(self, run_id: int) -> None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        self._execute(
+            self._table("runs")
+            .update({"final_sent_at": now})
+            .eq("id", run_id)
+        )
+
+    def is_run_final_sent(self, run_id: int) -> bool:
+        row = self._select_one("runs", id=run_id)
+        if not row:
+            return False
+        return bool(row.get("final_sent_at"))
+
+    def get_message(self, message_id: int) -> dict[str, Any] | None:
+        return self._select_one("messages", id=message_id)
+
+    def get_message_by_provider_id(
+        self, tenant_id: int, provider_message_id: str
+    ) -> dict[str, Any] | None:
+        return self._select_one(
+            "messages",
+            tenant_id=tenant_id,
+            provider_message_id=provider_message_id,
+        )
+
+    def set_tenant_kv(
+        self, tenant_id: int, namespace: str, key: str, value: dict[str, Any] | None
+    ) -> None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        payload = {
+            "tenant_id": tenant_id,
+            "namespace": namespace,
+            "key": key,
+            "value_json": value,
+            "updated_at": now,
+        }
+        self._execute(
+            self._table("tenant_state")
+            .upsert(payload, on_conflict="tenant_id,namespace,key")
+        )
+
+    def get_tenant_kv(self, tenant_id: int, namespace: str, key: str) -> dict[str, Any] | None:
+        row = (
+            self._table("tenant_state")
+            .select("value_json")
+            .eq("tenant_id", tenant_id)
+            .eq("namespace", namespace)
+            .eq("key", key)
+            .limit(1)
+        )
+        data = self._execute(row)
+        if not data:
+            return None
+        payload = data[0].get("value_json")
+        return payload if isinstance(payload, dict) else None
+
+    def record_tenant_event(self, tenant_id: int, event_type: str, payload: dict[str, Any]) -> int:
+        row = {
+            "tenant_id": tenant_id,
+            "event_type": event_type,
+            "payload_json": payload,
+            "received_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        data = self._execute(self._table("tenant_events").insert(row))
+        if not data:
+            raise RuntimeError("tenant_event_create_failed")
         return int(data[0]["id"])
 
     def create_run_input(
@@ -486,6 +769,15 @@ class SupabaseDatabase:
         data = self._execute(query)
         return len(data or [])
 
+    def cancel_run_inputs_for_run(self, run_id: int) -> int:
+        data = self._execute(
+            self._table("run_inputs")
+            .update({"status": "cancelled"})
+            .eq("run_id", run_id)
+            .in_("status", ["queued", "claimed"])
+        )
+        return len(data or [])
+
     def fetch_run_inputs(
         self,
         tenant_id: int,
@@ -507,6 +799,20 @@ class SupabaseDatabase:
             query = query.limit(limit)
         data = self._execute(query)
         return list(data or [])
+
+    def count_run_inputs(
+        self,
+        tenant_id: int,
+        project_name: str | None = None,
+        status: str | None = None,
+    ) -> int:
+        query = self._table("run_inputs").select("id").eq("tenant_id", tenant_id)
+        if project_name:
+            query = query.eq("project_name", project_name)
+        if status:
+            query = query.eq("status", status)
+        data = self._execute(query)
+        return len(data or [])
 
     def fetch_queued_run_input_groups(self, limit: int = 25) -> list[dict[str, Any]]:
         data = self._execute(
@@ -535,7 +841,13 @@ class SupabaseDatabase:
             "created_at": datetime.now(tz=timezone.utc).isoformat(),
             "sent_at": None,
         }
-        data = self._execute(self._table("outbox").insert(payload_row))
+        try:
+            data = self._execute(self._table("outbox").insert(payload_row))
+        except (APIError, RuntimeError) as exc:
+            if self._is_unique_violation_error(exc):
+                data = None
+            else:
+                raise
         if not data:
             row = self._select_one(
                 "outbox",
@@ -549,6 +861,22 @@ class SupabaseDatabase:
 
     def claim_outbox(self, limit: int = 25) -> list[dict[str, Any]]:
         data = self._execute(self.client.rpc("claim_outbox", {"p_limit": limit}))
+        return list(data or [])
+
+    def list_outbox(
+        self,
+        tenant_id: int | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        query = self._table("outbox").select("*").order("created_at", desc=False)
+        if tenant_id is not None:
+            query = query.eq("tenant_id", tenant_id)
+        if status:
+            query = query.eq("status", status)
+        if limit:
+            query = query.limit(limit)
+        data = self._execute(query)
         return list(data or [])
 
     def update_outbox_statuses(self, ids: list[str], status: str) -> None:
@@ -588,6 +916,15 @@ class SupabaseDatabase:
             query = query.eq("project_name", project_name)
         data = self._execute(query)
         return data[0] if data else None
+
+    def list_active_runs(self, limit: int = 50) -> list[dict[str, Any]]:
+        data = self._execute(
+            self._table("active_runs")
+            .select("*")
+            .order("updated_at", desc=False)
+            .limit(limit)
+        )
+        return list(data or [])
 
     def clear_active_run(self, tenant_id: int, project_name: str | None) -> None:
         query = self._table("active_runs").delete().eq("tenant_id", tenant_id)
@@ -641,6 +978,32 @@ class SupabaseDatabase:
             return
         payload: dict[str, Any] = {"total_cost_usd": total_cost_usd, "usage_json": usage}
         self._execute(self._table("runs").update(payload).eq("id", run_id))
+
+    def update_run_decision(self, run_id: int, decision: dict[str, Any] | None) -> None:
+        if decision is None:
+            return
+        self._execute(
+            self._table("runs")
+            .update({"interaction_decision_json": decision})
+            .eq("id", run_id)
+        )
+
+    def update_run_result_summary(self, run_id: int, summary: str | None) -> None:
+        if summary is None:
+            return
+        self._execute(self._table("runs").update({"result_summary": summary}).eq("id", run_id))
+
+    def update_run_tool_summary(self, run_id: int, summary: dict[str, Any] | None) -> None:
+        if summary is None:
+            return
+        self._execute(
+            self._table("runs").update({"tool_summary_json": summary}).eq("id", run_id)
+        )
+
+    def update_run_tool_runs(self, run_id: int, tool_runs: list[dict[str, Any]] | None) -> None:
+        if tool_runs is None:
+            return
+        self._execute(self._table("runs").update({"tool_runs_json": tool_runs}).eq("id", run_id))
 
     @staticmethod
     def _looks_like_raw_usage(payload: dict[str, Any]) -> bool:
@@ -824,6 +1187,58 @@ class SupabaseDatabase:
         if data:
             return data[0]
         return None
+
+    def get_latest_paid_billing_order(
+        self,
+        tenant_id: int,
+        *,
+        order_type_prefix: str | None = None,
+        statuses: set[str] | None = None,
+    ) -> dict[str, Any] | None:
+        status_list = sorted(statuses or {"paid", "active", "cancel_scheduled"})
+        query = (
+            self._table("billing_orders")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .in_("status", status_list)
+        )
+        if order_type_prefix:
+            query = query.like("order_type", f"{order_type_prefix}%")
+        data = self._execute(query.order("id", desc=True).limit(1))
+        if data:
+            return data[0]
+        return None
+
+    def sum_run_costs(
+        self,
+        tenant_id: int,
+        *,
+        started_after: str | None = None,
+    ) -> float:
+        query = (
+            self._table("runs")
+            .select("total:total_cost_usd.sum()")
+            .eq("tenant_id", tenant_id)
+        )
+        if started_after:
+            query = query.gte("started_at", started_after)
+        data = self._execute(query)
+        if not data:
+            return 0.0
+        row = data[0] if isinstance(data, list) else data
+        raw = None
+        if isinstance(row, dict):
+            raw = row.get("total")
+            if raw is None:
+                raw = row.get("sum")
+            if raw is None:
+                raw = row.get("total_cost_usd")
+        if raw is None:
+            return 0.0
+        try:
+            return float(raw)
+        except (TypeError, ValueError):
+            return 0.0
 
     def upsert_supabase_project(
         self,

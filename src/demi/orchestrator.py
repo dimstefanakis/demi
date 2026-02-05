@@ -8,6 +8,7 @@ import json
 import re
 import asyncio
 import httpx
+import uuid
 
 from demi.db.core import Database
 from demi.models import Attachment, NormalizedMessage, OrchestratorResult
@@ -18,9 +19,8 @@ from demi.memory import build_memory_prompt, build_summarization_prompt, read_lo
 from demi.memory.logs import append_log, write_chat_history
 
 from demi.failure_guard import clear_block, get_block, record_hard_failure
-from demi.tenant_db import ensure_tenant_db
 from demi.workspace.project_decider import decide_project
-from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager
+from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager, MAX_REPO_NAME_LENGTH
 from demi.config import Settings
 
 
@@ -41,33 +41,39 @@ class Orchestrator:
         if not inserted:
             return OrchestratorResult(status="duplicate", detail="message already processed")
 
-        msg, project_name = self._resolve_project_for_tenant(tenant, msg)
+        msg, project_name = self._resolve_project_from_message(msg)
         if project_name:
             self.db.update_message_project(message_id, project_name)
         user_payload = (msg.text or "").strip()
         if not user_payload and msg.images:
             user_payload = "(attachment)"
         workspace = await self._resolve_workspace(tenant, project_name=project_name)
-
+        if not project_name and workspace.project_name:
+            project_name = workspace.project_name
+            msg.project_name = project_name
+            self.db.update_message_project(message_id, project_name)
         if self._is_reset_command(user_payload):
             self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
             write_chat_history(workspace.tasks_dir)
             self._reset_state(workspace, tenant, project_name=project_name)
             self.db.update_message_status(message_id, "processed")
-            await self._send_interaction_message(
-                workspace,
-                tenant,
-                msg,
-                "Reset done. I cleared stuck runs and pending requests. "
-                "Send your request again and I’ll pick it up.",
+            await self._send_interaction_instruction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                instruction=(
+                    "Let the user know the reset is complete and they can resend their request."
+                ),
+                run_id=None,
+                message_id=message_id,
             )
             return OrchestratorResult(status="accepted", detail="reset")
 
         if await self._handle_blocked(workspace.tasks_dir, tenant, user_payload=user_payload):
+            self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
+            write_chat_history(workspace.tasks_dir)
             self.db.update_message_status(message_id, "processed")
             return OrchestratorResult(status="blocked", detail="system_blocked")
-        self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
-        write_chat_history(workspace.tasks_dir)
 
         settings = Settings()
         self.db.expire_stale_runs(tenant.id, project_name, self._now())
@@ -85,6 +91,158 @@ class Orchestrator:
                 self.db.clear_active_run(tenant.id, project_name)
                 active_run = None
 
+        billing_status: dict[str, Any] | None = None
+        billing_checked_at: str | None = None
+        self._write_interaction_context(
+            workspace=workspace,
+            tenant=tenant,
+            msg=msg,
+            message_id=message_id,
+            project_name=project_name,
+            active_run=active_run,
+            inflight_run=inflight_run,
+            billing_status=None,
+            billing_checked_at=None,
+        )
+
+        decision_result = await self._route_interaction(
+            workspace=workspace,
+            tenant=tenant,
+            msg=msg,
+            message_id=message_id,
+        )
+        if not self._interaction_decision_valid(decision_result):
+            append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+            try:
+                self.db.update_message_status(message_id, "failed")
+            except Exception:
+                pass
+            raise RuntimeError("interaction_route_invalid_decision")
+        decision, interaction_usage = self._normalize_interaction_decision(
+            decision_result, project_name=project_name, billing_checked=False
+        )
+
+        if decision.get("billing_check") and not decision.get("billing_checked"):
+            billing_status = await self._fetch_billing_status(
+                tenant=tenant,
+                msg=msg,
+                project_name=project_name,
+                tasks_dir=workspace.tasks_dir,
+            )
+            if billing_status is not None:
+                if not active_run and not inflight_run:
+                    self._write_billing_status(workspace.tasks_dir, billing_status)
+            billing_checked_at = self._now().isoformat()
+            self._write_interaction_context(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                message_id=message_id,
+                project_name=project_name,
+                active_run=active_run,
+                inflight_run=inflight_run,
+                billing_status=billing_status,
+                billing_checked_at=billing_checked_at,
+            )
+            decision_result = await self._route_interaction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                message_id=message_id,
+                billing_checked=True,
+            )
+            if not self._interaction_decision_valid(decision_result):
+                append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+                try:
+                    self.db.update_message_status(message_id, "failed")
+                except Exception:
+                    pass
+                raise RuntimeError("interaction_route_invalid_decision")
+            decision, interaction_usage = self._normalize_interaction_decision(
+                decision_result, project_name=project_name, billing_checked=True
+            )
+
+        decision_project = decision.get("project_name") or project_name or workspace.project_name
+        if decision_project:
+            decision_project = self.workspace_manager.normalize_project_name(decision_project)
+            if project_name != decision_project:
+                self.db.update_message_project(message_id, decision_project)
+            project_name = decision_project
+            msg.project_name = decision_project
+        if project_name and project_name != workspace.project_name:
+            workspace = await self._resolve_workspace(tenant, project_name=project_name)
+            inflight_run = self.db.get_inflight_run(tenant.id, project_name)
+            active_run = self.db.get_active_run(tenant.id, project_name)
+            self._write_interaction_context(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                message_id=message_id,
+                project_name=project_name,
+                active_run=active_run,
+                inflight_run=inflight_run,
+                billing_status=billing_status,
+                billing_checked_at=billing_checked_at,
+            )
+
+        self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
+        write_chat_history(workspace.tasks_dir)
+
+        if decision.get("repo_name") and decision.get("should_run"):
+            self._write_repo_name(workspace.tasks_dir, str(decision.get("repo_name")))
+
+        if decision.get("dedupe"):
+            self.db.update_message_status(message_id, "processed")
+            return OrchestratorResult(status="accepted", detail="no_run")
+
+        if not decision.get("should_run"):
+            self.db.update_message_status(message_id, "processed")
+            return OrchestratorResult(status="accepted", detail="no_run")
+
+        if active_run and decision.get("supersede_active_run"):
+            superseded_run_id = None
+            try:
+                cancel_project = active_run.get("project_name") if isinstance(active_run, dict) else None
+            except Exception:
+                cancel_project = None
+            cancel_project = cancel_project or project_name
+            try:
+                workspace_for_cancel = await self._resolve_workspace(
+                    tenant, project_name=cancel_project
+                )
+                if hasattr(self.agent, "cancel_run"):
+                    await self.agent.cancel_run(workspace_for_cancel)
+            except Exception:
+                pass
+            try:
+                superseded_run_id = int(active_run["run_id"])
+                self.db.finish_run(superseded_run_id, status="failed", error="superseded")
+            except Exception:
+                pass
+            if superseded_run_id is not None:
+                try:
+                    run_row = self.db.get_run(superseded_run_id)
+                except Exception:
+                    run_row = None
+                message_id = None
+                if run_row is not None:
+                    try:
+                        message_id = run_row.get("message_id") if hasattr(run_row, "get") else run_row["message_id"]
+                    except Exception:
+                        message_id = None
+                if message_id:
+                    try:
+                        self.db.update_message_status(int(message_id), "failed")
+                    except Exception:
+                        pass
+                try:
+                    self.db.cancel_run_inputs_for_run(superseded_run_id)
+                except Exception:
+                    pass
+            self.db.clear_active_run(tenant.id, project_name)
+            self._clear_inflight_stream(tenant.key, project_name)
+            active_run = None
+
         if active_run:
             self.db.update_message_status(message_id, "queued")
             self._enqueue_run_input(
@@ -94,9 +252,13 @@ class Orchestrator:
                 message_id=message_id,
                 msg=msg,
                 status="queued",
+                routing_decision=decision,
             )
+            if not decision.get("reply_sent"):
+                await self._send_busy_ack(
+                    workspace=workspace, tenant=tenant, msg=msg, message_id=message_id
+                )
             self._write_request_status(workspace, tenant)
-            await self._send_busy_ack(workspace, tenant, msg)
             return OrchestratorResult(status="busy", detail="tenant already running")
 
         lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
@@ -106,6 +268,9 @@ class Orchestrator:
             project_name=workspace.project_name,
             lease_seconds=settings.run_lease_seconds,
         )
+        if interaction_usage is not None:
+            self._record_interaction_usage(run_id, interaction_usage, workspace.tasks_dir)
+        self.db.update_run_decision(run_id, decision)
         self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
         run_input_id = self._enqueue_run_input(
             tenant_id=tenant.id,
@@ -114,7 +279,20 @@ class Orchestrator:
             message_id=message_id,
             msg=msg,
             status="claimed",
+            routing_decision=decision,
         )
+        if not decision.get("reply_sent"):
+            await self._send_interaction_instruction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=msg,
+                instruction=(
+                    "Acknowledge the user's request and say you're starting the work. "
+                    "Keep it brief and non-technical."
+                ),
+                run_id=run_id,
+                message_id=message_id,
+            )
         return await self._run_message(
             tenant=tenant,
             msg=msg,
@@ -124,6 +302,8 @@ class Orchestrator:
             run_input_ids=[run_input_id],
             process_queue=True,
             project_name=project_name,
+            billing_status=billing_status,
+            routing_decision=decision,
         )
 
     async def handle_event_job(
@@ -138,10 +318,12 @@ class Orchestrator:
 
         project_name = self._resolve_project_from_payload(payload)
         workspace = await self._resolve_workspace(tenant, project_name=project_name)
+        if not project_name and workspace.project_name:
+            project_name = workspace.project_name
         event_intent = str(payload.get("intent") or "").strip()
         event_type = str(payload.get("event_type") or "").strip()
         if event_intent == "system_blocked" or event_type == "system_blocked":
-            if not get_block(workspace.tasks_dir, "system"):
+            if not get_block(self.db, tenant.id, "system"):
                 return OrchestratorResult(status="accepted", detail="block_cleared")
         else:
             if await self._handle_blocked(workspace.tasks_dir, tenant, notify=False):
@@ -247,17 +429,17 @@ class Orchestrator:
             except Exception:
                 pass
         if notify:
-            sent = await self._maybe_send_interaction_request(
-                workspace, tenant, None, run_id=run_id
+            await self._send_interaction_instruction(
+                workspace=workspace,
+                tenant=tenant,
+                msg=None,
+                instruction=(
+                    "Let the user know the current run was stopped and they can resend "
+                    "their request when ready."
+                ),
+                run_id=run_id,
+                message_id=int(message_id) if message_id else None,
             )
-            if not sent:
-                await self._send_interaction_message(
-                    workspace,
-                    tenant,
-                    None,
-                    "I stopped the current run. Send your request again when ready.",
-                    run_id=run_id,
-                )
         return OrchestratorResult(status="accepted", detail="run_cancelled")
 
     async def _run_message(
@@ -270,6 +452,8 @@ class Orchestrator:
         project_name: str | None = None,
         run_id: int | None = None,
         run_input_ids: list[str] | None = None,
+        billing_status: dict[str, Any] | None = None,
+        routing_decision: dict[str, Any] | None = None,
     ) -> OrchestratorResult:
         workspace = await self._resolve_workspace(tenant, project_name=project_name)
         message_ids = message_ids or ([message_id] if message_id else [])
@@ -281,25 +465,21 @@ class Orchestrator:
         if msg.images and hasattr(self.messenger, "download_images"):
             asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
 
-        billing_status = None
-        if msg.provider != "event":
+        if billing_status is None and msg.provider != "event":
             billing_status = await self._fetch_billing_status(
                 tenant=tenant,
                 msg=msg,
                 project_name=workspace.project_name,
                 tasks_dir=workspace.tasks_dir,
             )
-            if billing_status is not None:
-                self._write_billing_status(workspace.tasks_dir, billing_status)
 
-        task_content = self._build_task_content(msg, asset_paths, billing_status)
-        task_path = workspace.write_task(task_content)
-        self._write_run_request(
-            workspace=workspace,
-            task_path=task_path,
-            msg=msg,
-            session_id=getattr(tenant, "session_id", None),
+        task_content = self._build_task_content(
+            msg,
+            asset_paths,
+            billing_status,
+            routing_decision=routing_decision,
         )
+        task_path = workspace.write_task(task_content)
 
         self._clear_run_artifacts(workspace.tasks_dir)
         self._maybe_prepare_compaction(workspace.tasks_dir)
@@ -313,6 +493,41 @@ class Orchestrator:
                 project_name=workspace.project_name,
                 lease_seconds=settings.run_lease_seconds,
             )
+        can_update_billing_status = True
+        inflight_run = self.db.get_inflight_run(tenant.id, workspace.project_name)
+        if inflight_run:
+            inflight_id = None
+            try:
+                inflight_id = int(inflight_run["id"])
+            except (TypeError, ValueError, KeyError):
+                inflight_id = None
+            if inflight_id is None or run_id is None or inflight_id != int(run_id):
+                can_update_billing_status = False
+        if can_update_billing_status:
+            billing_status_path = self._billing_status_path(workspace.tasks_dir)
+            if billing_status_path.exists():
+                try:
+                    billing_status_path.unlink()
+                except OSError:
+                    pass
+        if billing_status is not None:
+            if run_id is not None:
+                self._write_billing_status(workspace.tasks_dir, billing_status, run_id=run_id)
+            if can_update_billing_status:
+                self._write_billing_status(workspace.tasks_dir, billing_status)
+        task_path_value = task_path
+        try:
+            task_path_value = task_path.relative_to(workspace.tenant_root)
+        except Exception:
+            task_path_value = task_path
+        try:
+            self.db.update_run_context(
+                run_id,
+                task_path=str(task_path_value),
+                session_id=getattr(tenant, "session_id", None),
+            )
+        except Exception:
+            pass
         lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
         self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
         inflight_stream = self._ensure_inflight_stream(tenant.key, workspace.project_name)
@@ -338,14 +553,27 @@ class Orchestrator:
                 db=self.db,
                 payments=self.payments,
                 session_id=tenant.session_id,
+                run_id=run_id,
                 runtime_env=runtime_env,
             )
             if agent_result.session_id:
                 self.db.update_tenant_session(tenant.id, agent_result.session_id)
-            self.db.update_run_usage(
+            self.db.add_run_usage(
                 run_id,
                 total_cost_usd=getattr(agent_result, "total_cost_usd", None),
                 usage=getattr(agent_result, "usage", None),
+                usage_key="primary",
+            )
+            self.db.update_run_result_summary(run_id, getattr(agent_result, "summary", None))
+            tool_summary = self._build_tool_summary(workspace.tasks_dir)
+            self.db.update_run_tool_summary(run_id, tool_summary)
+            tool_runs = self._read_tool_runs(workspace.tasks_dir)
+            self.db.update_run_tool_runs(run_id, tool_runs)
+            self._write_run_result(
+                workspace.tasks_dir,
+                run_id=run_id,
+                result=agent_result,
+                tool_summary=tool_summary,
             )
             self.db.finish_run(run_id, status="completed")
             if message_ids:
@@ -354,7 +582,6 @@ class Orchestrator:
                 self.db.update_run_inputs_statuses(run_input_ids, "handled")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
-            await self._maybe_send_interaction_request(workspace, tenant, msg, run_id=run_id)
             if process_queue:
                 await self._drain_run_inputs(tenant, project_name=workspace.project_name)
             self._write_request_status(workspace, tenant)
@@ -367,17 +594,17 @@ class Orchestrator:
                 self.db.update_run_inputs_statuses(run_input_ids, "queued")
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
-            sent = await self._maybe_send_interaction_request(
-                workspace, tenant, msg, run_id=run_id
-            )
-            if not sent and msg.provider != "event":
-                await self._send_interaction_message(
-                    workspace,
-                    tenant,
-                    msg,
-                    "I hit a problem while working on that. "
-                    "Please try again in a moment.",
+            if msg.provider != "event":
+                await self._send_interaction_instruction(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=msg,
+                    instruction=(
+                        "Let the user know there was a problem while working on their request "
+                        "and to try again shortly."
+                    ),
                     run_id=run_id,
+                    message_id=message_id,
                 )
             self._write_request_status(workspace, tenant)
             raise
@@ -400,7 +627,7 @@ class Orchestrator:
             if not rows:
                 return
             run_input_ids = [str(row["id"]) for row in rows]
-            combined, message_ids = self._combine_run_inputs(rows)
+            combined, message_ids, routing_decision = self._combine_run_inputs(rows)
             if not combined:
                 self.db.update_run_inputs_statuses(run_input_ids, "queued")
                 return
@@ -413,6 +640,7 @@ class Orchestrator:
                 run_input_ids=run_input_ids,
                 process_queue=False,
                 project_name=project_name,
+                routing_decision=routing_decision,
             )
 
     @staticmethod
@@ -485,24 +713,24 @@ class Orchestrator:
                 except Exception:
                     pass
             if notify:
-                sent = await self._maybe_send_interaction_request(
-                    workspace, tenant, None, run_id=run_id
+                await self._send_interaction_instruction(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=None,
+                    instruction=(
+                        "Let the user know the run took too long and was stopped. "
+                        "Ask them to try again."
+                    ),
+                    run_id=run_id,
+                    message_id=int(message_id) if message_id else None,
                 )
-                if not sent:
-                    await self._send_interaction_message(
-                        workspace,
-                        tenant,
-                        None,
-                        "That run took too long and was stopped. "
-                        "Please try again.",
-                        run_id=run_id,
-                    )
 
     @staticmethod
     def _build_task_content(
         msg: NormalizedMessage,
         asset_paths: list[str] | None = None,
         billing_status: dict[str, Any] | None = None,
+        routing_decision: dict[str, Any] | None = None,
     ) -> str:
         message_text = (msg.text or "").strip()
         if not message_text and msg.images:
@@ -520,6 +748,21 @@ class Orchestrator:
             lines.append("\n## Saved Assets")
             for path in asset_paths:
                 lines.append(f"- {path}")
+        if routing_decision:
+            facts_only = bool(routing_decision.get("facts_only"))
+            purpose = str(routing_decision.get("purpose") or "").strip()
+            plan = str(routing_decision.get("plan") or "").strip()
+            notes = str(routing_decision.get("notes") or "").strip()
+            lines.append("\n## Routing")
+            lines.append(f"Facts-only: {facts_only}")
+            if purpose:
+                lines.append(f"Purpose: {purpose}")
+            if plan:
+                lines.append(f"Plan: {plan}")
+            if notes:
+                lines.append(f"Notes: {notes}")
+            if facts_only:
+                lines.append("Constraint: facts only, no build/edit/deploy. Reply snappy.")
         if billing_status:
             lines.append("\n## Billing")
             status = billing_status.get("status")
@@ -549,22 +792,132 @@ class Orchestrator:
             lines.append("Full payload: tasks/billing_status.json")
         return "\n".join(lines) + "\n"
 
-    @staticmethod
-    def _write_run_request(
+    async def _route_interaction(
+        self,
         *,
         workspace: Workspace,
-        task_path: Path,
+        tenant: Any,
         msg: NormalizedMessage,
-        session_id: str | None,
+        message_id: int,
+        billing_checked: bool = False,
+    ) -> Any:
+        router = getattr(self.agent, "route_interaction", None)
+        if router is None:
+            append_log(workspace.tasks_dir, "system", "interaction_router_missing")
+            try:
+                self.db.update_message_status(message_id, "failed")
+            except Exception:
+                pass
+            raise RuntimeError("interaction_router_missing")
+        try:
+            return await router(
+                workspace=workspace,
+                message=msg,
+                messenger=self.messenger,
+                tenant_id=tenant.id,
+                db=self.db,
+                payments=self.payments,
+                session_id=getattr(tenant, "session_id", None),
+                provider=msg.provider,
+                tenant_external_id=msg.tenant_external_id,
+                message_id=message_id,
+                billing_checked=billing_checked,
+            )
+        except Exception as exc:  # noqa: BLE001
+            try:
+                append_log(
+                    workspace.tasks_dir,
+                    "system",
+                    f"interaction_route_failed: {type(exc).__name__}: {exc}",
+                )
+            except Exception:
+                pass
+            try:
+                self.db.update_message_status(message_id, "failed")
+            except Exception:
+                pass
+            raise
+
+    def _normalize_interaction_decision(
+        self,
+        decision_result: Any,
+        *,
+        project_name: str | None = None,
+        billing_checked: bool = False,
+    ) -> tuple[dict[str, Any], Any | None]:
+        usage_result = None
+        decision: dict[str, Any] = {}
+        if decision_result is None:
+            decision = {}
+        elif isinstance(decision_result, dict):
+            decision = dict(decision_result)
+        else:
+            decision = dict(getattr(decision_result, "decision", {}) or {})
+            if getattr(decision_result, "total_cost_usd", None) is not None or getattr(
+                decision_result, "usage", None
+            ):
+                usage_result = decision_result
+        decision.setdefault("project_name", project_name)
+        decision.setdefault("should_run", False)
+        decision.setdefault("queue_run", False)
+        decision.setdefault("dedupe", False)
+        decision.setdefault("supersede_active_run", False)
+        decision.setdefault("ask_questions", [])
+        decision.setdefault("billing_check", False)
+        decision.setdefault("billing_checked", billing_checked)
+        decision.setdefault("reply_sent", False)
+        decision.setdefault("facts_only", False)
+        if decision.get("dedupe"):
+            decision["should_run"] = False
+        return decision, usage_result
+
+    @staticmethod
+    def _interaction_decision_valid(decision_result: Any) -> bool:
+        if decision_result is None:
+            return False
+        if isinstance(decision_result, dict):
+            payload = decision_result
+        else:
+            payload = dict(getattr(decision_result, "decision", {}) or {})
+        if not isinstance(payload, dict):
+            return False
+        if "should_run" not in payload:
+            return False
+        return isinstance(payload.get("should_run"), bool)
+
+    def _write_interaction_context(
+        self,
+        *,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage,
+        message_id: int,
+        project_name: str | None,
+        active_run: Any | None,
+        inflight_run: Any | None,
+        billing_status: dict[str, Any] | None,
+        billing_checked_at: str | None,
     ) -> None:
+        try:
+            queued = self.db.count_run_inputs(
+                tenant.id, project_name=project_name, status="queued"
+            )
+        except Exception:
+            queued = 0
+        try:
+            rows = self.db.list_recent_runs(
+                tenant.id,
+                project_name=project_name,
+                limit=5,
+            )
+            recent_runs = [dict(row) for row in rows or []]
+        except Exception:
+            recent_runs = []
         payload = {
-            "workspace_root": str(workspace.root),
-            "task_path": str(task_path),
-            "session_id": session_id,
+            "message_id": message_id,
             "message": {
                 "provider": msg.provider,
                 "provider_message_id": msg.provider_message_id,
-                "tenant_external_id": msg.tenant_external_id,
                 "received_at": msg.received_at.isoformat(),
                 "text": msg.text,
                 "images": [
@@ -576,8 +929,15 @@ class Orchestrator:
                     for image in msg.images
                 ],
             },
+            "project_name": project_name,
+            "active_run": dict(active_run) if active_run else None,
+            "inflight_run": dict(inflight_run) if inflight_run else None,
+            "queued_inputs": queued,
+            "recent_runs": recent_runs,
+            "billing_status": billing_status,
+            "billing_checked_at": billing_checked_at,
         }
-        path = workspace.tasks_dir / "run_request.json"
+        path = workspace.tasks_dir / "interaction_context.json"
         try:
             path.write_text(json.dumps(payload, indent=2))
         except OSError:
@@ -688,10 +1048,9 @@ class Orchestrator:
             "Context:\n"
             f"{intent_line}"
             f"{notify_line}"
-            "- The full event payload was stored in the project SQLite DB "
-            "(tenant.sqlite in the project root)\n"
-            "- Table: events (columns: event_type, payload_json, received_at)\n"
-            "- You may query or update this DB if needed.\n"
+            "- The full event payload was stored in Supabase (tenant_events table).\n"
+            "- Columns: event_type, payload_json, received_at.\n"
+            "- You may query or update this data if needed.\n"
         )
 
     @staticmethod
@@ -784,7 +1143,12 @@ class Orchestrator:
             pass
 
     async def _send_busy_ack(
-        self, workspace: Workspace, tenant: Any, msg: NormalizedMessage
+        self,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage,
+        *,
+        message_id: int | None = None,
     ) -> None:
         user_text = (msg.text or "").strip()
         if not user_text and msg.images:
@@ -802,6 +1166,7 @@ class Orchestrator:
             msg=msg,
             instruction=instruction,
             run_id=None,
+            message_id=message_id,
         )
         if sent:
             return
@@ -821,6 +1186,7 @@ class Orchestrator:
         msg: NormalizedMessage | None,
         instruction: str,
         run_id: int | None = None,
+        message_id: int | None = None,
     ) -> bool:
         sender = getattr(self.agent, "send_interaction_instruction", None)
         if sender is None:
@@ -837,6 +1203,8 @@ class Orchestrator:
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
+                run_id=run_id,
+                message_id=message_id,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
             return True
@@ -883,6 +1251,7 @@ class Orchestrator:
         msg: NormalizedMessage | None,
         text: str,
         run_id: int | None = None,
+        message_id: int | None = None,
     ) -> None:
         sender = getattr(self.agent, "send_interaction_message", None)
         if sender is None:
@@ -899,6 +1268,8 @@ class Orchestrator:
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
+                run_id=run_id,
+                message_id=message_id,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
         except Exception as exc:  # noqa: BLE001
@@ -910,71 +1281,6 @@ class Orchestrator:
                 )
             except Exception:
                 pass
-
-    async def _maybe_send_interaction_request(
-        self,
-        workspace: Workspace,
-        tenant: Any,
-        msg: NormalizedMessage | None,
-        run_id: int | None = None,
-    ) -> bool:
-        path = workspace.tasks_dir / "interaction_request.json"
-        if not path.exists():
-            return False
-        try:
-            payload = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            payload = None
-        try:
-            path.unlink()
-        except OSError:
-            pass
-        if not isinstance(payload, dict):
-            return False
-        kind = str(payload.get("type") or "").strip().lower()
-        if kind == "send_message":
-            text = str(payload.get("text") or "").strip()
-            if not text:
-                return False
-            final = bool(payload.get("final", False))
-            instruction = (
-                "Send the message below to the user. "
-                f"Set final to {str(final).lower()}.\n\n"
-                f"MESSAGE:\n{text}"
-            )
-            sent = await self._send_interaction_instruction(
-                workspace=workspace,
-                tenant=tenant,
-                msg=msg,
-                instruction=instruction,
-                run_id=run_id,
-            )
-            return sent
-        if kind == "send_payment_link":
-            text = str(payload.get("text") or "").strip()
-            order_id = payload.get("order_id")
-            source = str(payload.get("source") or "").strip()
-            final = bool(payload.get("final", False))
-            parts = [
-                "Send a payment link to the user using send_payment_link.",
-                f"Set final to {str(final).lower()}.",
-            ]
-            if order_id is not None:
-                parts.append(f"Order ID: {order_id}")
-            if source:
-                parts.append(f"Source: {source}")
-            if text:
-                parts.append(f"Message text:\n{text}")
-            instruction = "\n".join(parts)
-            sent = await self._send_interaction_instruction(
-                workspace=workspace,
-                tenant=tenant,
-                msg=msg,
-                instruction=instruction,
-                run_id=run_id,
-            )
-            return sent
-        return False
 
     def _record_interaction_usage(
         self,
@@ -1028,7 +1334,8 @@ class Orchestrator:
         for name in (
             "inflight_updates.jsonl",
             "inflight_consumed.jsonl",
-            "run_request.json",
+            "interaction_updates.jsonl",
+            "interaction_request.json",
             "run_result.json",
         ):
             path = workspace.tasks_dir / name
@@ -1070,7 +1377,9 @@ class Orchestrator:
                     msg = self._message_from_row(row)
                     if not msg:
                         try:
-                            received_raw = row["received_at"] if "received_at" in row.keys() else None
+                            received_raw = (
+                                row["received_at"] if "received_at" in row.keys() else None
+                            )
                             received_at = (
                                 datetime.fromisoformat(str(received_raw))
                                 if received_raw
@@ -1081,7 +1390,9 @@ class Orchestrator:
                         except Exception:
                             received_at = self._now()
                         msg = NormalizedMessage(
-                            provider=str(row.get("provider") if hasattr(row, "get") else row["provider"]),
+                            provider=str(
+                                row.get("provider") if hasattr(row, "get") else row["provider"]
+                            ),
                             provider_message_id=str(
                                 row.get("provider_message_id")
                                 if hasattr(row, "get")
@@ -1097,15 +1408,19 @@ class Orchestrator:
                             raw={},
                             project_name=project_name,
                         )
-                    self._enqueue_run_input(
-                        tenant_id=tenant.id,
-                        run_id=None,
-                        project_name=project_name,
-                        message_id=message_id,
-                        msg=msg,
-                        status="queued",
-                    )
-                    migrated += 1
+                    try:
+                        self._enqueue_run_input(
+                            tenant_id=tenant.id,
+                            run_id=None,
+                            project_name=project_name,
+                            message_id=message_id,
+                            msg=msg,
+                            status="queued",
+                        )
+                        migrated += 1
+                    except Exception as exc:  # noqa: BLE001
+                        if not self._is_run_input_duplicate(exc):
+                            raise
                 if message_ids:
                     self.db.update_message_statuses(message_ids, "processed")
         return migrated
@@ -1139,8 +1454,12 @@ class Orchestrator:
         )
 
     @staticmethod
-    def _build_run_input_payload(msg: NormalizedMessage, message_id: int) -> dict[str, Any]:
-        return {
+    def _build_run_input_payload(
+        msg: NormalizedMessage,
+        message_id: int,
+        routing_decision: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        payload = {
             "message_id": message_id,
             "provider": msg.provider,
             "provider_message_id": msg.provider_message_id,
@@ -1158,6 +1477,9 @@ class Orchestrator:
             "raw": msg.raw,
             "project_name": msg.project_name,
         }
+        if routing_decision is not None:
+            payload["routing_decision"] = routing_decision
+        return payload
 
     def _enqueue_run_input(
         self,
@@ -1168,8 +1490,13 @@ class Orchestrator:
         message_id: int,
         msg: NormalizedMessage,
         status: str = "queued",
+        routing_decision: dict[str, Any] | None = None,
     ) -> str:
-        payload = self._build_run_input_payload(msg, message_id)
+        payload = self._build_run_input_payload(
+            msg,
+            message_id,
+            routing_decision=routing_decision,
+        )
         return self.db.create_run_input(
             tenant_id=tenant_id,
             run_id=run_id,
@@ -1224,9 +1551,12 @@ class Orchestrator:
             project_name=payload.get("project_name"),
         )
 
-    def _combine_run_inputs(self, rows: list[Any]) -> tuple[NormalizedMessage | None, list[int]]:
+    def _combine_run_inputs(
+        self, rows: list[Any]
+    ) -> tuple[NormalizedMessage | None, list[int], dict[str, Any] | None]:
         messages: list[NormalizedMessage] = []
         message_ids: list[int] = []
+        routing_decision: dict[str, Any] | None = None
         for row in rows:
             msg = self._message_from_run_input(row)
             if msg:
@@ -1251,8 +1581,11 @@ class Orchestrator:
                     message_id = 0
                 if message_id:
                     message_ids.append(message_id)
+                raw_decision = payload.get("routing_decision")
+                if isinstance(raw_decision, dict):
+                    routing_decision = dict(raw_decision)
         if not messages:
-            return None, message_ids
+            return None, message_ids, routing_decision
 
         combined_text = "\n".join(
             [m.text.strip() for m in messages if m.text and m.text.strip()]
@@ -1274,6 +1607,7 @@ class Orchestrator:
                 project_name=latest.project_name,
             ),
             message_ids,
+            routing_decision,
         )
 
     def _inflight_updates_path(self, tasks_dir: Path) -> Path:
@@ -1349,10 +1683,10 @@ class Orchestrator:
         notify: bool = True,
         user_payload: str | None = None,
     ) -> bool:
-        self._ingest_tool_failures(tasks_dir)
-        block = get_block(tasks_dir, "system")
+        self._ingest_tool_failures(tasks_dir, tenant.id)
+        block = get_block(self.db, tenant.id, "system")
         if user_payload and block:
-            if notify and self._should_notify_block(tasks_dir, block):
+            if notify and self._should_notify_block(tenant.id, block):
                 payload = {
                     "event_type": "system_blocked",
                     "intent": "system_blocked",
@@ -1363,12 +1697,12 @@ class Orchestrator:
                     },
                 }
                 self.db.create_event_job(tenant.id, job_type="event", payload=payload)
-                self._mark_block_notified(tasks_dir, block)
-            self._clear_block_state(tasks_dir)
+                self._mark_block_notified(tenant.id, block)
+            self._clear_block_state(tenant.id)
             return False
         if not block:
             return False
-        if notify and self._should_notify_block(tasks_dir, block):
+        if notify and self._should_notify_block(tenant.id, block):
             payload = {
                 "event_type": "system_blocked",
                 "intent": "system_blocked",
@@ -1379,13 +1713,64 @@ class Orchestrator:
                 },
             }
             self.db.create_event_job(tenant.id, job_type="event", payload=payload)
-            self._mark_block_notified(tasks_dir, block)
+            self._mark_block_notified(tenant.id, block)
         return True
 
-    def _clear_block_state(self, tasks_dir: Path) -> None:
-        clear_block(tasks_dir, "system")
-        db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-        db.set_kv("system", "block_notified", None)
+    def _clear_block_state(self, tenant_id: int) -> None:
+        clear_block(self.db, tenant_id, "system")
+        self.db.set_tenant_kv(tenant_id, "system", "block_notified", None)
+
+    @staticmethod
+    def _looks_like_raw_usage_payload(payload: dict[str, Any]) -> bool:
+        token_keys = {
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+            "service_tier",
+            "server_tool_use",
+            "cache_creation",
+        }
+        return any(key in payload for key in token_keys)
+
+    def _usage_payload_has_primary(self, raw_usage: Any) -> bool:
+        if raw_usage is None:
+            return False
+        payload = raw_usage
+        if isinstance(raw_usage, str):
+            try:
+                payload = json.loads(raw_usage)
+            except json.JSONDecodeError:
+                return False
+        if isinstance(payload, dict):
+            if "primary" in payload:
+                return True
+            return self._looks_like_raw_usage_payload(payload)
+        return True
+
+    def _primary_usage_recorded(
+        self,
+        run_id: int,
+        total_cost: float | None,
+        usage: Any | None,
+    ) -> bool:
+        run_row = self.db.get_run(run_id)
+        if not run_row:
+            return False
+        raw_usage = (
+            run_row["usage_json"] if hasattr(run_row, "keys") else run_row.get("usage_json")
+        )
+        if self._usage_payload_has_primary(raw_usage):
+            return True
+        if usage is None and total_cost is not None:
+            existing_total = (
+                run_row["total_cost_usd"]
+                if hasattr(run_row, "keys")
+                else run_row.get("total_cost_usd")
+            )
+            if existing_total is not None and existing_total >= total_cost - 1e-6:
+                return True
+        return False
 
     def _reconcile_inflight_run(self, tenant: Any, run: Any, workspace: Workspace) -> bool:
         result_path = workspace.tasks_dir / "run_result.json"
@@ -1416,8 +1801,24 @@ class Orchestrator:
         run_id = run["id"] if hasattr(run, "keys") else run.get("id")
         total_cost = payload.get("total_cost_usd")
         usage = payload.get("usage")
-        if total_cost is not None or usage is not None:
-            self.db.update_run_usage(run_id, total_cost_usd=total_cost, usage=usage)
+        summary = payload.get("summary")
+        tool_summary = payload.get("tool_summary")
+        if (total_cost is not None or usage is not None) and not self._primary_usage_recorded(
+            run_id, total_cost, usage
+        ):
+            self.db.add_run_usage(
+                run_id,
+                total_cost_usd=total_cost,
+                usage=usage,
+                usage_key="primary",
+            )
+        if summary is not None:
+            self.db.update_run_result_summary(run_id, summary)
+        if tool_summary is not None:
+            self.db.update_run_tool_summary(run_id, tool_summary)
+        tool_runs = self._read_tool_runs(workspace.tasks_dir)
+        if tool_runs is not None:
+            self.db.update_run_tool_runs(run_id, tool_runs)
         self.db.finish_run(run_id, status=status, error=error)
         session_id = payload.get("session_id")
         if session_id:
@@ -1432,6 +1833,7 @@ class Orchestrator:
             if hasattr(run, "keys") and "project_name" in run.keys()
             else None
         )
+        self.db.clear_active_run(tenant.id, project_name)
         self._clear_inflight_stream(tenant.key, project_name)
         return True
 
@@ -1448,24 +1850,31 @@ class Orchestrator:
         if not config or not config.enabled:
             return None
         manager = GitHubRepoManager(config)
-        repo_name = self._default_repo_name(
+        repo_name = self._preferred_repo_name(
+            workspace=workspace,
+            tenant=tenant,
             prefix=config.repo_prefix,
-            tenant_id=getattr(tenant, "id", None),
-            project_name=workspace.project_name,
         )
-        try:
-            repo = await manager.ensure_repo(
-                project_root=workspace.root,
-                repo_name=repo_name,
-            )
-            token = await manager.create_repo_token(repo)
-        except Exception as exc:  # noqa: BLE001
-            append_log(
-                workspace.tasks_dir,
-                "system",
-                f"github_setup_failed: {type(exc).__name__}: {exc}",
-            )
-            return None
+        attempts = 0
+        while True:
+            try:
+                repo = await manager.ensure_repo(
+                    project_root=workspace.root,
+                    repo_name=repo_name,
+                )
+                token = await manager.create_repo_token(repo)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if self._is_repo_name_conflict(exc) and attempts < 2:
+                    repo_name = self._next_repo_name(repo_name)
+                    attempts += 1
+                    continue
+                append_log(
+                    workspace.tasks_dir,
+                    "system",
+                    f"github_setup_failed: {type(exc).__name__}: {exc}",
+                )
+                return None
         env: dict[str, str] = {
             "GITHUB_TOKEN": token,
             "GITHUB_REPO_FULL_NAME": repo.full_name,
@@ -1493,13 +1902,86 @@ class Orchestrator:
         project_part = (project_name or "main").strip() or "main"
         return f"{base_prefix}-{tenant_part}-{project_part}"
 
-    def _ingest_tool_failures(self, tasks_dir: Path) -> None:
+    @staticmethod
+    def _slug_repo_name(value: str) -> str:
+        cleaned = re.sub(r"[^a-z0-9._-]+", "-", value.strip().lower())
+        cleaned = re.sub(r"-{2,}", "-", cleaned).strip("-_")
+        if len(cleaned) > MAX_REPO_NAME_LENGTH:
+            cleaned = cleaned[:MAX_REPO_NAME_LENGTH].rstrip("-_")
+        return cleaned
+
+    @staticmethod
+    def _read_repo_name(tasks_dir: Path) -> str | None:
+        for name in ("repo_name.txt", "app_name.txt"):
+            path = tasks_dir / name
+            if not path.exists():
+                continue
+            try:
+                value = path.read_text().strip()
+            except OSError:
+                continue
+            if value:
+                return value
+        return None
+
+    def _preferred_repo_name(
+        self,
+        *,
+        workspace: Workspace,
+        tenant: Any,
+        prefix: str | None,
+    ) -> str:
+        preferred = self._read_repo_name(workspace.tasks_dir)
+        if preferred:
+            slugged = self._slug_repo_name(preferred)
+            if slugged:
+                return slugged
+        return self._default_repo_name(
+            prefix=prefix,
+            tenant_id=getattr(tenant, "id", None),
+            project_name=workspace.project_name,
+        )
+
+    @staticmethod
+    def _next_repo_name(base: str) -> str:
+        suffix = uuid.uuid4().hex[:6]
+        limit = MAX_REPO_NAME_LENGTH - len(suffix) - 1
+        trimmed = base[:limit].rstrip("-_")
+        return f"{trimmed}-{suffix}"
+
+    @staticmethod
+    def _write_repo_name(tasks_dir: Path, repo_name: str) -> None:
+        slugged = Orchestrator._slug_repo_name(repo_name)
+        if not slugged:
+            return
+        path = tasks_dir / "repo_name.txt"
+        try:
+            path.write_text(slugged + "\n")
+        except OSError:
+            return
+
+    @staticmethod
+    def _is_repo_name_conflict(error: Exception) -> bool:
+        message = str(error).lower()
+        return "github_repo_name_conflict" in message or "name_conflict" in message
+
+    @staticmethod
+    def _is_run_input_duplicate(error: Exception) -> bool:
+        message = str(error).lower()
+        if "run_inputs_dedupe_idx" in message:
+            return True
+        if "duplicate key value" in message:
+            return True
+        if "already exists" in message:
+            return True
+        return False
+
+    def _ingest_tool_failures(self, tasks_dir: Path, tenant_id: int) -> None:
         path = tasks_dir / "tool_runs.jsonl"
         if not path.exists():
             return
         try:
-            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-            cursor = db.get_kv("system", "tool_runs_cursor") or {}
+            cursor = self.db.get_tenant_kv(tenant_id, "system", "tool_runs_cursor") or {}
         except Exception:
             return
         last_ts = cursor.get("timestamp")
@@ -1520,21 +2002,23 @@ class Orchestrator:
                 status = str(result.get("status") or "").strip().lower()
                 if status in {"missing_token", "missing_org", "missing_context", "blocked"}:
                     record_hard_failure(
-                        tasks_dir,
+                        self.db,
+                        tenant_id,
                         "system",
                         reason=f"{entry.get('tool')}:{status}",
                         max_failures=2,
                     )
         if latest_ts and latest_ts != last_ts:
             try:
-                db.set_kv("system", "tool_runs_cursor", {"timestamp": latest_ts})
+                self.db.set_tenant_kv(
+                    tenant_id, "system", "tool_runs_cursor", {"timestamp": latest_ts}
+                )
             except Exception:
                 return
 
-    def _should_notify_block(self, tasks_dir: Path, block: dict[str, Any]) -> bool:
+    def _should_notify_block(self, tenant_id: int, block: dict[str, Any]) -> bool:
         try:
-            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-            cursor = db.get_kv("system", "block_notified") or {}
+            cursor = self.db.get_tenant_kv(tenant_id, "system", "block_notified") or {}
         except Exception:
             return True
         last_at = cursor.get("at")
@@ -1543,10 +2027,9 @@ class Orchestrator:
             return True
         return last_at != block_at
 
-    def _mark_block_notified(self, tasks_dir: Path, block: dict[str, Any]) -> None:
+    def _mark_block_notified(self, tenant_id: int, block: dict[str, Any]) -> None:
         try:
-            db = ensure_tenant_db(tasks_dir.parent / "tenant.sqlite")
-            db.set_kv("system", "block_notified", {"at": block.get("at")})
+            self.db.set_tenant_kv(tenant_id, "system", "block_notified", {"at": block.get("at")})
         except Exception:
             return
 
@@ -1565,7 +2048,7 @@ class Orchestrator:
             "result_summary.md",
             "summary_prompt.md",
             "memory_prompt.md",
-            "interaction_request.json",
+            "tool_runs.jsonl",
         ):
             path = tasks_dir / name
             if path.exists():
@@ -1659,9 +2142,17 @@ class Orchestrator:
             return None
 
     @staticmethod
-    def _write_billing_status(tasks_dir: Path, payload: dict[str, Any]) -> None:
+    def _billing_status_path(tasks_dir: Path, run_id: int | None = None) -> Path:
+        if run_id is None:
+            return tasks_dir / "billing_status.json"
+        return tasks_dir / f"billing_status_{run_id}.json"
+
+    @staticmethod
+    def _write_billing_status(
+        tasks_dir: Path, payload: dict[str, Any], *, run_id: int | None = None
+    ) -> None:
         try:
-            path = tasks_dir / "billing_status.json"
+            path = Orchestrator._billing_status_path(tasks_dir, run_id=run_id)
             path.write_text(json.dumps(payload, indent=2, ensure_ascii=True))
         except OSError:
             return
@@ -1744,6 +2235,79 @@ class Orchestrator:
             f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
             f"{prompt.messages[0]['content']}\n"
         )
+
+    @staticmethod
+    def _build_tool_summary(tasks_dir: Path) -> dict[str, Any] | None:
+        path = tasks_dir / "tool_runs.jsonl"
+        if not path.exists():
+            return None
+        tools: dict[str, dict[str, Any]] = {}
+        total = 0
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            tool_name = str(record.get("tool") or "").strip()
+            if not tool_name:
+                continue
+            total += 1
+            entry = tools.setdefault(tool_name, {"count": 0, "error_count": 0})
+            entry["count"] += 1
+            if record.get("error"):
+                entry["error_count"] += 1
+        return {"count": total, "tools": tools}
+
+    @staticmethod
+    def _read_tool_runs(tasks_dir: Path) -> list[dict[str, Any]] | None:
+        path = tasks_dir / "tool_runs.jsonl"
+        if not path.exists():
+            return None
+        try:
+            lines = path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return None
+        runs: list[dict[str, Any]] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                runs.append(record)
+        return runs
+
+    @staticmethod
+    def _write_run_result(
+        tasks_dir: Path,
+        *,
+        run_id: int,
+        result: Any,
+        tool_summary: dict[str, Any] | None,
+    ) -> None:
+        payload = {
+            "run_id": run_id,
+            "session_id": getattr(result, "session_id", None),
+            "summary": getattr(result, "summary", None),
+            "total_cost_usd": getattr(result, "total_cost_usd", None),
+            "usage": getattr(result, "usage", None),
+            "tool_summary": tool_summary,
+        }
+        path = tasks_dir / "run_result.json"
+        try:
+            path.write_text(json.dumps(payload, indent=2))
+        except OSError:
+            return
 
 
 @dataclass

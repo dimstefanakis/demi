@@ -82,6 +82,18 @@ class TelegramUpdateParser:
         )
 
 
+def message_has_reply(raw: Any) -> bool:
+    if not isinstance(raw, dict):
+        return False
+    message = raw.get("message") or raw.get("edited_message")
+    if not isinstance(message, dict):
+        if "reply_to_message" in raw:
+            message = raw
+        else:
+            return False
+    return bool(message.get("reply_to_message"))
+
+
 @dataclass
 class TelegramConfig:
     bot_token: str
@@ -92,9 +104,17 @@ class TelegramClient:
         self.config = config
         self._client = http_client or httpx.AsyncClient(timeout=15)
 
-    async def send_text(self, chat_id: str, text: str) -> None:
+    async def send_text(
+        self, chat_id: str, text: str, reply_to_message_id: str | None = None
+    ) -> None:
         url = f"https://api.telegram.org/bot{self.config.bot_token}/sendMessage"
-        await self._client.post(url, json={"chat_id": chat_id, "text": text})
+        payload: dict[str, Any] = {"chat_id": chat_id, "text": text}
+        if reply_to_message_id:
+            try:
+                payload["reply_to_message_id"] = int(reply_to_message_id)
+            except (TypeError, ValueError):
+                pass
+        await self._client.post(url, json=payload)
 
     async def download_images(self, images: list[Attachment], dest_dir: Path) -> list[str]:
         dest_dir.mkdir(parents=True, exist_ok=True)

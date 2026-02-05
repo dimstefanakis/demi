@@ -39,16 +39,18 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
                 │ writes/reads                  │ uses
                 ▼                               ▼
 ┌──────────────────────────────┐   ┌────────────────────────────────────────┐
-│ Main DB (SQLite/Supabase)    │   │ Workspace (data/.../projects/...)       │
-│ tenants, messages, runs,     │   │ tasks/, assets/, site/, memory.md       │
-│ run_inputs, outbox, billing  │   │ tenant.sqlite, CLAUDE.md, DESIGN.md     │
+│ Main DB (Supabase)           │   │ Workspace (data/.../projects/...)       │
+│ tenants, messages, runs      │   │ tasks/, assets/, site/, memory.md       │
+│ (tool_summary_json,          │   │ tenant.sqlite (scratchpad), CLAUDE.md   │
+│ tool_runs_json), run_inputs, │   │                                         │
+│ outbox, billing, message_events │ │                                       │
 └───────────────┬──────────────┘   └────────────────────────────────────────┘
                 │
         ┌───────▼────────────────────────────────────────────────────────────┐
-        │                         Run Decision                               │
-        │   busy -> queue run_input + Interaction Agent ack                  │
-        │          (restricted tools) -> Telegram/outbox                     │
-        │   idle -> start run (lease)                                        │
+        │                  Interaction Agent Routing                         │
+        │   - replies to the user                                            │
+        │   - decides if execution should run                                │
+        │   - can queue into active run                                      │
         └───────┬────────────────────────────────────────────────────────────┘
                 │
                 ▼
@@ -67,7 +69,8 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
             ▼           ▼
    ┌────────────────┐   ┌──────────────────────────────┐
    │ Telegram reply │   │ Assets / Repo / Backend ops   │
-   │ via chat tools │   │ (Unsplash, GitHub, Supabase)  │
+   │ via interaction│   │ (Unsplash, GitHub, Supabase)  │
+   │ agent + outbox │   │                              │
    └───────┬────────┘   └──────────────────────────────┘
            ▼
    ┌──────────────────────────────┐
@@ -89,7 +92,7 @@ Background workers (poll main DB):
 - API: FastAPI (`src/demi/app.py`)
 - Orchestration: Python (`src/demi/orchestrator.py`)
 - Agent runtime: Claude Agent SDK (`claude_agent_sdk`) with optional Docker isolation
-- Design: Gemini CLI driven by `DESIGN.md`
+- Design: Gemini CLI driven by `DESIGN.md`, editing app files directly (auto-edit mode)
 - Deploy: Vercel CLI
 - Messaging: Telegram Bot API
 - Storage: SQLite by default, Supabase optional for main DB
@@ -116,13 +119,13 @@ demi/
 │       ├── messaging/                 # Telegram + file messenger
 │       ├── workspace/                 # Workspace layout + project routing
 │       ├── memory/                    # Chat logs + memory prompts
-│       ├── db/                        # Main DB (SQLite/Supabase)
+│       ├── db/                        # Main DB (Supabase)
 │       ├── jobs/                      # Background workers
 │       └── payments/                  # Stripe helpers
 ├── docker/
 │   ├── agent.Dockerfile
 │   └── app.Dockerfile
-├── data/                              # Per-tenant workspaces + main DB
+├── data/                              # Per-tenant workspaces
 ├── tests/
 └── scripts/
 ```
@@ -146,7 +149,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Stripe: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL`, `STRIPE_CANCEL_URL`
 - Billing gate: `BILLING_STATUS_URL`, `BILLING_STATUS_TOKEN`
 - Assistant pricing: `ASSISTANT_STRIPE_PRICE_ID` (preferred) or `ASSISTANT_PRICE_USD` + `ASSISTANT_PRODUCT_NAME` + `ASSISTANT_CURRENCY`
-- Supabase main DB: `MAIN_DB_BACKEND=supabase`, `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`
+- Supabase main DB: `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`
 - Supabase managed backend: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_ORG_*`
 - GitHub App: `GITHUB_ORG`, `GITHUB_APP_*`
 - Chrome DevTools MCP: `CHROME_DEVTOOLS_MCP_*`
@@ -165,6 +168,10 @@ Purpose scoping:
 - The orchestrator attaches `purpose` and `purpose_label` to each billing check.
 - The billing system stores distinct assistant subscription orders per purpose.
 - Responses return the same purpose fields so the agent can explain what the hire covers.
+- Usage threshold: if aggregate run cost exceeds `ASSISTANT_USAGE_THRESHOLD_USD` and there is
+  no active assistant subscription, the billing status will set `payment_required=true`
+  and include `usage_total_usd` + `usage_threshold_usd`. The agent should then request
+  an assistant subscription and send the payment link.
 
 Request payload (POST JSON):
 ```json
@@ -194,7 +201,9 @@ Expected response (example):
   "purpose": "pricing-request-42",
   "purpose_label": "Pricing request",
   "price_usd": 50,
-  "currency": "USD"
+  "currency": "USD",
+  "usage_total_usd": 3.25,
+  "usage_threshold_usd": 3.0
 }
 ```
 
@@ -207,6 +216,8 @@ Each tenant has a workspace rooted under `data/<tenant_key>/` in local runtime m
 Workspace roots by runtime:
 - Local runtime: `data/<tenant_key>/`
 - Docker pool runtime: `data/pool/slot-<uuid>/` (assigned per tenant and persisted as `tenants.workspace_path`)
+- On each execution run, the agent entrypoint syncs template artifacts
+  (`.claude/`, `CLAUDE.md`, `DESIGN.md`, `.env.example`) into the project workspace if missing.
 
 ```
 data/<tenant_key>/
@@ -223,11 +234,14 @@ data/<tenant_key>/
         │   ├── memory_prompt.md
         │   ├── request_status.md
         │   ├── billing_status.json
-        │   ├── interaction_request.json
+        │   ├── billing_status_<run_id>.json
+        │   ├── interaction_context.json
+        │   ├── interaction_updates.jsonl
+        │   ├── repo_name.txt
         │   ├── tool_runs.jsonl
         │   ├── agent_events.jsonl
         │   ├── deploy_url.txt
-        │   └── run_request.json / run_result.json
+        │   └── run_result.json
         ├── assets/
         ├── site/
         ├── memory.md
@@ -243,6 +257,7 @@ data/<tenant_key>/
 - `chat_history.md` keeps a short recent transcript.
 - `chat_summary.md` is the rolling summary the agent maintains when prompted.
 - `summary_prompt.md` and `memory_prompt.md` are generated prompts the agent uses to refresh summaries and memory.
+- `tenant.sqlite` is an execution-agent scratchpad database. It is not used for orchestration or queues.
 
 **Project routing**
 - Each tenant can have multiple projects.
@@ -282,20 +297,23 @@ Flow:
 2. The webhook parser normalizes the message into a `NormalizedMessage`.
 3. The orchestrator records the message (idempotent by `provider_message_id`).
 4. Project selection is resolved (explicit directive or inferred from context).
-5. If configured, the orchestrator calls the billing status endpoint and writes `tasks/billing_status.json`.
-   Billing status no longer creates assistant orders by default; the agent explicitly requests payment links.
-6. A task brief is written to `tasks/` and logs are updated.
-7. The orchestrator writes `tasks/run_request.json` for interaction-agent reply matching (and the Docker runtime
-   reuses it when running containerized agents).
-8. If a run is in flight for the same project, the message is queued in `run_inputs` and a short acknowledgment is sent via the interaction agent.
-9. Otherwise a new run is created and leased.
-10. The agent runtime executes. The primary agent first triggers the interaction agent to send a short acknowledgment of the latest user message before any tool calls. It then reads `memory.md`, `DESCRIPTION.md`, `tasks/latest.md`, `DESIGN.md`, uses Gemini CLI and Vercel CLI as needed, and sends user-facing messages through MCP tools.
-   - If billing requires payment, primary-agent send requests are queued in `tasks/interaction_request.json`
-     and delivered via the interaction agent after the run.
-   - The agent can create an assistant subscription order by calling `request_assistant_subscription`
-     after delivering value, then sends the payment link via the interaction agent.
-11. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
-12. Any queued `run_inputs` are drained into the next run.
+5. If configured, the orchestrator calls the billing status endpoint during routing.
+   It writes `tasks/billing_status.json` when no other run is active; if a run is already in flight it writes
+   `tasks/billing_status_<run_id>.json` for the new run to avoid clobbering the in-flight payload. Billing
+   status no longer creates assistant orders by default; the agent explicitly requests payment links.
+6. The orchestrator writes `tasks/interaction_context.json` and calls the interaction agent in routing mode.
+7. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
+   - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
+8. If no run is needed, the message is marked processed. The interaction agent already replied.
+9. If a run is in flight for the same project, the message is queued in `run_inputs`. The interaction agent handles the queued ack (orchestrator only falls back if no reply was sent).
+10. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
+11. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
+    - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
+    - The agent can create an assistant subscription order by calling `request_assistant_subscription`
+      after delivering value, then sends the payment link via the interaction agent.
+12. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
+13. Any queued `run_inputs` are drained into the next run.
+14. All outbound user messages are recorded in `message_events` for replay/debugging.
 
 ---
 
@@ -312,9 +330,10 @@ Supported user-level commands in Telegram messages:
 
 Background workers poll the main DB and run in the API process or the worker container.
 
-- EventWorker: Consumes `event_jobs` from the main DB, relies on `/events` to persist payloads in `tenant.sqlite`, and triggers the orchestrator with a normalized event message.
+- EventWorker: Consumes `event_jobs` from the main DB, relies on `/events` to persist payloads in `tenant_events` (Supabase), and triggers the orchestrator with a normalized event message.
 - PendingWorker: Drains queued `run_inputs` once a project is idle and reclaims stale runs after lease expiry.
 - OutboxWorker: Sends deferred messages from the `outbox` table for busy acknowledgments and fallback notifications.
+  Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
 
 ---
 
@@ -322,7 +341,7 @@ Background workers poll the main DB and run in the API process or the worker con
 
 MCP servers are registered per agent run.
 
-- `demi-chat`: `send_message`, `should_send_message`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
+- `demi-chat`: `send_message`, `should_send_message`, `check_for_status`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
 - `demi-unsplash`: `search_photos` (Unsplash sourcing)
 - `demi-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
 - `demi-github`: `prepare_repo` (GitHub App provisioning)
@@ -350,5 +369,6 @@ See `DEPLOY.md` for the full GCE blue/green process and required secrets.
 - Environment forwarding into agent containers is allowlist-based.
 - Event webhook signatures are verified when `EVENTS_SIGNING_SECRET` is set.
 - Admin run-cancel endpoint is protected by `ADMIN_API_TOKEN`.
-- Runs are lease-based with heartbeats to prevent stuck tasks.
+- Runs are lease-based with heartbeats to prevent stuck tasks; docker execution runs maintain leases by watching
+  task artifacts (including Gemini output) and updating `last_activity_at`/`last_heartbeat_at`.
 - Tenant workspaces are isolated by path and only mounted per run.
