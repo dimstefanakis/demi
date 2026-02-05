@@ -18,6 +18,7 @@ fi
 echo "Current: ${current_color}. Deploying ${target_color}."
 
 docker build -f docker/agent.Dockerfile -t demi-agent:local .
+DOCKER_IMAGE=demi-agent:local python3 scripts/check_integrations.py --ci
 docker compose up -d --build nginx worker
 docker compose up -d --build "api_${target_color}"
 
@@ -41,7 +42,7 @@ done
 
 echo "Pruning unused Docker resources..."
 docker container prune -f || true
-docker image prune -af || true
+docker image prune -f || true
 docker builder prune -af || true
 
 echo "Deploy complete."

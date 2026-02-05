@@ -93,6 +93,70 @@ class DockerPool:
         args.extend([self.config.image, *command])
         await self._run_cmd(args)
 
+    async def cancel_workspace(self, workspace_path: Path) -> int:
+        await self._scan_existing()
+        target = Path(workspace_path).resolve()
+        to_stop: dict[str, ContainerSlot] = {}
+        for slot in list(self._idle) + list(self._assigned.values()):
+            try:
+                slot_path = slot.workspace_path.resolve()
+            except OSError:
+                slot_path = slot.workspace_path
+            if slot_path == target:
+                to_stop[slot.container_id] = slot
+
+        ids_raw = await self._run_cmd(
+            [
+                "docker",
+                "ps",
+                "--filter",
+                f"name=^{self.config.container_prefix}-",
+                "--format",
+                "{{.ID}}",
+            ]
+        )
+        ids = [line.strip() for line in ids_raw.splitlines() if line.strip()]
+        for container_id in ids:
+            if container_id in to_stop:
+                continue
+            info = await self._inspect_container(container_id)
+            if not info:
+                continue
+            mounts = info.get("Mounts") or []
+            mount_path = self._mount_source(mounts, self.config.mount_path)
+            if not mount_path:
+                continue
+            try:
+                mount_path = mount_path.resolve()
+            except OSError:
+                pass
+            if mount_path == target:
+                name = str(info.get("Name", "")).lstrip("/") or container_id
+                to_stop[container_id] = ContainerSlot(
+                    container_id=container_id,
+                    name=name,
+                    workspace_path=mount_path,
+                )
+
+        if not to_stop:
+            return 0
+
+        stopped = 0
+        for container_id in list(to_stop.keys()):
+            try:
+                await self._run_cmd(["docker", "rm", "-f", container_id])
+            except RuntimeError:
+                continue
+            stopped += 1
+
+        self._idle = [slot for slot in self._idle if slot.container_id not in to_stop]
+        self._assigned = {
+            path: slot
+            for path, slot in self._assigned.items()
+            if slot.container_id not in to_stop
+        }
+        return stopped
+
     async def _start_idle_container(self) -> ContainerSlot:
         workspace_path = self._next_workspace_path()
         workspace_path.mkdir(parents=True, exist_ok=True)

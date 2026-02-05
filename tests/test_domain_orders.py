@@ -1,12 +1,9 @@
-import json
-
-from demi.db.core import Database
+from tests.utils import build_test_db, create_test_tenant
 
 
-def test_billing_order_lifecycle(tmp_path):
-    db = Database(tmp_path / "main.sqlite")
-    db.init()
-    tenant = db.get_or_create_tenant(provider="telegram", external_id="321")
+def test_billing_order_lifecycle():
+    db = build_test_db()
+    tenant = create_test_tenant(db)
 
     order_id = db.create_billing_order(
         tenant_id=tenant.id,
@@ -25,6 +22,6 @@ def test_billing_order_lifecycle(tmp_path):
     assert order is not None
     assert order["order_type"] == "domain"
     assert order["status"] == "purchased"
-    metadata = json.loads(order["metadata_json"])
+    metadata = order["metadata_json"]
     assert metadata["domain"] == "example.com"
     assert metadata["vercel_status"] == "ok"

@@ -134,11 +134,9 @@ The agent **must not** access other tenants’ data. Enforce at multiple layers:
 - New run can be resumed with the same run_id (optional) or restarted cleanly.
 - Inputs already handled are not re-claimed.
 
-## Local SQLite (Agent Autonomy)
-- Keep `tenant.sqlite` per tenant for fully autonomous, local operations:
-  - scratchpad data, cached checks, tool logs, or lightweight structured notes.
-- Do not use SQLite to orchestrate runs or queues; orchestration stays in Supabase.
-- This keeps autonomy while preventing cross-tenant leakage and split-brain bugs.
+## Local Scratchpad (SQLite)
+- Execution agents may keep tenant-local scratchpad data in `tenant.sqlite`.
+- Do not use SQLite for orchestration or queues; authoritative state stays in Supabase.
 
 ## Minimal Migration Plan (Low-Churn)
 1) Add tables (`runs`, `run_inputs`, `outbox`, `active_runs`) + RLS policies.

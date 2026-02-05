@@ -119,7 +119,8 @@ chmod 600 /opt/demi/.env
 ```
 
 Minimum required:
-- `MAIN_DB_BACKEND=supabase`
+- `MAIN_DB_SUPABASE_URL`
+- `MAIN_DB_SUPABASE_SERVICE_KEY`
 - `MAIN_DB_SUPABASE_URL=...`
 - `MAIN_DB_SUPABASE_SERVICE_KEY=...`
 - `TELEGRAM_BOT_TOKEN=...`

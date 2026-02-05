@@ -6,7 +6,7 @@ import re
 from contextlib import suppress
 import json
 from typing import Any
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 
 from demi.agent.claude import ClaudeAgent
 from demi.config import Settings
@@ -22,9 +22,8 @@ from demi.events import normalize_event_type, verify_signature
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
-from demi.runtime.docker_agent import DockerAgent
+from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
-from demi.tenant_db import ensure_tenant_db
 from demi.workspace.core import WorkspaceManager
 
 
@@ -60,6 +59,7 @@ def create_app() -> FastAPI:
             pool_size=settings.docker_pool_size,
             pool_root=pool_root,
             mount_path=settings.docker_mount_path,
+            extra_env=load_env_file_values(settings),
         )
         pool = DockerPool(pool_config)
         agent = DockerAgent(
@@ -107,9 +107,24 @@ def create_app() -> FastAPI:
                 poll_interval=settings.outbox_worker_poll_interval,
                 batch_size=settings.outbox_worker_batch_size,
             ),
+            interaction_agent=orchestrator.agent,
+            workspace_manager=workspace_manager,
         )
 
     app = FastAPI()
+
+    def _require_admin(request: Request) -> None:
+        token = settings.admin_api_token
+        if not token:
+            raise HTTPException(status_code=404, detail="not_found")
+        auth = request.headers.get("Authorization", "")
+        candidate = ""
+        if auth.lower().startswith("bearer "):
+            candidate = auth.split(" ", 1)[1].strip()
+        if not candidate:
+            candidate = request.headers.get("X-Admin-Token", "").strip()
+        if candidate != token:
+            raise HTTPException(status_code=403, detail="forbidden")
 
     @app.on_event("startup")
     async def _migrate_legacy_queue() -> None:
@@ -224,11 +239,11 @@ def create_app() -> FastAPI:
         if tenant is None:
             return {"status": "invalid", "reason": "tenant_not_found"}
 
-        project_name = orchestrator._resolve_project_from_payload(payload)
-        workspace = await orchestrator._resolve_workspace(tenant, project_name=project_name)
-        tenant_db = ensure_tenant_db(workspace.root / "tenant.sqlite")
         event_type = normalize_event_type(payload)
-        tenant_db.record_event(event_type, payload)
+        try:
+            db.record_tenant_event(tenant.id, event_type, payload)
+        except Exception:
+            return {"status": "invalid", "reason": "event_record_failed"}
         job_payload = {
             "intent": payload.get("intent"),
             "event_type": event_type,
@@ -261,6 +276,21 @@ def create_app() -> FastAPI:
     @app.get("/health")
     async def health():
         return {"status": "ok"}
+
+    @app.post("/admin/runs/{run_id}/cancel")
+    async def cancel_run(run_id: int, request: Request):
+        _require_admin(request)
+        reason = "admin_cancelled"
+        try:
+            payload = await request.json()
+        except Exception:
+            payload = {}
+        if isinstance(payload, dict):
+            provided = str(payload.get("reason") or "").strip()
+            if provided:
+                reason = provided
+        result = await orchestrator.cancel_run(run_id, reason=reason, notify=True)
+        return {"status": result.status, "detail": result.detail}
 
     @app.post("/stripe/webhook")
     async def stripe_webhook(request: Request):
@@ -585,11 +615,12 @@ def _handle_subscription_updated(db: Database, subscription: dict[str, Any]) -> 
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] not in {
-        "managed_backend",
-    }:
-        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
-            return
+    if order_row is None:
+        return
+    order_type = order_row["order_type"]
+    emit_events = order_type in {"managed_backend"}
+    if not emit_events and not _is_assistant_order_type(order_type):
+        return
     order_id = int(order_row["id"])
     cancel_at_period_end = bool(subscription.get("cancel_at_period_end"))
     cancel_at = subscription.get("cancel_at")
@@ -603,21 +634,23 @@ def _handle_subscription_updated(db: Database, subscription: dict[str, Any]) -> 
     }
     if cancel_at_period_end:
         db.update_billing_order_status(order_id, "cancel_scheduled", metadata=metadata)
-        _emit_billing_event(
-            db,
-            order_row,
-            "backend_cancel_scheduled",
-            "managed_backend_cancel_scheduled",
-        )
+        if emit_events:
+            _emit_billing_event(
+                db,
+                order_row,
+                "backend_cancel_scheduled",
+                "managed_backend_cancel_scheduled",
+            )
         return
     if status in {"canceled", "unpaid", "incomplete_expired"}:
         db.update_billing_order_status(order_id, "canceled", metadata=metadata)
-        _emit_billing_event(
-            db,
-            order_row,
-            "backend_canceled",
-            "managed_backend_canceled",
-        )
+        if emit_events:
+            _emit_billing_event(
+                db,
+                order_row,
+                "backend_canceled",
+                "managed_backend_canceled",
+            )
         return
     db.update_billing_order_status(order_id, "active", metadata=metadata)
 
@@ -627,23 +660,25 @@ def _handle_subscription_deleted(db: Database, subscription: dict[str, Any]) -> 
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] not in {
-        "managed_backend",
-    }:
-        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
-            return
+    if order_row is None:
+        return
+    order_type = order_row["order_type"]
+    emit_events = order_type in {"managed_backend"}
+    if not emit_events and not _is_assistant_order_type(order_type):
+        return
     order_id = int(order_row["id"])
     metadata = {
         "subscription_status": subscription.get("status"),
         "canceled_at": subscription.get("canceled_at"),
     }
     db.update_billing_order_status(order_id, "canceled", metadata=metadata)
-    _emit_billing_event(
-        db,
-        order_row,
-        "backend_canceled",
-        "managed_backend_canceled",
-    )
+    if emit_events:
+        _emit_billing_event(
+            db,
+            order_row,
+            "backend_canceled",
+            "managed_backend_canceled",
+        )
 
 
 def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]) -> None:
@@ -651,29 +686,32 @@ def _handle_invoice_event(db: Database, event_type: str, invoice: dict[str, Any]
     if not subscription_id:
         return
     order_row = db.get_billing_order_by_subscription(str(subscription_id))
-    if order_row is None or order_row["order_type"] not in {
-        "managed_backend",
-    }:
-        if not _is_assistant_order_type(order_row["order_type"] if order_row else None):
-            return
+    if order_row is None:
+        return
+    order_type = order_row["order_type"]
+    emit_events = order_type in {"managed_backend"}
+    if not emit_events and not _is_assistant_order_type(order_type):
+        return
     order_id = int(order_row["id"])
     if event_type == "invoice.payment_failed":
         db.update_billing_order_status(order_id, "payment_failed")
-        _emit_billing_event(
-            db,
-            order_row,
-            "backend_payment_failed",
-            "managed_backend_payment_failed",
-        )
+        if emit_events:
+            _emit_billing_event(
+                db,
+                order_row,
+                "backend_payment_failed",
+                "managed_backend_payment_failed",
+            )
         return
     if event_type == "invoice.payment_action_required":
         db.update_billing_order_status(order_id, "payment_action_required")
-        _emit_billing_event(
-            db,
-            order_row,
-            "backend_payment_action_required",
-            "managed_backend_payment_action_required",
-        )
+        if emit_events:
+            _emit_billing_event(
+                db,
+                order_row,
+                "backend_payment_action_required",
+                "managed_backend_payment_action_required",
+            )
         return
     if event_type == "invoice.paid":
         if order_row["status"] == "cancel_scheduled":
@@ -730,6 +768,19 @@ def _is_assistant_order_type(order_type: str | None) -> bool:
     return bool(order_type and order_type.startswith("assistant_subscription"))
 
 
+def _assistant_usage_threshold(settings: Settings) -> float | None:
+    raw = settings.assistant_usage_threshold_usd
+    if raw is None:
+        return None
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if value <= 0:
+        return None
+    return value
+
+
 def _normalize_billing_purpose(value: Any | None) -> str | None:
     raw = str(value or "").strip().lower()
     if not raw:
@@ -769,6 +820,8 @@ async def _build_assistant_billing_status(
     cached_label = purpose_label
     default_currency = _assistant_currency(settings)
     default_price = settings.assistant_price_usd
+    price_id = (settings.assistant_stripe_price_id or "").strip()
+    pricing_configured = bool(price_id) or default_price is not None
     if order_row is not None:
         status = str(_row_value(order_row, "status") or "").strip().lower()
         order_id = int(_row_value(order_row, "id") or 0)
@@ -839,6 +892,29 @@ async def _build_assistant_billing_status(
                 "currency": currency,
             }
 
+    usage_threshold = _assistant_usage_threshold(settings)
+    if usage_threshold is not None and pricing_configured:
+        paid_order = db.get_latest_paid_billing_order(
+            int(tenant.id),
+            order_type_prefix="assistant_subscription",
+        )
+        if paid_order is None:
+            usage_total = db.sum_run_costs(int(tenant.id))
+            if usage_total >= usage_threshold:
+                return {
+                    "status": "usage_limit",
+                    "payment_required": True,
+                    "allow_first_build": allow_first_build,
+                    "plan": _assistant_plan_name(settings),
+                    "message": "usage_threshold_exceeded",
+                    "purpose": normalized_purpose,
+                    "purpose_label": cached_label,
+                    "price_usd": default_price,
+                    "currency": default_currency,
+                    "usage_total_usd": usage_total,
+                    "usage_threshold_usd": usage_threshold,
+                }
+
     if not create_if_missing:
         return {
             "status": "ready",
@@ -865,7 +941,6 @@ async def _build_assistant_billing_status(
             "currency": default_currency,
         }
 
-    price_id = (settings.assistant_stripe_price_id or "").strip()
     price_usd = settings.assistant_price_usd
     product_name = (settings.assistant_product_name or "Hire me").strip() or "Hire me"
     currency = _assistant_currency(settings)

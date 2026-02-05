@@ -75,14 +75,12 @@ cd /opt/demi
 cp .env.example .env
 ```
 Set at minimum:
-- `MAIN_DB_BACKEND=supabase`
 - `MAIN_DB_SUPABASE_URL=...`
 - `MAIN_DB_SUPABASE_SERVICE_KEY=...`
 - `TELEGRAM_BOT_TOKEN=...`
 - Other runtime secrets (Vercel, Unsplash, Stripe, etc)
 
-Main DB credentials are only used by the orchestrator/worker; they are not forwarded
-into tenant containers.
+Main DB credentials are forwarded into agent containers so they can load run context.
 
 ### 6) Build the agent image
 ```bash
@@ -124,9 +122,9 @@ Pushes to `main` run the deploy script on the VM.
 - Worker isolation: `worker` runs `demi.worker_entrypoint` and is separate from
   API containers, so deployments do not interrupt request handling.
 - Main DB: The orchestrator/worker use Supabase Postgres via
-  `MAIN_DB_BACKEND=supabase`. This keeps runs/messages shared across containers.
-- Tenant DB: `tenant.sqlite` remains inside each tenant workspace under `data/`.
+  `MAIN_DB_SUPABASE_URL` + `MAIN_DB_SUPABASE_SERVICE_KEY`. This keeps runs/messages shared across containers.
+- Tenant scratchpad: `tenant.sqlite` may exist in each tenant workspace for execution-agent notes/cache only.
 - Agent runtime: The API/worker use the Docker socket to run short-lived agent
-  containers. Main DB secrets are not forwarded into those tenant containers.
+  containers. Main DB credentials are forwarded so agents can load run context.
 - Reliability: If a deploy restarts the worker, stale runs are re-queued and
   drained on the next worker loop, preventing stuck runs.

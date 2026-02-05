@@ -1,14 +1,14 @@
-from pathlib import Path
-
+from tests.utils import build_test_db, create_test_tenant
 from demi.failure_guard import get_block, record_hard_failure
 
 
-def test_failure_guard_blocks_after_two(tmp_path):
-    tasks_dir = tmp_path / "tasks"
-    tasks_dir.mkdir(parents=True, exist_ok=True)
+def test_failure_guard_blocks_after_two():
+    db = build_test_db()
+    tenant = create_test_tenant(db)
 
     first = record_hard_failure(
-        tasks_dir,
+        db,
+        tenant.id,
         "managed_backend",
         reason="missing_org",
         max_failures=2,
@@ -16,11 +16,12 @@ def test_failure_guard_blocks_after_two(tmp_path):
     assert first["blocked"] is False
 
     second = record_hard_failure(
-        tasks_dir,
+        db,
+        tenant.id,
         "managed_backend",
         reason="missing_org",
         max_failures=2,
     )
     assert second["blocked"] is True
-    block = get_block(tasks_dir, "managed_backend")
+    block = get_block(db, tenant.id, "managed_backend")
     assert block is not None

@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 from dataclasses import dataclass
-import sqlite3
 from typing import Any
 
 from demi.db.core import Database
@@ -29,27 +28,19 @@ class EventWorker:
         self._running = True
         try:
             while self._running:
-                try:
-                    jobs = await self._db_call(
-                        self.db.fetch_pending_event_jobs,
-                        self.config.batch_size,
-                    )
-                except sqlite3.OperationalError as exc:
-                    if "locked" in str(exc).lower():
-                        await asyncio.sleep(self.config.poll_interval)
-                        continue
-                    raise
+                jobs = await self._db_call(
+                    self.db.fetch_pending_event_jobs,
+                    self.config.batch_size,
+                )
                 if not jobs:
                     await asyncio.sleep(self.config.poll_interval)
                     continue
                 for job in jobs:
                     try:
                         await self._handle_job(job)
-                    except sqlite3.OperationalError as exc:
-                        if "locked" in str(exc).lower():
-                            await asyncio.sleep(self.config.poll_interval)
-                            break
-                        raise
+                    except Exception:
+                        await asyncio.sleep(self.config.poll_interval)
+                        break
         except asyncio.CancelledError:
             pass
         finally:

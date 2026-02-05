@@ -2,10 +2,10 @@ from datetime import datetime, timezone
 
 import pytest
 
-from demi.db.core import Database
 from demi.models import NormalizedMessage
 from demi.orchestrator import Orchestrator
 from demi.workspace.core import WorkspaceManager
+from tests.utils import build_test_db, create_test_tenant
 
 
 class FakeAgent:
@@ -23,6 +23,7 @@ class FakeAgent:
         db=None,
         payments=None,
         session_id=None,
+        run_id=None,
         runtime_env=None,
     ):
         self.messages.append(message)
@@ -30,7 +31,7 @@ class FakeAgent:
 
 
 class FakeMessenger:
-    async def send_text(self, tenant_external_id, text):
+    async def send_text(self, tenant_external_id, text, reply_to_message_id=None):
         return None
 
 
@@ -47,9 +48,8 @@ def _raw_update(message_id: str, text: str):
 
 @pytest.mark.asyncio
 async def test_pending_messages_coalesced(tmp_path):
-    db = Database(tmp_path / "main.sqlite")
-    db.init()
-    tenant = db.get_or_create_tenant("telegram", "123")
+    db = build_test_db()
+    tenant = create_test_tenant(db)
 
     agent = FakeAgent()
     orchestrator = Orchestrator(
@@ -62,7 +62,7 @@ async def test_pending_messages_coalesced(tmp_path):
     msg_a = NormalizedMessage(
         provider="telegram",
         provider_message_id="1",
-        tenant_external_id="123",
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="Use this header image",
         images=[],
@@ -71,7 +71,7 @@ async def test_pending_messages_coalesced(tmp_path):
     msg_b = NormalizedMessage(
         provider="telegram",
         provider_message_id="2",
-        tenant_external_id="123",
+        tenant_external_id=tenant.external_id,
         received_at=datetime.now(tz=timezone.utc),
         text="And update the gallery text",
         images=[],

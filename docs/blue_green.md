@@ -44,4 +44,4 @@ Optional secrets:
 ## Notes
 - `worker` runs `demi.worker_entrypoint` (no HTTP server).
 - Agent containers still run on the host via the Docker socket.
-- `MAIN_DB_BACKEND=supabase` is required for multi-instance safety.
+- `MAIN_DB_SUPABASE_URL` + `MAIN_DB_SUPABASE_SERVICE_KEY` are required for multi-instance safety.
