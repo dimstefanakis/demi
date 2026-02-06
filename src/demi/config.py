@@ -54,7 +54,7 @@ class Settings(BaseSettings):
 
     agent_runtime: str = "local"
     docker_image: str = "demi-agent:local"
-    docker_pool_size: int = 1
+    docker_pool_size: int = 0
     docker_pool_root: Path = Path("data/pool")
     docker_mount_path: str = "/workspace"
     # NOTE: all secrets are considered safe for agents to consume in this runtime.

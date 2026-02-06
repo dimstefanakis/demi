@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+export HOME="${HOME:-/root}"
+mkdir -p "${HOME}"
+
 REPO_DIR="/opt/demi"
 BRANCH="main"
 
@@ -77,4 +80,11 @@ if [ -f "${REPO_DIR}/.env.production" ]; then
 fi
 
 docker build -f docker/agent.Dockerfile -t demi-agent:local .
-docker compose up -d --build nginx worker api_blue
+COMPOSE_PARALLEL_LIMIT=1 docker compose up -d --build nginx worker api_blue api_green
+
+docker container prune -f || true
+docker image prune -f || true
+docker builder prune -af || true
+docker compose exec -T api_blue python scripts/cleanup_pool_slots.py \
+  --stop-pool-containers || docker compose exec -T api_green python \
+  scripts/cleanup_pool_slots.py --stop-pool-containers || true

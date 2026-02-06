@@ -161,6 +161,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 **Agent runtime mode**
 - `AGENT_RUNTIME=local` (default) runs Claude in-process
 - `AGENT_RUNTIME=docker` runs Claude inside `demi-agent` containers
+- `DOCKER_POOL_SIZE` controls pre-warmed idle pool containers (default `0`, disabled)
 - `DOCKER_ENV_ALLOWLIST` controls which env vars can be forwarded to containers
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
@@ -218,7 +219,8 @@ Each tenant has a workspace rooted under `data/<tenant_key>/` in local runtime m
 
 Workspace roots by runtime:
 - Local runtime: `data/<tenant_key>/`
-- Docker pool runtime: `data/pool/slot-<uuid>/` (assigned per tenant and persisted as `tenants.workspace_path`)
+- Docker runtime (persistent tenant workspace): `data/pool/tenant-<id>/`
+- Optional idle pool slots: `data/pool/idle-<n>/` (only when `DOCKER_POOL_SIZE > 0`)
 - On each execution run, the agent entrypoint syncs template artifacts
   (`.claude/`, `CLAUDE.md`, `DESIGN.md`, `.env.example`) into the project workspace if missing.
 

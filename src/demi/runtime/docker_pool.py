@@ -4,8 +4,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 import asyncio
+import hashlib
 import json
 import os
+import re
 import uuid
 
 from demi.config import Settings
@@ -13,7 +15,7 @@ from demi.config import Settings
 @dataclass(frozen=True)
 class DockerPoolConfig:
     image: str
-    pool_size: int = 1
+    pool_size: int = 0
     pool_root: Path = Path("data/pool")
     mount_path: str = "/workspace"
     container_prefix: str = "demi-pool"
@@ -36,6 +38,8 @@ class DockerPool:
         self._scanned = False
 
     async def ensure_pool(self) -> None:
+        if self.config.pool_size <= 0:
+            return
         await self._scan_existing()
         async with self._lock:
             while len(self._idle) < self.config.pool_size:
@@ -43,6 +47,11 @@ class DockerPool:
                 self._idle.append(slot)
 
     async def allocate_workspace(self, tenant: object | None = None) -> Path:
+        tenant_workspace = self._tenant_workspace_path(tenant)
+        if tenant_workspace is not None:
+            tenant_workspace.mkdir(parents=True, exist_ok=True)
+            return tenant_workspace
+
         await self._scan_existing()
         async with self._lock:
             slot = None
@@ -54,7 +63,8 @@ class DockerPool:
             if slot is None:
                 slot = await self._start_idle_container()
             self._assigned[slot.workspace_path] = slot
-        asyncio.create_task(self.ensure_pool())
+        if self.config.pool_size > 0:
+            asyncio.create_task(self.ensure_pool())
         return slot.workspace_path
 
     def pop_container_for_workspace(self, workspace_path: Path) -> ContainerSlot | None:
@@ -158,7 +168,7 @@ class DockerPool:
         return stopped
 
     async def _start_idle_container(self) -> ContainerSlot:
-        workspace_path = self._next_workspace_path()
+        workspace_path = self._next_idle_workspace_path()
         workspace_path.mkdir(parents=True, exist_ok=True)
         name = f"{self.config.container_prefix}-{uuid.uuid4().hex[:8]}"
         args = [
@@ -167,6 +177,8 @@ class DockerPool:
             "-d",
             "--name",
             name,
+            "--restart",
+            "unless-stopped",
             "--mount",
             f"type=bind,src={workspace_path},dst={self.config.mount_path}",
         ]
@@ -249,10 +261,42 @@ class DockerPool:
             return False
         return output.strip().lower() == "true"
 
-    def _next_workspace_path(self) -> Path:
+    def _next_idle_workspace_path(self) -> Path:
         base = Path(self.config.pool_root)
         base.mkdir(parents=True, exist_ok=True)
-        return base / f"slot-{uuid.uuid4().hex}"
+        used_paths = {slot.workspace_path for slot in self._idle}
+        used_paths.update(self._assigned.keys())
+        max_slots = max(1, self.config.pool_size or 0)
+        for index in range(max_slots * 8):
+            candidate = base / f"idle-{index:02d}"
+            if candidate in used_paths:
+                continue
+            return candidate
+        return base / f"idle-{uuid.uuid4().hex[:8]}"
+
+    def _tenant_workspace_path(self, tenant: object | None) -> Path | None:
+        if tenant is None:
+            return None
+        raw_workspace_path = getattr(tenant, "workspace_path", None)
+        if isinstance(raw_workspace_path, str) and raw_workspace_path.strip():
+            candidate = Path(raw_workspace_path).expanduser()
+            if candidate.is_absolute():
+                resolved = candidate.resolve()
+                if self._is_within_pool(resolved):
+                    return resolved
+        tenant_id = getattr(tenant, "id", None)
+        if isinstance(tenant_id, int) and tenant_id > 0:
+            name = f"tenant-{tenant_id}"
+        else:
+            tenant_key = getattr(tenant, "key", None)
+            if not isinstance(tenant_key, str) or not tenant_key.strip():
+                return None
+            slug = re.sub(r"[^a-z0-9_-]+", "-", tenant_key.lower()).strip("-")
+            digest = hashlib.sha1(tenant_key.encode("utf-8")).hexdigest()[:8]
+            prefix = slug[:40] if slug else "tenant"
+            name = f"tenant-{prefix}-{digest}"
+        base = Path(self.config.pool_root)
+        return (base / name).resolve()
 
     @staticmethod
     async def _run_cmd(args: list[str]) -> str:
