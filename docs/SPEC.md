@@ -43,7 +43,10 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
 │ tenants, messages, runs      │   │ tasks/, assets/, site/, memory.md       │
 │ (tool_summary_json,          │   │ tenant.sqlite (scratchpad), CLAUDE.md   │
 │ tool_runs_json), run_inputs, │   │                                         │
-│ outbox, billing, message_events │ │                                       │
+│ outbox, billing, message_events, │ │                                      │
+│ interaction_sessions,        │   │                                         │
+│ interaction_session_inputs,  │   │                                         │
+│ execution_stream_inputs      │   │                                         │
 └───────────────┬──────────────┘   └────────────────────────────────────────┘
                 │
         ┌───────▼────────────────────────────────────────────────────────────┐
@@ -291,29 +294,80 @@ Flow:
 
 ---
 
+## Streaming Telemetry (Supabase)
+
+These tables capture interaction/execution in-flight streaming so operations can inspect exactly what
+happened in Supabase dashboards.
+
+- `interaction_sessions`
+- One row per interaction routing loop.
+- Columns: `tenant_id`, `project_name`, `status` (`running|completed|failed`), `started_at`, `finished_at`.
+
+- `interaction_session_inputs`
+- Inputs streamed into a live interaction routing loop.
+- Columns: `session_id`, `message_id`, `provider_message_id`, `text`, `assets_json`, `status`, `created_at`, `streamed_at`.
+
+- `execution_stream_inputs`
+- Inputs targeted at a running execution agent.
+- Columns: `tenant_id`, `run_id`, `project_name`, `message_id`, `provider_message_id`, `text`, `assets_json`,
+  `status` (`pending|streamed`), `created_at`, `streamed_at`.
+
+- `tenant_events` (`event_type='agent_stop_reason'`)
+- Claude Agent SDK result stop telemetry persisted to Supabase for observability.
+- Payload fields include `context` (`prepare_context|route_interaction|send_interaction_message|send_interaction_instruction`),
+  `stop_reason`, `result_subtype`, derived `status`, and run/message metadata when available.
+
+Execution runtime consumption:
+- Agent runtime claims `execution_stream_inputs.status='pending'` for its `run_id`,
+  pushes payloads into the in-memory inflight stream, then marks rows `streamed`.
+- If direct memory streaming is unavailable, rows remain visible and are still consumed by the runtime poller.
+- `inflight_updates.jsonl` is only written for true file-stream fallback cases to avoid duplicate runtime ingestion
+  when DB-backed streaming is available.
+- File-fallback entries include `run_id`; runtime only accepts matching `run_id` entries and drains the file via
+  snapshot-rename to avoid replaying stale updates across later runs.
+
+Run selection when streaming to execution:
+- Interaction agent first calls `find_execution_agent`.
+- `stream_to_execution_agent` targets `run_id` directly when provided.
+- Without `run_id`, it resolves by `project_name` when unique; if multiple candidates remain, it returns
+  `ambiguous_run` with candidates and does not stream.
+
+---
+
 ## Message Flow
 
 1. Telegram sends an update to `POST /telegram/webhook`.
 2. The webhook parser normalizes the message into a `NormalizedMessage`.
 3. The orchestrator records the message (idempotent by `provider_message_id`).
-4. Project selection is resolved (explicit directive or inferred from context).
-5. If configured, the orchestrator calls the billing status endpoint during routing.
+4. Interaction routing is serialized per tenant (single interaction loop per tenant).
+   Each inbound message starts its own interaction turn unless a turn is already running for the tenant.
+   In that case, the new message is streamed into the active interaction turn as an in-flight update.
+5. Project selection is resolved (explicit directive or inferred from context).
+6. If configured, the orchestrator calls the billing status endpoint during routing.
    It writes `tasks/billing_status.json` when no other run is active; if a run is already in flight it writes
    `tasks/billing_status_<run_id>.json` for the new run to avoid clobbering the in-flight payload. Billing
    status no longer creates assistant orders by default; the agent explicitly requests payment links.
-6. The orchestrator writes `tasks/interaction_context.json` and calls the interaction agent in routing mode.
-7. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
+7. The orchestrator merges any attachments for the current interaction turn, saves them under `assets/`, writes
+   `tasks/interaction_context.json`, and calls the interaction agent in routing mode.
+8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
    - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
-8. If no run is needed, the message is marked processed. The interaction agent already replied.
-9. If a run is in flight for the same project, the message is queued in `run_inputs`. The interaction agent handles the queued ack (orchestrator only falls back if no reply was sent).
-10. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
-11. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
+9. If no run is needed, the messages included in the turn are marked processed. The interaction agent already replied.
+10. If a run is in flight for the same project, messages included in the turn are queued in `run_inputs`. The interaction agent handles the queued ack (orchestrator only falls back if no reply was sent).
+   When streaming is supported, the interaction agent can optionally stream the new input to the
+   active execution agent instead of queueing a new run.
+11. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
+12. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
     - The agent can create an assistant subscription order by calling `request_assistant_subscription`
       after delivering value, then sends the payment link via the interaction agent.
-12. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
-13. Any queued `run_inputs` are drained into the next run.
-14. All outbound user messages are recorded in `message_events` for replay/debugging.
+13. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
+    - `run_result.json` includes Claude SDK stop metadata (`stop_reason`, `result_subtype`).
+    - Terminal stop reasons (`end_turn`, `stop_sequence`) are treated as successful completion unless
+      `result_subtype` indicates an SDK error.
+    - Non-terminal execution stop reasons (for example `max_tokens`, `refusal`, `model_context_window_exceeded`)
+      fail the run instead of being treated as successful completion.
+14. Any queued `run_inputs` are drained into the next run.
+15. All outbound user messages are recorded in `message_events` for replay/debugging.
 
 ---
 
@@ -341,7 +395,10 @@ Background workers poll the main DB and run in the API process or the worker con
 
 MCP servers are registered per agent run.
 
-- `demi-chat`: `send_message`, `should_send_message`, `check_for_status`, `ack_inflight_updates`, `record_deploy`, `record_domain_quote`, `record_billing_status`, `send_payment_link`, `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
+- `demi-chat`: `send_message`, `should_send_message`, `check_for_status`, `find_execution_agent`,
+  `stream_to_execution_agent`, `stop_execution_agent`, `ack_inflight_updates`, `record_deploy`,
+  `record_domain_quote`, `record_billing_status`, `send_payment_link`,
+  `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
 - `demi-unsplash`: `search_photos` (Unsplash sourcing)
 - `demi-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
 - `demi-github`: `prepare_repo` (GitHub App provisioning)

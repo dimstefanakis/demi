@@ -1,6 +1,9 @@
 import json
+import asyncio
 
+import pytest
 from demi.agent.claude import ClaudeAgent, _sdk_message_log_data
+from demi.agent.inflight import InflightTextStream
 
 
 def test_default_allowed_tools():
@@ -43,3 +46,22 @@ def test_sdk_message_log_data_does_not_include_repr():
     assert payload["subtype"] == "tool_result"
     assert "repr" not in payload
     assert "ghs_secret_token" not in json.dumps(payload)
+
+
+@pytest.mark.asyncio
+async def test_interaction_prompt_stream_stops_when_close_event_set():
+    stream = InflightTextStream(queue=asyncio.Queue())
+    close_event = asyncio.Event()
+    prompt_stream = ClaudeAgent._interaction_prompt_stream(
+        "ROUTING MODE",
+        inflight_stream=stream,
+        close_event=close_event,
+    )
+
+    first = await prompt_stream.__anext__()
+    assert first["type"] == "user"
+
+    close_event.set()
+    with pytest.raises(StopAsyncIteration):
+        await prompt_stream.__anext__()
+    assert stream.accepting is False

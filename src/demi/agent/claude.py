@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import base64
 import json
+import mimetypes
 from pathlib import Path
 import os
 import re
-from typing import Any
-from contextlib import asynccontextmanager
+from typing import Any, Callable
+from contextlib import asynccontextmanager, suppress
 import asyncio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
@@ -42,6 +44,7 @@ from demi.workspace.core import Workspace
 
 
 _ENV_LOCK = asyncio.Lock()
+INTERACTION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 
 
 @asynccontextmanager
@@ -68,6 +71,8 @@ class AgentResult:
     summary: str | None
     total_cost_usd: float | None = None
     usage: dict[str, Any] | None = None
+    stop_reason: str | None = None
+    result_subtype: str | None = None
 
 
 @dataclass
@@ -75,6 +80,8 @@ class InteractionRouteResult:
     decision: dict[str, Any]
     total_cost_usd: float | None = None
     usage: dict[str, Any] | None = None
+    stop_reason: str | None = None
+    result_subtype: str | None = None
 
 
 def _sdk_message_log_data(msg: Any) -> dict[str, Any]:
@@ -82,6 +89,21 @@ def _sdk_message_log_data(msg: Any) -> dict[str, Any]:
         "class": msg.__class__.__name__,
         "subtype": getattr(msg, "subtype", None),
     }
+
+
+def _cli_stderr_logger(tasks_dir: Path, tag: str) -> Callable[[str], None]:
+    def _log(line: str) -> None:
+        cleaned = line.rstrip()
+        if not cleaned:
+            return
+        if len(cleaned) > 4000:
+            cleaned = cleaned[:4000] + "..."
+        try:
+            log_agent_event(tasks_dir, "cli_stderr", {"tag": tag, "line": cleaned})
+        except Exception:
+            pass
+
+    return _log
 
 
 class ClaudeAgent:
@@ -135,6 +157,99 @@ class ClaudeAgent:
         self.setting_sources = setting_sources or ["project", "local"]
         self.plugins = plugins if plugins is not None else self._load_plugins_from_env()
         self.agents = agents or self._default_agents()
+
+    @staticmethod
+    def _normalize_stop_reason(raw: Any) -> str | None:
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        return value or None
+
+    @staticmethod
+    def _normalize_result_subtype(raw: Any) -> str | None:
+        if raw is None:
+            return None
+        value = str(raw).strip()
+        return value or None
+
+    @classmethod
+    def _stop_reason_status(
+        cls,
+        stop_reason: str | None,
+        result_subtype: str | None,
+    ) -> str:
+        if result_subtype and result_subtype.startswith("error_"):
+            return "error"
+        if stop_reason in {"end_turn", "stop_sequence"}:
+            return "completed"
+        if stop_reason == "refusal":
+            return "refusal"
+        if stop_reason in {
+            "max_tokens",
+            "model_context_window_exceeded",
+            "pause_turn",
+            "tool_use",
+        }:
+            return "incomplete"
+        if stop_reason is None:
+            return "unknown"
+        return "unexpected"
+
+    @classmethod
+    def _stop_reason_error(
+        cls,
+        stop_reason: str | None,
+        result_subtype: str | None,
+    ) -> str | None:
+        if result_subtype and result_subtype.startswith("error_"):
+            return f"agent_result_subtype_{result_subtype}"
+        status = cls._stop_reason_status(stop_reason, result_subtype)
+        if status == "completed":
+            return None
+        if status == "refusal":
+            return "agent_stop_reason_refusal"
+        if status == "incomplete":
+            return f"agent_stop_reason_{stop_reason}"
+        return None
+
+    @classmethod
+    def _record_stop_reason_event(
+        cls,
+        *,
+        tasks_dir: Path,
+        db: Any | None,
+        tenant_id: int | None,
+        context: str,
+        stop_reason: str | None,
+        result_subtype: str | None,
+        session_id: str | None = None,
+        run_id: int | None = None,
+        message_id: int | None = None,
+        project_name: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {
+            "context": context,
+            "stop_reason": stop_reason,
+            "result_subtype": result_subtype,
+            "status": cls._stop_reason_status(stop_reason, result_subtype),
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        if run_id is not None:
+            payload["run_id"] = int(run_id)
+        if message_id is not None:
+            payload["message_id"] = int(message_id)
+        if project_name:
+            payload["project_name"] = project_name
+        try:
+            log_agent_event(tasks_dir, "agent_stop_reason", payload)
+        except Exception:
+            pass
+        if db is not None and tenant_id is not None:
+            try:
+                db.record_tenant_event(int(tenant_id), "agent_stop_reason", payload)
+            except Exception:
+                pass
 
     async def prepare_context(
         self,
@@ -213,6 +328,7 @@ class ClaudeAgent:
             plugins=self.plugins,
             agents=self.agents,
             mcp_servers=mcp_servers,
+            stderr=_cli_stderr_logger(workspace.tasks_dir, "primary"),
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
@@ -242,14 +358,21 @@ class ClaudeAgent:
         new_session_id = session_id
         total_cost_usd = None
         usage: dict[str, Any] | None = None
+        stop_reason: str | None = None
+        result_subtype: str | None = None
 
+        query_task: asyncio.Task[None] | None = None
         try:
             async with _apply_runtime_env(runtime_env):
-                await client.query(
-                    self._prompt_stream(
-                        prompt, inflight_stream=inflight_stream, stop_event=stop_event
-                    ),
-                    session_id=session_id or "default",
+                query_task = asyncio.create_task(
+                    client.query(
+                        self._prompt_stream(
+                            prompt,
+                            inflight_stream=inflight_stream,
+                            stop_event=stop_event,
+                        ),
+                        session_id=session_id or "default",
+                    )
                 )
                 async for msg in client.receive_messages():
                     log_agent_event(
@@ -261,6 +384,26 @@ class ClaudeAgent:
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
                         new_session_id = msg.session_id or new_session_id
+                        stop_reason = self._normalize_stop_reason(
+                            getattr(msg, "stop_reason", None)
+                        )
+                        result_subtype = self._normalize_result_subtype(
+                            getattr(msg, "subtype", None)
+                        )
+                        self._record_stop_reason_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="prepare_context",
+                            stop_reason=stop_reason,
+                            result_subtype=result_subtype,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            project_name=workspace.project_name,
+                        )
+                        stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
+                        if stop_reason_error:
+                            raise RuntimeError(stop_reason_error)
                         summary = msg.result
                         total_cost_usd = msg.total_cost_usd
                         usage = msg.usage
@@ -268,6 +411,17 @@ class ClaudeAgent:
                             stop_event.set()
                         break
         finally:
+            if stop_event is not None:
+                stop_event.set()
+            if query_task is not None:
+                try:
+                    await asyncio.wait_for(query_task, timeout=5.0)
+                except asyncio.TimeoutError:
+                    query_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await query_task
+                except Exception:
+                    pass
             log_agent_event(
                 workspace.tasks_dir,
                 "run_end",
@@ -276,6 +430,8 @@ class ClaudeAgent:
                     "summary": (summary or "")[:500],
                     "total_cost_usd": total_cost_usd,
                     "usage": usage,
+                    "stop_reason": stop_reason,
+                    "result_subtype": result_subtype,
                 },
             )
             await client.disconnect()
@@ -285,6 +441,8 @@ class ClaudeAgent:
             summary=summary,
             total_cost_usd=total_cost_usd,
             usage=usage,
+            stop_reason=stop_reason,
+            result_subtype=result_subtype,
         )
 
     async def send_interaction_message(
@@ -302,6 +460,8 @@ class ClaudeAgent:
         message_id: int | None = None,
         reply_to_message_id: str | None = None,
         reply_to_text: str | None = None,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
@@ -316,6 +476,7 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                execution_bridge=execution_bridge,
                 role="interaction",
                 run_id=run_id,
                 message_id=message_id,
@@ -330,6 +491,9 @@ class ClaudeAgent:
                 "Glob",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
             ],
@@ -341,11 +505,14 @@ class ClaudeAgent:
             plugins=self.plugins,
             agents=None,
             mcp_servers={CHAT_SERVER_NAME: chat_server},
+            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_update"),
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         total_cost_usd = None
         usage: dict[str, Any] | None = None
+        stop_reason: str | None = None
+        result_subtype: str | None = None
         try:
             reply_to_message_id = str(reply_to_message_id or "").strip()
             reply_to_text = str(reply_to_text or "").strip()
@@ -361,9 +528,26 @@ class ClaudeAgent:
                     f"text={reply_to_text or 'n/a'}\n"
                 )
             prompt += f"\nUPDATE:\n{text}"
-            await client.query(prompt, session_id=session_id or "interaction")
+            await client.query(
+                self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
+                session_id=session_id or "interaction",
+            )
             async for msg in client.receive_messages():
                 if isinstance(msg, ResultMessage):
+                    stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
+                    result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
+                    self._record_stop_reason_event(
+                        tasks_dir=workspace.tasks_dir,
+                        db=db,
+                        tenant_id=tenant_id,
+                        context="send_interaction_message",
+                        stop_reason=stop_reason,
+                        result_subtype=result_subtype,
+                        session_id=session_id,
+                        run_id=run_id,
+                        message_id=message_id,
+                        project_name=workspace.project_name,
+                    )
                     total_cost_usd = msg.total_cost_usd
                     usage = msg.usage
                     break
@@ -374,6 +558,8 @@ class ClaudeAgent:
             summary=None,
             total_cost_usd=total_cost_usd,
             usage=usage,
+            stop_reason=stop_reason,
+            result_subtype=result_subtype,
         )
 
     async def route_interaction(
@@ -390,9 +576,18 @@ class ClaudeAgent:
         tenant_external_id: str | None = None,
         message_id: int | None = None,
         billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
+        inflight_stream: InflightTextStream | None = None,
     ) -> InteractionRouteResult:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_router_prompt_path)
+        stream_close_event = asyncio.Event() if inflight_stream is not None else None
+
+        def _on_interaction_message_sent() -> None:
+            if stream_close_event is not None:
+                stream_close_event.set()
+
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -405,8 +600,10 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                execution_bridge=execution_bridge,
                 role="interaction",
                 message_id=message_id,
+                on_interaction_message_sent=_on_interaction_message_sent,
             )
         )
         options = ClaudeAgentOptions(
@@ -419,6 +616,9 @@ class ClaudeAgent:
                 f"mcp__{CHAT_SERVER_NAME}__decide_project",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
@@ -431,11 +631,14 @@ class ClaudeAgent:
             plugins=self.plugins,
             agents=None,
             mcp_servers={CHAT_SERVER_NAME: chat_server},
+            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_router"),
         )
         total_cost_usd = None
         usage: dict[str, Any] | None = None
         decision: dict[str, Any] = {}
         raw_output: str | None = None
+        stop_reason: str | None = None
+        result_subtype: str | None = None
 
         def _decision_valid(payload: dict[str, Any]) -> bool:
             if not isinstance(payload, dict):
@@ -445,9 +648,11 @@ class ClaudeAgent:
             return isinstance(payload.get("should_run"), bool)
 
         async def _query_router(retry_note: str | None = None) -> None:
-            nonlocal total_cost_usd, usage, decision, raw_output
+            nonlocal total_cost_usd, usage, decision, raw_output, stop_reason, result_subtype
             client = ClaudeSDKClient(options=options)
             await client.connect()
+            stop_event = asyncio.Event() if inflight_stream is not None else None
+            query_task: asyncio.Task[None] | None = None
             try:
                 prompt = (
                     "ROUTING MODE\n"
@@ -458,15 +663,54 @@ class ClaudeAgent:
                 )
                 if retry_note:
                     prompt += f"\n{retry_note}\n"
-                await client.query(prompt, session_id=session_id or "interaction-router")
+                query_task = asyncio.create_task(
+                    client.query(
+                        self._interaction_prompt_stream(
+                            prompt,
+                            asset_paths=asset_paths,
+                            inflight_stream=inflight_stream,
+                            stop_event=stop_event,
+                            close_event=stream_close_event,
+                        ),
+                        session_id=session_id or "interaction",
+                    )
+                )
                 async for msg in client.receive_messages():
                     if isinstance(msg, ResultMessage):
+                        stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
+                        result_subtype = self._normalize_result_subtype(
+                            getattr(msg, "subtype", None)
+                        )
+                        self._record_stop_reason_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="route_interaction",
+                            stop_reason=stop_reason,
+                            result_subtype=result_subtype,
+                            session_id=(getattr(msg, "session_id", None) or session_id),
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
                         total_cost_usd = msg.total_cost_usd
                         usage = msg.usage
                         raw_output = msg.result
                         decision = self._parse_router_json(msg.result)
+                        if stop_event is not None:
+                            stop_event.set()
                         break
             finally:
+                if stop_event is not None:
+                    stop_event.set()
+                if query_task is not None:
+                    try:
+                        await asyncio.wait_for(query_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        query_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await query_task
+                    except Exception:
+                        pass
                 await client.disconnect()
 
         await _query_router()
@@ -484,6 +728,8 @@ class ClaudeAgent:
             decision=decision,
             total_cost_usd=total_cost_usd,
             usage=usage,
+            stop_reason=stop_reason,
+            result_subtype=result_subtype,
         )
 
     async def send_interaction_instruction(
@@ -499,6 +745,8 @@ class ClaudeAgent:
         tenant_external_id: str | None = None,
         run_id: int | None = None,
         message_id: int | None = None,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
         chat_server = build_chat_server(
@@ -513,6 +761,7 @@ class ClaudeAgent:
                 tenant_id=tenant_id,
                 db=db,
                 payments=payments,
+                execution_bridge=execution_bridge,
                 role="interaction",
                 run_id=run_id,
                 message_id=message_id,
@@ -527,6 +776,9 @@ class ClaudeAgent:
                 "Glob",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
@@ -539,20 +791,40 @@ class ClaudeAgent:
             plugins=self.plugins,
             agents=None,
             mcp_servers={CHAT_SERVER_NAME: chat_server},
+            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_instruction"),
         )
         client = ClaudeSDKClient(options=options)
         await client.connect()
         total_cost_usd = None
         usage: dict[str, Any] | None = None
+        stop_reason: str | None = None
+        result_subtype: str | None = None
         try:
             prompt = (
                 "Follow the instruction below. If sending a message would be redundant, "
                 "do not send anything.\n\n"
                 f"INSTRUCTION:\n{instruction}"
             )
-            await client.query(prompt, session_id=session_id or "interaction")
+            await client.query(
+                self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
+                session_id=session_id or "interaction",
+            )
             async for msg in client.receive_messages():
                 if isinstance(msg, ResultMessage):
+                    stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
+                    result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
+                    self._record_stop_reason_event(
+                        tasks_dir=workspace.tasks_dir,
+                        db=db,
+                        tenant_id=tenant_id,
+                        context="send_interaction_instruction",
+                        stop_reason=stop_reason,
+                        result_subtype=result_subtype,
+                        session_id=session_id,
+                        run_id=run_id,
+                        message_id=message_id,
+                        project_name=workspace.project_name,
+                    )
                     total_cost_usd = msg.total_cost_usd
                     usage = msg.usage
                     break
@@ -563,6 +835,8 @@ class ClaudeAgent:
             summary=None,
             total_cost_usd=total_cost_usd,
             usage=usage,
+            stop_reason=stop_reason,
+            result_subtype=result_subtype,
         )
 
     @staticmethod
@@ -691,6 +965,100 @@ class ClaudeAgent:
         return content
 
     @staticmethod
+    def _build_interaction_content(
+        prompt: str,
+        asset_paths: list[str] | None = None,
+    ) -> str | list[dict[str, Any]]:
+        assets = asset_paths or []
+        if not assets:
+            return prompt
+        notes: list[str] = []
+        images: list[dict[str, Any]] = []
+        for raw_path in assets:
+            path = Path(str(raw_path)).expanduser()
+            if not path.exists():
+                notes.append(f"- {raw_path} (missing)")
+                continue
+            media_type, _ = mimetypes.guess_type(str(path))
+            if not media_type or not media_type.startswith("image/"):
+                notes.append(f"- {path}")
+                continue
+            try:
+                data = path.read_bytes()
+            except OSError:
+                notes.append(f"- {path} (unreadable)")
+                continue
+            if len(data) > INTERACTION_IMAGE_MAX_BYTES:
+                notes.append(f"- {path} (too large)")
+                continue
+            images.append(
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": base64.b64encode(data).decode("ascii"),
+                    },
+                }
+            )
+        text = prompt
+        if images:
+            text = f"{text}\n\nUser attachments are included below."
+        if notes:
+            text = f"{text}\n\nAttachments:\n" + "\n".join(notes)
+        if not images:
+            return text
+        return [{"type": "text", "text": text}] + images
+
+    @staticmethod
+    async def _interaction_prompt_stream(
+        prompt: str,
+        asset_paths: list[str] | None = None,
+        inflight_stream: InflightTextStream | None = None,
+        stop_event=None,
+        close_event=None,
+    ):
+        content = ClaudeAgent._build_interaction_content(prompt, asset_paths)
+        yield {
+            "type": "user",
+            "message": {"role": "user", "content": content},
+        }
+        if inflight_stream is None:
+            return
+        import time
+
+        start = time.monotonic()
+        max_window = 1800.0
+        while True:
+            if stop_event is not None and stop_event.is_set():
+                break
+            if close_event is not None and close_event.is_set():
+                break
+            if time.monotonic() - start >= max_window:
+                break
+            try:
+                update = await asyncio.wait_for(inflight_stream.queue.get(), timeout=0.2)
+            except asyncio.TimeoutError:
+                continue
+            if update is None:
+                break
+            text = str(update).strip()
+            if not text:
+                continue
+            yield {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": (
+                        "IN-FLIGHT UPDATE (new user message while routing; "
+                        "incorporate this before final response): "
+                        f"{text}"
+                    ),
+                },
+            }
+        inflight_stream.accepting = False
+
+    @staticmethod
     async def _prompt_stream(
         prompt: str,
         inflight_stream: InflightTextStream | None = None,
@@ -752,6 +1120,9 @@ class ClaudeAgent:
                     "Glob",
                     f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                     f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
                     SEND_MESSAGE_TOOL,
                     f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 ],

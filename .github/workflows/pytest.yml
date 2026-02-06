@@ -1,0 +1,50 @@
+name: Pytest
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Install dependencies
+        run: uv sync --frozen --all-extras
+
+      - name: Start local Supabase
+        run: supabase start
+
+      - name: Export test DB env
+        shell: bash
+        run: |
+          eval "$(supabase status -o env)"
+          echo "::add-mask::$SERVICE_ROLE_KEY"
+          echo "MAIN_DB_SUPABASE_URL=$API_URL" >> "$GITHUB_ENV"
+          echo "MAIN_DB_SUPABASE_SERVICE_KEY=$SERVICE_ROLE_KEY" >> "$GITHUB_ENV"
+
+      - name: Run pytest
+        run: uv run pytest
+
+      - name: Stop local Supabase
+        if: always()
+        run: supabase stop

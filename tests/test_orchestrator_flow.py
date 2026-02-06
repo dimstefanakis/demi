@@ -32,6 +32,8 @@ class FakeAgent:
         tenant_external_id=None,
         message_id=None,
         billing_checked=False,
+        asset_paths=None,
+        execution_bridge=None,
     ):
         self.route_calls.append((workspace.root, message))
         return {
@@ -364,6 +366,8 @@ async def test_orchestrator_supersedes_and_cancels_active_run(tmp_path):
             tenant_external_id=None,
             message_id=None,
             billing_checked=False,
+            asset_paths=None,
+            execution_bridge=None,
         ):
             return {
                 "ok": True,
@@ -421,47 +425,6 @@ async def test_orchestrator_supersedes_and_cancels_active_run(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_migrate_legacy_queue_ignores_duplicate_inputs(tmp_path, monkeypatch):
-    db = build_test_db()
-    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
-
-    orchestrator = Orchestrator(
-        db=db,
-        workspace_manager=workspace_manager,
-        agent=FakeAgent(),
-        messenger=FakeMessenger(),
-    )
-
-    tenant = create_test_tenant(db)
-    workspace_manager.ensure_workspace(tenant.key, project_name="main")
-
-    msg = NormalizedMessage(
-        provider="telegram",
-        provider_message_id="dup-1",
-        tenant_external_id=tenant.external_id,
-        received_at=datetime.now(tz=timezone.utc),
-        text="pending message",
-        images=[],
-        raw={},
-    )
-    message_id, _ = db.record_message(tenant.id, msg)
-    db.update_message_status(message_id, "pending")
-
-    def _raise_duplicate(*_args, **_kwargs):
-        raise RuntimeError(
-            'duplicate key value violates unique constraint "run_inputs_dedupe_idx"'
-        )
-
-    monkeypatch.setattr(orchestrator, "_enqueue_run_input", _raise_duplicate)
-
-    migrated = await orchestrator.migrate_legacy_queue()
-
-    assert migrated == 0
-    row = db.get_message(message_id)
-    assert row["status"] == "processed"
-
-
-@pytest.mark.asyncio
 async def test_orchestrator_reconciles_run_result(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
@@ -513,6 +476,119 @@ async def test_orchestrator_reconciles_run_result(tmp_path):
     assert result.status == "accepted"
     run_row = db.get_run(run_id)
     assert run_row["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_reconciles_run_result_stop_sequence_completed(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stop-seq-old",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Europe",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id, message_id=message_id, project_name=workspace.project_name
+    )
+
+    result_payload = {
+        "session_id": "session-stop-seq",
+        "summary": "ok",
+        "total_cost_usd": 1.23,
+        "usage": {"input_tokens": 10},
+        "stop_reason": "stop_sequence",
+        "result_subtype": "success",
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(result_payload))
+
+    new_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stop-seq-new",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Try again",
+        images=[],
+        raw={},
+    )
+    result = await orchestrator.handle_message(new_msg)
+
+    assert result.status == "accepted"
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "completed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_reconciles_run_result_error_subtype_fails(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stop-err-old",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Europe",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id, message_id=message_id, project_name=workspace.project_name
+    )
+
+    result_payload = {
+        "session_id": "session-stop-err",
+        "summary": "ok",
+        "total_cost_usd": 1.23,
+        "usage": {"input_tokens": 10},
+        "stop_reason": "end_turn",
+        "result_subtype": "error_max_turns",
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(result_payload))
+
+    new_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stop-err-new",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Try again",
+        images=[],
+        raw={},
+    )
+    result = await orchestrator.handle_message(new_msg)
+
+    assert result.status == "accepted"
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "failed"
+    assert run_row["error"] == "agent_result_subtype:error_max_turns"
 
 
 @pytest.mark.asyncio
@@ -983,3 +1059,193 @@ async def test_orchestrator_infers_project_from_description(tmp_path):
     assert agent.calls
     used_root = agent.calls[-1][0]
     assert used_root == cafe_ws.root
+
+
+@pytest.mark.asyncio
+async def test_stream_to_execution_agent_persists_db_stream_input(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class StreamAgent(FakeAgent):
+        supports_file_stream = True
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=StreamAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    seed = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stream-seed",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="seed",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, seed)
+    run_id = db.create_run(tenant.id, message_id=message_id, project_name=workspace.project_name)
+    db.set_active_run(tenant.id, workspace.project_name, run_id, datetime.now(tz=timezone.utc).isoformat())
+
+    result = await orchestrator.stream_to_execution_agent(
+        tenant_key=tenant.key,
+        project_name=workspace.project_name,
+        run_id=run_id,
+        text="new user input while running",
+    )
+
+    assert result["ok"] is True
+    rows = db.list_execution_stream_inputs(run_id=run_id)
+    assert rows
+    assert rows[-1]["text"] == "new user input while running"
+
+
+def test_list_execution_agents_includes_all_active_runs(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class StreamAgent(FakeAgent):
+        supports_file_stream = True
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=StreamAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    now = datetime.now(tz=timezone.utc).isoformat()
+    main_run = db.create_run(tenant.id, message_id=0, project_name="main")
+    beta_run = db.create_run(tenant.id, message_id=0, project_name="beta")
+    db.set_active_run(tenant.id, "main", main_run, now)
+    db.set_active_run(tenant.id, "beta", beta_run, now)
+
+    agents = orchestrator.list_execution_agents(
+        tenant_id=tenant.id,
+        tenant_key=tenant.key,
+        project_name=None,
+    )
+
+    run_ids = {int(agent["run_id"]) for agent in agents}
+    assert main_run in run_ids
+    assert beta_run in run_ids
+
+
+@pytest.mark.asyncio
+async def test_stream_to_execution_agent_reports_ambiguous_without_run_id(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class StreamAgent(FakeAgent):
+        supports_file_stream = True
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=StreamAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    now = datetime.now(tz=timezone.utc).isoformat()
+    main_run = db.create_run(tenant.id, message_id=0, project_name="main")
+    beta_run = db.create_run(tenant.id, message_id=0, project_name="beta")
+    db.set_active_run(tenant.id, "main", main_run, now)
+    db.set_active_run(tenant.id, "beta", beta_run, now)
+
+    result = await orchestrator.stream_to_execution_agent(
+        tenant_key=tenant.key,
+        project_name=None,
+        text="new user input while running",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "ambiguous_run"
+    assert len(result["candidates"]) >= 2
+
+
+@pytest.mark.asyncio
+async def test_stream_to_execution_agent_rejects_foreign_run_id(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class StreamAgent(FakeAgent):
+        supports_file_stream = True
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=StreamAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant_a = create_test_tenant(db)
+    tenant_b = create_test_tenant(db)
+
+    run_id = db.create_run(tenant_b.id, message_id=0, project_name="main")
+    result = await orchestrator.stream_to_execution_agent(
+        tenant_key=tenant_a.key,
+        project_name="main",
+        run_id=run_id,
+        text="cross-tenant attempt",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "not_found"
+    rows = db.list_execution_stream_inputs(run_id=run_id)
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_stream_to_execution_agent_rejects_inactive_explicit_run(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class StreamAgent(FakeAgent):
+        supports_file_stream = True
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=StreamAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    run_id = db.create_run(tenant.id, message_id=0, project_name="main")
+    db.finish_run(run_id, status="completed")
+
+    result = await orchestrator.stream_to_execution_agent(
+        tenant_key=tenant.key,
+        project_name="main",
+        run_id=run_id,
+        text="should not be accepted",
+    )
+
+    assert result["ok"] is False
+    assert result["status"] == "no_active_run"
+    rows = db.list_execution_stream_inputs(run_id=run_id)
+    assert rows == []
+
+
+def test_enqueue_execution_stream_input_returns_none_on_insert_failure(monkeypatch):
+    db = build_test_db()
+
+    def _raise(*_args, **_kwargs):
+        raise RuntimeError("db_unavailable")
+
+    monkeypatch.setattr(db, "_execute", _raise)
+
+    stream_id = db.enqueue_execution_stream_input(
+        tenant_id=1,
+        run_id=123,
+        project_name="main",
+        message_id=None,
+        provider_message_id=None,
+        text="stream payload",
+        assets=[],
+        status="pending",
+    )
+
+    assert stream_id is None

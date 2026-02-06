@@ -8,8 +8,10 @@ from datetime import datetime, timedelta, timezone
 import json
 import os
 from pathlib import Path
+import uuid
 
 from demi.agent.claude import ClaudeAgent
+from demi.agent.inflight import InflightTextStream
 from demi.config import Settings
 from demi.db.factory import build_database
 from demi.messaging.file import FileMessenger
@@ -88,6 +90,85 @@ class RunLeaseHeartbeat:
             return 15.0
         return max(5.0, min(30.0, self.lease_seconds / 4))
 
+
+async def _pump_inflight_updates(
+    tasks_dir: Path,
+    inflight_stream: InflightTextStream,
+    stop_event: asyncio.Event,
+    *,
+    db=None,
+    run_id: int | None = None,
+) -> None:
+    path = tasks_dir / "inflight_updates.jsonl"
+    while not stop_event.is_set():
+        if db is not None and run_id is not None:
+            try:
+                rows = db.claim_execution_stream_inputs(run_id=run_id, limit=25)
+            except Exception:
+                rows = []
+            for row in rows or []:
+                text = str(row.get("text") or "").strip()
+                assets = row.get("assets_json") or row.get("assets") or []
+                attachments = "\n".join(f"- {item}" for item in assets if item)
+                if attachments:
+                    if text:
+                        text = f"{text}\n\nAttachments:\n{attachments}"
+                    else:
+                        text = f"Attachments:\n{attachments}"
+                if not text:
+                    continue
+                try:
+                    inflight_stream.queue.put_nowait(text)
+                except Exception:
+                    pass
+        snapshot_path = tasks_dir / f".inflight_updates.{uuid.uuid4().hex}.jsonl"
+        lines: list[str] = []
+        if path.exists():
+            try:
+                path.replace(snapshot_path)
+            except OSError:
+                snapshot_path = None
+            if snapshot_path is not None:
+                try:
+                    lines = snapshot_path.read_text(encoding="utf-8").splitlines()
+                except OSError:
+                    lines = []
+                finally:
+                    try:
+                        snapshot_path.unlink()
+                    except OSError:
+                        pass
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                payload = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            payload_run_id = payload.get("run_id")
+            if run_id is not None:
+                try:
+                    payload_run_id = int(payload_run_id)
+                except (TypeError, ValueError):
+                    payload_run_id = None
+                if payload_run_id != int(run_id):
+                    continue
+            text = str(payload.get("text") or "").strip()
+            assets = payload.get("assets") or []
+            attachments = "\n".join(f"- {item}" for item in assets if item)
+            if attachments:
+                if text:
+                    text = f"{text}\n\nAttachments:\n{attachments}"
+                else:
+                    text = f"Attachments:\n{attachments}"
+            if not text:
+                continue
+            try:
+                inflight_stream.queue.put_nowait(text)
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
 
 _GITHUB_RUNTIME_ENV_KEYS = (
     "GITHUB_TOKEN",
@@ -292,13 +373,24 @@ async def _run(run_id: int) -> int:
             poll_interval=settings.run_activity_poll_interval,
         )
         monitor_task = asyncio.create_task(monitor.run())
+        inflight_stream = InflightTextStream(queue=asyncio.Queue())
+        inflight_stop = asyncio.Event()
+        inflight_task = asyncio.create_task(
+            _pump_inflight_updates(
+                tasks_dir,
+                inflight_stream,
+                inflight_stop,
+                db=db,
+                run_id=run_id,
+            )
+        )
         try:
             result = await agent.prepare_context(
                 workspace=workspace,
                 task_path=task_path,
                 message=message,
                 messenger=messenger,
-                inflight_stream=None,
+                inflight_stream=inflight_stream,
                 tenant_id=tenant.id,
                 db=db,
                 payments=None,
@@ -312,10 +404,14 @@ async def _run(run_id: int) -> int:
             result_path.write_text(json.dumps(result_payload, indent=2))
             return 0
         finally:
+            inflight_stop.set()
+            inflight_task.cancel()
             monitor.stop()
             monitor_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await monitor_task
+            with contextlib.suppress(asyncio.CancelledError):
+                await inflight_task
     except Exception as exc:  # noqa: BLE001
         if tasks_dir is not None:
             _write_run_result_error(tasks_dir, exc)

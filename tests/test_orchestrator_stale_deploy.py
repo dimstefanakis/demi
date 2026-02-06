@@ -23,6 +23,8 @@ class FakeAgentNoDeploy:
         tenant_external_id=None,
         message_id=None,
         billing_checked=False,
+        asset_paths=None,
+        execution_bridge=None,
     ):
         return {
             "ok": True,

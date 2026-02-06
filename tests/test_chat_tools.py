@@ -20,6 +20,38 @@ class FakeMessenger:
         self.sent.append((tenant_external_id, text, reply_to_message_id))
 
 
+class FakeExecutionBridge:
+    def __init__(self, agents=None):
+        self._agents = list(agents or [])
+        self.stream_calls = []
+        self.stop_calls = []
+
+    def list_execution_agents(self, tenant_id, tenant_key, project_name=None):
+        del tenant_id, tenant_key, project_name
+        return list(self._agents)
+
+    async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+        self.stream_calls.append(
+            {
+                "tenant_key": tenant_key,
+                "project_name": project_name,
+                "run_id": run_id,
+                "text": text,
+            }
+        )
+        return {"ok": True, "status": "streamed", "run_id": run_id, "project_name": project_name}
+
+    async def stop_execution_agent(self, run_id, reason, notify):
+        self.stop_calls.append(
+            {
+                "run_id": run_id,
+                "reason": reason,
+                "notify": notify,
+            }
+        )
+        return type("StopResult", (), {"status": "accepted", "detail": "run_cancelled"})()
+
+
 def test_send_message_tool_dedupes(tmp_path):
     tasks_dir = tmp_path / "tasks"
     append_log(tasks_dir, "assistant_message", "Hello there")
@@ -38,7 +70,36 @@ def test_send_message_tool_dedupes(tmp_path):
     asyncio.run(send_tool.handler({"text": "Hello there!"}))
     asyncio.run(send_tool.handler({"text": "Hello there!"}))
 
-    assert len(messenger.sent) == 2
+    # Tool-level dedupe should skip redundant sends even if the model fails to call should_send_message.
+    assert len(messenger.sent) == 0
+
+
+def test_send_message_dedupes_url_variants(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    append_log(
+        tasks_dir,
+        "assistant_message",
+        "Use this checkout link: https://example.com/pay/session_abc now.",
+    )
+
+    messenger = FakeMessenger()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
+        )
+    )
+    send_tool = next(tool for tool in tools if tool.name == "send_message")
+
+    asyncio.run(
+        send_tool.handler(
+            {"text": "Use this checkout link https://example.com/pay/session_xyz now"}
+        )
+    )
+
+    assert messenger.sent == []
 
 
 def test_send_message_tool_sends_once_for_new_text(tmp_path):
@@ -57,7 +118,28 @@ def test_send_message_tool_sends_once_for_new_text(tmp_path):
     asyncio.run(send_tool.handler({"text": "Working on it now."}))
     asyncio.run(send_tool.handler({"text": "Working on it now."}))
 
-    assert len(messenger.sent) == 2
+    assert len(messenger.sent) == 1
+
+
+def test_send_message_interaction_triggers_stream_close_callback(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    messenger = FakeMessenger()
+    calls: list[str] = []
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger,
+            tenant_external_id="tenant-1",
+            tasks_dir=tasks_dir,
+            role="interaction",
+            on_interaction_message_sent=lambda: calls.append("closed"),
+        )
+    )
+    send_tool = next(tool for tool in tools if tool.name == "send_message")
+
+    asyncio.run(send_tool.handler({"text": "Working on it now."}))
+
+    assert len(messenger.sent) == 1
+    assert calls == ["closed"]
 
 
 def test_send_payment_link_uses_quote_file(tmp_path):
@@ -450,3 +532,188 @@ def test_send_message_keeps_reply_context_after_idle_gap(tmp_path):
 
     assert messenger.sent
     assert messenger.sent[0][2] == "msg-11"
+
+
+def test_stream_to_execution_agent_selects_run_by_project(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    bridge = FakeExecutionBridge(
+        agents=[
+            {"run_id": 41, "project_name": "main", "status": "running"},
+            {"run_id": 42, "project_name": "kappa", "status": "running"},
+        ]
+    )
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id="tenant-1",
+            tenant_key="telegram:tenant-1",
+            provider="telegram",
+            tasks_dir=tasks_dir,
+            role="interaction",
+            execution_bridge=bridge,
+        )
+    )
+    stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
+
+    result = asyncio.run(stream_tool.handler({"text": "keep going", "project_name": "kappa"}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert bridge.stream_calls
+    assert bridge.stream_calls[-1]["run_id"] == 42
+
+
+def test_stream_to_execution_agent_requires_run_id_when_ambiguous(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    bridge = FakeExecutionBridge(
+        agents=[
+            {"run_id": 51, "project_name": "main", "status": "running"},
+            {"run_id": 52, "project_name": "main", "status": "running"},
+        ]
+    )
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id="tenant-2",
+            tenant_key="telegram:tenant-2",
+            provider="telegram",
+            tasks_dir=tasks_dir,
+            role="interaction",
+            execution_bridge=bridge,
+        )
+    )
+    stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
+
+    result = asyncio.run(stream_tool.handler({"text": "update active run", "project_name": "main"}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is False
+    assert payload["status"] == "ambiguous_run"
+    assert bridge.stream_calls == []
+
+
+def test_stream_to_execution_agent_skips_file_fallback_for_db_stream(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    class DbStreamBridge(FakeExecutionBridge):
+        async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+            self.stream_calls.append(
+                {
+                    "tenant_key": tenant_key,
+                    "project_name": project_name,
+                    "run_id": run_id,
+                    "text": text,
+                }
+            )
+            return {
+                "ok": True,
+                "status": "db_stream",
+                "run_id": run_id,
+                "project_name": project_name,
+                "stream_input_id": "db-1",
+            }
+
+    bridge = DbStreamBridge(agents=[{"run_id": 90, "project_name": "main", "status": "running"}])
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id="tenant-db-stream",
+            tenant_key="telegram:tenant-db-stream",
+            provider="telegram",
+            tasks_dir=tasks_dir,
+            role="interaction",
+            execution_bridge=bridge,
+        )
+    )
+    stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
+
+    result = asyncio.run(stream_tool.handler({"text": "continue work"}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload["status"] == "db_stream"
+    assert bridge.stream_calls
+    assert not (tasks_dir / "inflight_updates.jsonl").exists()
+
+
+def test_stream_to_execution_agent_writes_file_fallback_for_file_stream(tmp_path):
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    class FileStreamBridge(FakeExecutionBridge):
+        async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+            self.stream_calls.append(
+                {
+                    "tenant_key": tenant_key,
+                    "project_name": project_name,
+                    "run_id": run_id,
+                    "text": text,
+                }
+            )
+            return {
+                "ok": True,
+                "status": "file_stream",
+                "run_id": run_id,
+                "project_name": project_name,
+            }
+
+    bridge = FileStreamBridge(agents=[{"run_id": 91, "project_name": "main", "status": "running"}])
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id="tenant-file-stream",
+            tenant_key="telegram:tenant-file-stream",
+            provider="telegram",
+            tasks_dir=tasks_dir,
+            role="interaction",
+            execution_bridge=bridge,
+        )
+    )
+    stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
+
+    result = asyncio.run(stream_tool.handler({"text": "continue work"}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload["status"] == "file_stream"
+    updates_path = tasks_dir / "inflight_updates.jsonl"
+    assert updates_path.exists()
+    lines = updates_path.read_text().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["text"] == "continue work"
+
+
+def test_stop_execution_agent_rejects_cross_tenant_run(tmp_path):
+    db = build_test_db()
+    tenant_a = create_test_tenant(db)
+    tenant_b = create_test_tenant(db)
+    run_id = db.create_run(tenant_b.id, message_id=0, project_name="main")
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    bridge = FakeExecutionBridge()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant_a.external_id,
+            tenant_key=tenant_a.key,
+            provider=tenant_a.provider,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant_a.id,
+            execution_bridge=bridge,
+        )
+    )
+    stop_tool = next(tool for tool in tools if tool.name == "stop_execution_agent")
+
+    result = asyncio.run(stop_tool.handler({"run_id": run_id}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is False
+    assert payload["status"] == "not_found"
+    assert bridge.stop_calls == []
