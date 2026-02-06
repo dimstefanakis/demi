@@ -135,7 +135,7 @@ def create_app() -> FastAPI:
         except Exception:  # noqa: BLE001
             logger.exception("Legacy queue migration failed")
 
-    if pool is not None:
+    if pool is not None and settings.docker_pool_size > 0:
         async def _warm_pool_background() -> None:
             try:
                 await asyncio.wait_for(

@@ -44,5 +44,7 @@ echo "Pruning unused Docker resources..."
 docker container prune -f || true
 docker image prune -f || true
 docker builder prune -af || true
+docker compose exec -T "api_${target_color}" python scripts/cleanup_pool_slots.py \
+  --stop-pool-containers || true
 
 echo "Deploy complete."
