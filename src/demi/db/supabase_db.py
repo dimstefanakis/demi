@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 import json
 from typing import Any
+import uuid
 
 from supabase import Client, create_client
 from postgrest.exceptions import APIError
@@ -16,6 +17,7 @@ class SupabaseDatabase:
     url: str
     service_key: str
     client: Client | None = None
+    _execution_stream_fallback: dict[int, list[dict[str, Any]]] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if not self.url or not self.service_key:
@@ -494,6 +496,7 @@ class SupabaseDatabase:
         tenant_id: int,
         statuses: list[str],
         project_name: str | None = None,
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         if not statuses:
             return []
@@ -506,6 +509,8 @@ class SupabaseDatabase:
         )
         if project_name:
             query = query.eq("project_name", project_name)
+        if limit:
+            query = query.limit(limit)
         data = self._execute(query)
         return list(data or [])
 
@@ -700,6 +705,176 @@ class SupabaseDatabase:
         if not data:
             raise RuntimeError("tenant_event_create_failed")
         return int(data[0]["id"])
+
+    def create_interaction_session(
+        self,
+        *,
+        tenant_id: int,
+        project_name: str | None,
+        status: str = "running",
+    ) -> int | None:
+        payload = {
+            "tenant_id": tenant_id,
+            "project_name": project_name,
+            "status": status,
+            "started_at": datetime.now(tz=timezone.utc).isoformat(),
+            "finished_at": None,
+        }
+        try:
+            data = self._execute(self._table("interaction_sessions").insert(payload))
+        except Exception:
+            return None
+        if not data:
+            return None
+        try:
+            return int(data[0]["id"])
+        except Exception:
+            return None
+
+    def finish_interaction_session(self, session_id: int, *, status: str = "completed") -> None:
+        payload = {
+            "status": status,
+            "finished_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        try:
+            self._execute(self._table("interaction_sessions").update(payload).eq("id", int(session_id)))
+        except Exception:
+            return
+
+    def record_interaction_session_input(
+        self,
+        *,
+        session_id: int,
+        message_id: int | None,
+        provider_message_id: str | None,
+        text: str,
+        assets: list[str] | None = None,
+        status: str = "streamed",
+    ) -> str | None:
+        payload = {
+            "session_id": int(session_id),
+            "message_id": message_id,
+            "provider_message_id": provider_message_id,
+            "text": text,
+            "assets_json": assets or [],
+            "status": status,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "streamed_at": datetime.now(tz=timezone.utc).isoformat()
+            if status == "streamed"
+            else None,
+        }
+        try:
+            data = self._execute(self._table("interaction_session_inputs").insert(payload))
+        except Exception:
+            return None
+        if not data:
+            return None
+        return str(data[0].get("id") or "")
+
+    def enqueue_execution_stream_input(
+        self,
+        *,
+        tenant_id: int,
+        run_id: int,
+        project_name: str | None,
+        message_id: int | None,
+        provider_message_id: str | None,
+        text: str,
+        assets: list[str] | None = None,
+        status: str = "pending",
+    ) -> str | None:
+        payload = {
+            "tenant_id": tenant_id,
+            "run_id": run_id,
+            "project_name": project_name,
+            "message_id": message_id,
+            "provider_message_id": provider_message_id,
+            "text": text,
+            "assets_json": assets or [],
+            "status": status,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+            "streamed_at": None,
+        }
+        try:
+            data = self._execute(self._table("execution_stream_inputs").insert(payload))
+        except Exception:
+            fallback_id = f"fallback-{uuid.uuid4().hex}"
+            fallback_row = {
+                **payload,
+                "id": fallback_id,
+            }
+            self._execution_stream_fallback.setdefault(int(run_id), []).append(fallback_row)
+            # Caller must switch to shared file fallback when DB persistence fails.
+            return None
+        if not data:
+            return None
+        return str(data[0].get("id") or "")
+
+    def list_execution_stream_inputs(
+        self,
+        *,
+        run_id: int | None = None,
+        status: str | None = None,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        try:
+            query = self._table("execution_stream_inputs").select("*").order("created_at", desc=False)
+            if run_id is not None:
+                query = query.eq("run_id", int(run_id))
+            if status:
+                query = query.eq("status", status)
+            if limit:
+                query = query.limit(limit)
+            data = self._execute(query)
+        except Exception:
+            rows: list[dict[str, Any]] = []
+            if run_id is not None:
+                rows = list(self._execution_stream_fallback.get(int(run_id), []))
+            else:
+                for values in self._execution_stream_fallback.values():
+                    rows.extend(values)
+            if status:
+                rows = [row for row in rows if str(row.get("status") or "") == status]
+            if limit:
+                rows = rows[:limit]
+            return rows
+        return list(data or [])
+
+    def claim_execution_stream_inputs(self, *, run_id: int, limit: int = 25) -> list[dict[str, Any]]:
+        rows = self.list_execution_stream_inputs(run_id=run_id, status="pending", limit=limit)
+        if not rows:
+            return []
+        ids = [row.get("id") for row in rows if row.get("id")]
+        if not ids:
+            return []
+        try:
+            self._execute(
+                self._table("execution_stream_inputs")
+                .update(
+                    {
+                        "status": "streamed",
+                        "streamed_at": datetime.now(tz=timezone.utc).isoformat(),
+                    }
+                )
+                .in_("id", ids)
+            )
+        except Exception:
+            id_set = {str(item) for item in ids}
+            for key in list(self._execution_stream_fallback.keys()):
+                values = self._execution_stream_fallback.get(key) or []
+                keep: list[dict[str, Any]] = []
+                for row in values:
+                    row_id = str(row.get("id") or "")
+                    if row_id in id_set:
+                        updated = dict(row)
+                        updated["status"] = "streamed"
+                        updated["streamed_at"] = datetime.now(tz=timezone.utc).isoformat()
+                        keep.append(updated)
+                    else:
+                        keep.append(row)
+                self._execution_stream_fallback[key] = keep
+            return rows
+        return rows
 
     def create_run_input(
         self,

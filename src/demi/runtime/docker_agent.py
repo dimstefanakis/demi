@@ -57,6 +57,7 @@ def load_env_file_values(settings: Settings) -> dict[str, str]:
 @dataclass
 class DockerAgent:
     supports_inflight_stream = False
+    supports_file_stream = True
     pool: DockerPool
     settings: Settings
     mount_path: str = "/workspace"
@@ -126,6 +127,8 @@ class DockerAgent:
             summary=result.get("summary"),
             total_cost_usd=result.get("total_cost_usd"),
             usage=result.get("usage"),
+            stop_reason=result.get("stop_reason"),
+            result_subtype=result.get("result_subtype"),
         )
 
     async def cancel_run(self, workspace) -> int:
@@ -147,6 +150,8 @@ class DockerAgent:
         message_id: int | None = None,
         reply_to_message_id: str | None = None,
         reply_to_text: str | None = None,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         interaction_agent = ClaudeAgent()
         return await interaction_agent.send_interaction_message(
@@ -163,6 +168,8 @@ class DockerAgent:
             message_id=message_id,
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
+            asset_paths=asset_paths,
+            execution_bridge=execution_bridge,
         )
 
     async def send_interaction_instruction(
@@ -178,6 +185,8 @@ class DockerAgent:
         tenant_external_id: str | None = None,
         run_id: int | None = None,
         message_id: int | None = None,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         interaction_agent = ClaudeAgent()
         return await interaction_agent.send_interaction_instruction(
@@ -192,6 +201,8 @@ class DockerAgent:
             tenant_external_id=tenant_external_id,
             run_id=run_id,
             message_id=message_id,
+            asset_paths=asset_paths,
+            execution_bridge=execution_bridge,
         )
 
     async def route_interaction(
@@ -208,6 +219,9 @@ class DockerAgent:
         tenant_external_id: str | None = None,
         message_id: int | None = None,
         billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
+        inflight_stream=None,
     ):
         interaction_agent = ClaudeAgent()
         return await interaction_agent.route_interaction(
@@ -222,6 +236,9 @@ class DockerAgent:
             tenant_external_id=tenant_external_id,
             message_id=message_id,
             billing_checked=billing_checked,
+            asset_paths=asset_paths,
+            execution_bridge=execution_bridge,
+            inflight_stream=inflight_stream,
         )
 
     def _entrypoint_command(self, run_id: int) -> list[str]:

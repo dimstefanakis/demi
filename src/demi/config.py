@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     design_prompt_path: Path = Path("DESIGN.md")
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
+    interaction_router_prompt_path: Path = Path("prompts/interaction_agent.md")
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")

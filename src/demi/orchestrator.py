@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
@@ -9,6 +9,7 @@ import re
 import asyncio
 import httpx
 import uuid
+import inspect
 
 from demi.db.core import Database
 from demi.models import Attachment, NormalizedMessage, OrchestratorResult
@@ -25,6 +26,18 @@ from demi.config import Settings
 
 
 @dataclass
+class InteractionRouteSession:
+    tenant_id: int
+    tenant_key: str
+    project_name: str | None
+    workspace: Workspace
+    stream: InflightTextStream = field(default_factory=lambda: InflightTextStream(queue=asyncio.Queue()))
+    message_ids: set[int] = field(default_factory=set)
+    messages: dict[int, NormalizedMessage] = field(default_factory=dict)
+    db_session_id: int | None = None
+
+
+@dataclass
 class Orchestrator:
     db: Database
     workspace_manager: WorkspaceManager
@@ -33,6 +46,279 @@ class Orchestrator:
     payments: Any | None = None
     inflight_text_queues: dict[str, InflightTextStream] | None = None
     workspace_allocator: Any | None = None
+    interaction_locks: dict[int, asyncio.Lock] | None = None
+    interaction_route_sessions: dict[int, InteractionRouteSession] | None = None
+
+    def _interaction_lock_for(self, tenant_id: int) -> asyncio.Lock:
+        if self.interaction_locks is None:
+            self.interaction_locks = {}
+        lock = self.interaction_locks.get(tenant_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self.interaction_locks[tenant_id] = lock
+        return lock
+
+    def _interaction_session_for(self, tenant_id: int) -> InteractionRouteSession | None:
+        if self.interaction_route_sessions is None:
+            return None
+        return self.interaction_route_sessions.get(tenant_id)
+
+    def _register_interaction_session(self, session: InteractionRouteSession) -> None:
+        if self.interaction_route_sessions is None:
+            self.interaction_route_sessions = {}
+        self.interaction_route_sessions[session.tenant_id] = session
+
+    def _close_interaction_session(self, tenant_id: int, *, status: str = "completed") -> None:
+        if self.interaction_route_sessions is None:
+            return
+        session = self.interaction_route_sessions.pop(tenant_id, None)
+        if session is None:
+            return
+        session.stream.accepting = False
+        if session.db_session_id is not None:
+            try:
+                self.db.finish_interaction_session(session.db_session_id, status=status)
+            except Exception:
+                pass
+
+    def _open_interaction_session(
+        self,
+        *,
+        tenant: Any,
+        workspace: Workspace,
+        project_name: str | None,
+        messages: list[tuple[int, NormalizedMessage]],
+    ) -> InteractionRouteSession:
+        session = InteractionRouteSession(
+            tenant_id=int(tenant.id),
+            tenant_key=str(tenant.key),
+            project_name=project_name,
+            workspace=workspace,
+        )
+        for mid, message in messages:
+            session.message_ids.add(int(mid))
+            session.messages[int(mid)] = message
+        try:
+            session.db_session_id = self.db.create_interaction_session(
+                tenant_id=int(tenant.id),
+                project_name=project_name,
+                status="running",
+            )
+        except Exception:
+            session.db_session_id = None
+        self._register_interaction_session(session)
+        return session
+
+    async def _stream_into_interaction_session(
+        self,
+        *,
+        session: InteractionRouteSession,
+        message_id: int,
+        msg: NormalizedMessage,
+    ) -> bool:
+        if not session.stream.accepting:
+            return False
+        text = (msg.text or "").strip()
+        asset_paths = await self._download_message_assets(msg, session.workspace)
+        if not text and (asset_paths or msg.images):
+            text = "(attachment)"
+        if asset_paths:
+            items = "\n".join(f"- {path}" for path in asset_paths if path)
+            if items:
+                if text:
+                    text = f"{text}\n\nAttachments:\n{items}"
+                else:
+                    text = f"Attachments:\n{items}"
+        if not text:
+            return False
+        if not session.stream.accepting:
+            return False
+        session.message_ids.add(int(message_id))
+        session.messages[int(message_id)] = msg
+        if session.db_session_id is not None:
+            try:
+                self.db.record_interaction_session_input(
+                    session_id=session.db_session_id,
+                    message_id=message_id,
+                    provider_message_id=str(msg.provider_message_id or "") or None,
+                    text=text,
+                    assets=asset_paths,
+                    status="streamed",
+                )
+            except Exception:
+                pass
+        try:
+            session.stream.queue.put_nowait(text)
+            return True
+        except Exception:
+            return False
+
+    def _merge_interaction_session_messages(
+        self,
+        *,
+        batched_messages: list[tuple[int, NormalizedMessage]],
+        session: InteractionRouteSession | None,
+    ) -> list[tuple[int, NormalizedMessage]]:
+        if session is None:
+            return batched_messages
+        merged: dict[int, NormalizedMessage] = {}
+        for mid, message in batched_messages:
+            merged[int(mid)] = message
+        for mid, message in session.messages.items():
+            merged[int(mid)] = message
+        ordered = list(merged.items())
+        ordered.sort(key=lambda item: (item[1].received_at, item[0]))
+        return ordered
+
+    def _rollback_interaction_processing_messages(self, session: InteractionRouteSession) -> None:
+        for message_id in sorted(session.message_ids):
+            row = None
+            try:
+                row = self.db.get_message(int(message_id))
+            except Exception:
+                row = None
+            if not isinstance(row, dict):
+                continue
+            status = str(row.get("status") or "").strip().lower()
+            if status != "processing":
+                continue
+            try:
+                self.db.update_message_status(int(message_id), "received")
+            except Exception:
+                continue
+
+    def _message_from_message_row(
+        self, tenant: Any, row: Any
+    ) -> NormalizedMessage | None:
+        if row is None:
+            return None
+        raw_payload = None
+        try:
+            raw_payload = row.get("raw_json") if hasattr(row, "get") else row["raw_json"]
+        except Exception:
+            raw_payload = None
+        if isinstance(raw_payload, str):
+            try:
+                raw_payload = json.loads(raw_payload)
+            except json.JSONDecodeError:
+                raw_payload = {}
+        if not isinstance(raw_payload, dict):
+            raw_payload = {}
+
+        provider = None
+        provider_message_id = None
+        text = None
+        received_raw = None
+        project_name = None
+        try:
+            provider = row.get("provider") if hasattr(row, "get") else row["provider"]
+        except Exception:
+            provider = None
+        try:
+            provider_message_id = (
+                row.get("provider_message_id")
+                if hasattr(row, "get")
+                else row["provider_message_id"]
+            )
+        except Exception:
+            provider_message_id = None
+        try:
+            text = row.get("text") if hasattr(row, "get") else row["text"]
+        except Exception:
+            text = None
+        try:
+            received_raw = row.get("received_at") if hasattr(row, "get") else row["received_at"]
+        except Exception:
+            received_raw = None
+        try:
+            project_name = (
+                row.get("project_name") if hasattr(row, "get") else row["project_name"]
+            )
+        except Exception:
+            project_name = None
+
+        received_at = None
+        if received_raw:
+            try:
+                received_at = datetime.fromisoformat(str(received_raw))
+            except (TypeError, ValueError):
+                received_at = None
+        if received_at is None:
+            received_at = self._now()
+        if received_at.tzinfo is None:
+            received_at = received_at.replace(tzinfo=timezone.utc)
+
+        parsed = None
+        if str(provider or "") == "telegram":
+            try:
+                parsed = TelegramUpdateParser.parse(raw_payload)
+            except Exception:
+                parsed = None
+        if parsed is not None:
+            candidate = parsed
+            if provider_message_id and str(candidate.provider_message_id) != str(provider_message_id):
+                candidate = replace(candidate, provider_message_id=str(provider_message_id))
+            if text is not None and candidate.text != text:
+                candidate = replace(candidate, text=text)
+            if candidate.received_at != received_at:
+                candidate = replace(candidate, received_at=received_at)
+            if project_name and candidate.project_name != project_name:
+                candidate = replace(candidate, project_name=project_name)
+            return candidate
+
+        tenant_external_id = str(getattr(tenant, "external_id", "") or "")
+        return NormalizedMessage(
+            provider=str(provider or "event"),
+            provider_message_id=str(provider_message_id or ""),
+            tenant_external_id=tenant_external_id,
+            received_at=received_at,
+            text=text,
+            images=[],
+            raw=raw_payload,
+            project_name=str(project_name) if project_name else None,
+        )
+
+    @staticmethod
+    def _combine_received_messages(
+        messages: list[tuple[int, NormalizedMessage]]
+    ) -> NormalizedMessage:
+        if not messages:
+            raise ValueError("messages required")
+        ordered = [m for _mid, m in messages]
+        combined_lines: list[str] = []
+        for m in ordered:
+            text = (m.text or "").strip()
+            if not text and m.images:
+                text = "(attachment)"
+            if text:
+                combined_lines.append(text)
+        combined_text = "\n".join(combined_lines).strip() or None
+
+        seen_file_ids: set[str] = set()
+        combined_images: list[Attachment] = []
+        for m in ordered:
+            for img in m.images:
+                file_id = str(img.provider_file_id or "").strip()
+                if not file_id or file_id in seen_file_ids:
+                    continue
+                seen_file_ids.add(file_id)
+                combined_images.append(img)
+
+        latest = ordered[-1]
+        raw_value: dict[str, Any] = {}
+        if isinstance(latest.raw, dict):
+            raw_value = dict(latest.raw)
+        raw_value.setdefault("_batched_message_ids", [mid for mid, _m in messages])
+        return NormalizedMessage(
+            provider=latest.provider,
+            provider_message_id=latest.provider_message_id,
+            tenant_external_id=latest.tenant_external_id,
+            received_at=latest.received_at,
+            text=combined_text,
+            images=combined_images,
+            raw=raw_value,
+            project_name=latest.project_name,
+        )
 
     async def handle_message(self, msg: NormalizedMessage) -> OrchestratorResult:
         tenant = self.db.get_or_create_tenant(msg.provider, msg.tenant_external_id)
@@ -40,271 +326,433 @@ class Orchestrator:
         message_id, inserted = self.db.record_message(tenant.id, msg)
         if not inserted:
             return OrchestratorResult(status="duplicate", detail="message already processed")
-
-        msg, project_name = self._resolve_project_from_message(msg)
-        if project_name:
-            self.db.update_message_project(message_id, project_name)
-        user_payload = (msg.text or "").strip()
-        if not user_payload and msg.images:
-            user_payload = "(attachment)"
-        workspace = await self._resolve_workspace(tenant, project_name=project_name)
-        if not project_name and workspace.project_name:
-            project_name = workspace.project_name
-            msg.project_name = project_name
-            self.db.update_message_project(message_id, project_name)
-        if self._is_reset_command(user_payload):
-            self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
-            write_chat_history(workspace.tasks_dir)
-            self._reset_state(workspace, tenant, project_name=project_name)
-            self.db.update_message_status(message_id, "processed")
-            await self._send_interaction_instruction(
-                workspace=workspace,
-                tenant=tenant,
+        existing_session = self._interaction_session_for(tenant.id)
+        if existing_session is not None and existing_session.stream.accepting:
+            streamed = await self._stream_into_interaction_session(
+                session=existing_session,
+                message_id=int(message_id),
                 msg=msg,
-                instruction=(
-                    "Let the user know the reset is complete and they can resend their request."
-                ),
-                run_id=None,
-                message_id=message_id,
             )
-            return OrchestratorResult(status="accepted", detail="reset")
-
-        if await self._handle_blocked(workspace.tasks_dir, tenant, user_payload=user_payload):
-            self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
-            write_chat_history(workspace.tasks_dir)
-            self.db.update_message_status(message_id, "processed")
-            return OrchestratorResult(status="blocked", detail="system_blocked")
-
-        settings = Settings()
-        self.db.expire_stale_runs(tenant.id, project_name, self._now())
-        inflight_run = self.db.get_inflight_run(tenant.id, project_name)
-        if inflight_run:
-            if self._reconcile_inflight_run(tenant, inflight_run, workspace):
-                inflight_run = None
-        if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
-            await self._finalize_stale_run(tenant, inflight_run, notify=False)
-            inflight_run = None
-
-        active_run = self.db.get_active_run(tenant.id, project_name)
-        if active_run:
-            if not inflight_run or int(active_run["run_id"]) != int(inflight_run["id"]):
-                self.db.clear_active_run(tenant.id, project_name)
-                active_run = None
-
-        billing_status: dict[str, Any] | None = None
-        billing_checked_at: str | None = None
-        self._write_interaction_context(
-            workspace=workspace,
-            tenant=tenant,
-            msg=msg,
-            message_id=message_id,
-            project_name=project_name,
-            active_run=active_run,
-            inflight_run=inflight_run,
-            billing_status=None,
-            billing_checked_at=None,
-        )
-
-        decision_result = await self._route_interaction(
-            workspace=workspace,
-            tenant=tenant,
-            msg=msg,
-            message_id=message_id,
-        )
-        if not self._interaction_decision_valid(decision_result):
-            append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
-            try:
-                self.db.update_message_status(message_id, "failed")
-            except Exception:
-                pass
-            raise RuntimeError("interaction_route_invalid_decision")
-        decision, interaction_usage = self._normalize_interaction_decision(
-            decision_result, project_name=project_name, billing_checked=False
-        )
-
-        if decision.get("billing_check") and not decision.get("billing_checked"):
-            billing_status = await self._fetch_billing_status(
-                tenant=tenant,
-                msg=msg,
-                project_name=project_name,
-                tasks_dir=workspace.tasks_dir,
-            )
-            if billing_status is not None:
-                if not active_run and not inflight_run:
-                    self._write_billing_status(workspace.tasks_dir, billing_status)
-            billing_checked_at = self._now().isoformat()
-            self._write_interaction_context(
-                workspace=workspace,
-                tenant=tenant,
-                msg=msg,
-                message_id=message_id,
-                project_name=project_name,
-                active_run=active_run,
-                inflight_run=inflight_run,
-                billing_status=billing_status,
-                billing_checked_at=billing_checked_at,
-            )
-            decision_result = await self._route_interaction(
-                workspace=workspace,
-                tenant=tenant,
-                msg=msg,
-                message_id=message_id,
-                billing_checked=True,
-            )
-            if not self._interaction_decision_valid(decision_result):
-                append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+            if streamed:
                 try:
-                    self.db.update_message_status(message_id, "failed")
+                    self.db.update_message_status(int(message_id), "processing")
                 except Exception:
                     pass
-                raise RuntimeError("interaction_route_invalid_decision")
-            decision, interaction_usage = self._normalize_interaction_decision(
-                decision_result, project_name=project_name, billing_checked=True
-            )
+                return OrchestratorResult(status="accepted", detail="interaction_streamed")
 
-        decision_project = decision.get("project_name") or project_name or workspace.project_name
-        if decision_project:
-            decision_project = self.workspace_manager.normalize_project_name(decision_project)
-            if project_name != decision_project:
-                self.db.update_message_project(message_id, decision_project)
-            project_name = decision_project
-            msg.project_name = decision_project
-        if project_name and project_name != workspace.project_name:
-            workspace = await self._resolve_workspace(tenant, project_name=project_name)
-            inflight_run = self.db.get_inflight_run(tenant.id, project_name)
-            active_run = self.db.get_active_run(tenant.id, project_name)
-            self._write_interaction_context(
-                workspace=workspace,
-                tenant=tenant,
-                msg=msg,
-                message_id=message_id,
-                project_name=project_name,
-                active_run=active_run,
-                inflight_run=inflight_run,
-                billing_status=billing_status,
-                billing_checked_at=billing_checked_at,
-            )
-
-        self._append_chat_log(workspace.tasks_dir, "user", user_payload, msg.received_at)
-        write_chat_history(workspace.tasks_dir)
-
-        if decision.get("repo_name") and decision.get("should_run"):
-            self._write_repo_name(workspace.tasks_dir, str(decision.get("repo_name")))
-
-        if decision.get("dedupe"):
-            self.db.update_message_status(message_id, "processed")
-            return OrchestratorResult(status="accepted", detail="no_run")
-
-        if not decision.get("should_run"):
-            self.db.update_message_status(message_id, "processed")
-            return OrchestratorResult(status="accepted", detail="no_run")
-
-        if active_run and decision.get("supersede_active_run"):
-            superseded_run_id = None
+        run_message_args: dict[str, Any] | None = None
+        lock = self._interaction_lock_for(tenant.id)
+        async with lock:
+            row = None
             try:
-                cancel_project = active_run.get("project_name") if isinstance(active_run, dict) else None
+                row = self.db.get_message(message_id)
             except Exception:
-                cancel_project = None
-            cancel_project = cancel_project or project_name
-            try:
-                workspace_for_cancel = await self._resolve_workspace(
-                    tenant, project_name=cancel_project
+                row = None
+            if row is not None:
+                status = str(row.get("status") or "")
+                if status and status != "received":
+                    return OrchestratorResult(status="duplicate", detail="message already handled")
+            existing_session = self._interaction_session_for(tenant.id)
+            if existing_session is not None and existing_session.stream.accepting:
+                streamed = await self._stream_into_interaction_session(
+                    session=existing_session,
+                    message_id=int(message_id),
+                    msg=msg,
                 )
-                if hasattr(self.agent, "cancel_run"):
-                    await self.agent.cancel_run(workspace_for_cancel)
-            except Exception:
-                pass
-            try:
-                superseded_run_id = int(active_run["run_id"])
-                self.db.finish_run(superseded_run_id, status="failed", error="superseded")
-            except Exception:
-                pass
-            if superseded_run_id is not None:
-                try:
-                    run_row = self.db.get_run(superseded_run_id)
-                except Exception:
-                    run_row = None
-                message_id = None
-                if run_row is not None:
+                if streamed:
                     try:
-                        message_id = run_row.get("message_id") if hasattr(run_row, "get") else run_row["message_id"]
-                    except Exception:
-                        message_id = None
-                if message_id:
-                    try:
-                        self.db.update_message_status(int(message_id), "failed")
+                        self.db.update_message_status(int(message_id), "processing")
                     except Exception:
                         pass
-                try:
-                    self.db.cancel_run_inputs_for_run(superseded_run_id)
-                except Exception:
-                    pass
-            self.db.clear_active_run(tenant.id, project_name)
-            self._clear_inflight_stream(tenant.key, project_name)
-            active_run = None
+                    return OrchestratorResult(status="accepted", detail="interaction_streamed")
 
-        if active_run:
-            self.db.update_message_status(message_id, "queued")
-            self._enqueue_run_input(
-                tenant_id=tenant.id,
-                run_id=int(active_run["run_id"]),
-                project_name=project_name,
-                message_id=message_id,
-                msg=msg,
-                status="queued",
-                routing_decision=decision,
-            )
-            if not decision.get("reply_sent"):
-                await self._send_busy_ack(
-                    workspace=workspace, tenant=tenant, msg=msg, message_id=message_id
+            settings = Settings()
+            batched_messages: list[tuple[int, NormalizedMessage]] = [(int(message_id), msg)]
+            message_ids = [mid for mid, _ in batched_messages]
+            latest_message_id = message_ids[-1]
+            combined_msg = self._combine_received_messages(batched_messages)
+
+            # Resolve project from latest message + directive extraction.
+            combined_msg, project_name = self._resolve_project_for_tenant(tenant, combined_msg)
+            if project_name:
+                for mid in message_ids:
+                    try:
+                        self.db.update_message_project(mid, project_name)
+                    except Exception:
+                        continue
+
+            user_payloads: list[tuple[str, datetime]] = []
+            for _mid, m in batched_messages:
+                text = (m.text or "").strip()
+                if not text and m.images:
+                    text = "(attachment)"
+                if text:
+                    user_payloads.append((text, m.received_at))
+            combined_user_payload = (combined_msg.text or "").strip()
+            if not combined_user_payload and combined_msg.images:
+                combined_user_payload = "(attachment)"
+
+            workspace = await self._resolve_workspace(tenant, project_name=project_name)
+
+            # Reset should apply for the current interaction turn.
+            if any(self._is_reset_command((m.text or "").strip()) for _mid, m in batched_messages):
+                for payload, received_at in user_payloads:
+                    self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
+                write_chat_history(workspace.tasks_dir)
+                self._reset_state(workspace, tenant, project_name=project_name)
+                self.db.update_message_statuses(message_ids, "processed")
+                await self._send_interaction_instruction(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=combined_msg,
+                    instruction=(
+                        "Let the user know the reset is complete and they can resend their request."
+                    ),
+                    run_id=None,
+                    message_id=latest_message_id,
                 )
-            self._write_request_status(workspace, tenant)
-            return OrchestratorResult(status="busy", detail="tenant already running")
+                return OrchestratorResult(status="accepted", detail="reset")
 
-        lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
-        run_id = self.db.create_run(
-            tenant.id,
-            message_id=message_id,
-            project_name=workspace.project_name,
-            lease_seconds=settings.run_lease_seconds,
-        )
-        if interaction_usage is not None:
-            self._record_interaction_usage(run_id, interaction_usage, workspace.tasks_dir)
-        self.db.update_run_decision(run_id, decision)
-        self.db.set_active_run(tenant.id, workspace.project_name or "main", run_id, lease_expires)
-        run_input_id = self._enqueue_run_input(
-            tenant_id=tenant.id,
-            run_id=run_id,
-            project_name=project_name,
-            message_id=message_id,
-            msg=msg,
-            status="claimed",
-            routing_decision=decision,
-        )
-        if not decision.get("reply_sent"):
-            await self._send_interaction_instruction(
+            if await self._handle_blocked(
+                workspace.tasks_dir, tenant, user_payload=combined_user_payload
+            ):
+                for payload, received_at in user_payloads:
+                    self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
+                write_chat_history(workspace.tasks_dir)
+                self.db.update_message_statuses(message_ids, "processed")
+                return OrchestratorResult(status="blocked", detail="system_blocked")
+
+            self.db.expire_stale_runs(tenant.id, project_name, self._now())
+            inflight_run = self.db.get_inflight_run(tenant.id, project_name)
+            if inflight_run:
+                if self._reconcile_inflight_run(tenant, inflight_run, workspace):
+                    inflight_run = None
+            if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
+                await self._finalize_stale_run(tenant, inflight_run, notify=False)
+                inflight_run = None
+
+            active_run = self.db.get_active_run(tenant.id, project_name)
+            if active_run:
+                if not inflight_run or int(active_run["run_id"]) != int(inflight_run["id"]):
+                    self.db.clear_active_run(tenant.id, project_name)
+                    active_run = None
+
+            # Download attachments for this interaction turn.
+            asset_paths = await self._download_message_assets(combined_msg, workspace)
+            if not project_name and workspace.project_name:
+                project_name = workspace.project_name
+                combined_msg.project_name = project_name
+                for mid in message_ids:
+                    try:
+                        self.db.update_message_project(mid, project_name)
+                    except Exception:
+                        continue
+
+            billing_status: dict[str, Any] | None = None
+            billing_checked_at: str | None = None
+            self._write_interaction_context(
                 workspace=workspace,
                 tenant=tenant,
-                msg=msg,
-                instruction=(
-                    "Acknowledge the user's request and say you're starting the work. "
-                    "Keep it brief and non-technical."
-                ),
-                run_id=run_id,
-                message_id=message_id,
+                msg=combined_msg,
+                message_id=latest_message_id,
+                project_name=project_name,
+                active_run=active_run,
+                inflight_run=inflight_run,
+                billing_status=None,
+                billing_checked_at=None,
+                asset_paths=asset_paths,
             )
-        return await self._run_message(
-            tenant=tenant,
-            msg=msg,
-            message_id=message_id,
-            message_ids=[message_id],
-            run_id=run_id,
-            run_input_ids=[run_input_id],
-            process_queue=True,
-            project_name=project_name,
-            billing_status=billing_status,
-            routing_decision=decision,
-        )
+            interaction_session = self._open_interaction_session(
+                tenant=tenant,
+                workspace=workspace,
+                project_name=project_name,
+                messages=batched_messages,
+            )
+            interaction_session_status = "failed"
+            try:
+                decision_result = await self._route_interaction(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=combined_msg,
+                    message_id=latest_message_id,
+                    asset_paths=asset_paths,
+                    inflight_stream=interaction_session.stream,
+                )
+                if not self._interaction_decision_valid(decision_result):
+                    append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+                    try:
+                        self.db.update_message_statuses(message_ids, "failed")
+                    except Exception:
+                        pass
+                    raise RuntimeError("interaction_route_invalid_decision")
+                decision, interaction_usage = self._normalize_interaction_decision(
+                    decision_result, project_name=project_name, billing_checked=False
+                )
+
+                if decision.get("billing_check") and not decision.get("billing_checked"):
+                    billing_status = await self._fetch_billing_status(
+                        tenant=tenant,
+                        msg=combined_msg,
+                        project_name=project_name,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                    if billing_status is not None:
+                        if not active_run and not inflight_run:
+                            self._write_billing_status(workspace.tasks_dir, billing_status)
+                    billing_checked_at = self._now().isoformat()
+                    self._write_interaction_context(
+                        workspace=workspace,
+                        tenant=tenant,
+                        msg=combined_msg,
+                        message_id=latest_message_id,
+                        project_name=project_name,
+                        active_run=active_run,
+                        inflight_run=inflight_run,
+                        billing_status=billing_status,
+                        billing_checked_at=billing_checked_at,
+                        asset_paths=asset_paths,
+                    )
+                    decision_result = await self._route_interaction(
+                        workspace=workspace,
+                        tenant=tenant,
+                        msg=combined_msg,
+                        message_id=latest_message_id,
+                        billing_checked=True,
+                        asset_paths=asset_paths,
+                        inflight_stream=interaction_session.stream,
+                    )
+                    if not self._interaction_decision_valid(decision_result):
+                        append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+                        try:
+                            self.db.update_message_statuses(message_ids, "failed")
+                        except Exception:
+                            pass
+                        raise RuntimeError("interaction_route_invalid_decision")
+                    decision, interaction_usage = self._normalize_interaction_decision(
+                        decision_result, project_name=project_name, billing_checked=True
+                    )
+
+                decision_project = decision.get("project_name") or project_name or workspace.project_name
+                if decision_project:
+                    decision_project = self.workspace_manager.normalize_project_name(decision_project)
+                    if project_name != decision_project:
+                        for mid in message_ids:
+                            try:
+                                self.db.update_message_project(mid, decision_project)
+                            except Exception:
+                                continue
+                    project_name = decision_project
+                    combined_msg.project_name = decision_project
+                if project_name and project_name != workspace.project_name:
+                    workspace = await self._resolve_workspace(tenant, project_name=project_name)
+                    inflight_run = self.db.get_inflight_run(tenant.id, project_name)
+                    active_run = self.db.get_active_run(tenant.id, project_name)
+                    self._write_interaction_context(
+                        workspace=workspace,
+                        tenant=tenant,
+                        msg=combined_msg,
+                        message_id=latest_message_id,
+                        project_name=project_name,
+                        active_run=active_run,
+                        inflight_run=inflight_run,
+                        billing_status=billing_status,
+                        billing_checked_at=billing_checked_at,
+                        asset_paths=asset_paths,
+                    )
+
+                # Stop accepting new streamed messages before snapshotting the session.
+                interaction_session.stream.accepting = False
+                batched_messages = self._merge_interaction_session_messages(
+                    batched_messages=batched_messages,
+                    session=interaction_session,
+                )
+                message_ids = [mid for mid, _m in batched_messages]
+                latest_message_id = batched_messages[-1][0]
+                combined_msg = self._combine_received_messages(batched_messages)
+                if project_name:
+                    combined_msg.project_name = project_name
+                    for mid in message_ids:
+                        try:
+                            self.db.update_message_project(mid, project_name)
+                        except Exception:
+                            continue
+                user_payloads = []
+                for _mid, m in batched_messages:
+                    text = (m.text or "").strip()
+                    if not text and m.images:
+                        text = "(attachment)"
+                    if text:
+                        user_payloads.append((text, m.received_at))
+
+                # Use the final merged interaction payload and final workspace before running.
+                asset_paths = await self._download_message_assets(combined_msg, workspace)
+                self._write_interaction_context(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=combined_msg,
+                    message_id=latest_message_id,
+                    project_name=project_name,
+                    active_run=active_run,
+                    inflight_run=inflight_run,
+                    billing_status=billing_status,
+                    billing_checked_at=billing_checked_at,
+                    asset_paths=asset_paths,
+                )
+
+                for payload, received_at in user_payloads:
+                    self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
+                write_chat_history(workspace.tasks_dir)
+
+                if decision.get("repo_name") and decision.get("should_run"):
+                    self._write_repo_name(workspace.tasks_dir, str(decision.get("repo_name")))
+
+                if decision.get("dedupe") or not decision.get("should_run"):
+                    self.db.update_message_statuses(message_ids, "processed")
+                    interaction_session_status = "completed"
+                    return OrchestratorResult(status="accepted", detail="no_run")
+
+                if active_run and decision.get("supersede_active_run"):
+                    superseded_run_id = None
+                    try:
+                        cancel_project = (
+                            active_run.get("project_name") if isinstance(active_run, dict) else None
+                        )
+                    except Exception:
+                        cancel_project = None
+                    cancel_project = cancel_project or project_name
+                    try:
+                        workspace_for_cancel = await self._resolve_workspace(
+                            tenant, project_name=cancel_project
+                        )
+                        if hasattr(self.agent, "cancel_run"):
+                            await self.agent.cancel_run(workspace_for_cancel)
+                    except Exception:
+                        pass
+                    try:
+                        superseded_run_id = int(active_run["run_id"])
+                        self.db.finish_run(superseded_run_id, status="failed", error="superseded")
+                    except Exception:
+                        pass
+                    if superseded_run_id is not None:
+                        try:
+                            run_row = self.db.get_run(superseded_run_id)
+                        except Exception:
+                            run_row = None
+                        superseded_message_id = None
+                        if run_row is not None:
+                            try:
+                                superseded_message_id = (
+                                    run_row.get("message_id")
+                                    if hasattr(run_row, "get")
+                                    else run_row["message_id"]
+                                )
+                            except Exception:
+                                superseded_message_id = None
+                        if superseded_message_id:
+                            try:
+                                self.db.update_message_status(int(superseded_message_id), "failed")
+                            except Exception:
+                                pass
+                        try:
+                            self.db.cancel_run_inputs_for_run(superseded_run_id)
+                        except Exception:
+                            pass
+                    self.db.clear_active_run(tenant.id, project_name)
+                    self._clear_inflight_stream(tenant.key, project_name)
+                    active_run = None
+
+                if active_run:
+                    self.db.update_message_statuses(message_ids, "queued")
+                    for mid, m in batched_messages:
+                        self._enqueue_run_input(
+                            tenant_id=tenant.id,
+                            run_id=int(active_run["run_id"]),
+                            project_name=project_name,
+                            message_id=mid,
+                            msg=m,
+                            status="queued",
+                            routing_decision=decision,
+                        )
+                    if not decision.get("reply_sent"):
+                        await self._send_busy_ack(
+                            workspace=workspace,
+                            tenant=tenant,
+                            msg=combined_msg,
+                            message_id=latest_message_id,
+                            asset_paths=asset_paths,
+                        )
+                    self._write_request_status(workspace, tenant)
+                    interaction_session_status = "completed"
+                    return OrchestratorResult(status="busy", detail="tenant already running")
+
+                lease_expires = (self._now() + timedelta(seconds=settings.run_lease_seconds)).isoformat()
+                run_id = self.db.create_run(
+                    tenant.id,
+                    message_id=latest_message_id,
+                    project_name=workspace.project_name,
+                    lease_seconds=settings.run_lease_seconds,
+                )
+                if interaction_usage is not None:
+                    self._record_interaction_usage(run_id, interaction_usage, workspace.tasks_dir)
+                self.db.update_run_decision(run_id, decision)
+                self.db.set_active_run(
+                    tenant.id, workspace.project_name or "main", run_id, lease_expires
+                )
+                run_input_ids: list[str] = []
+                for mid, m in batched_messages:
+                    run_input_ids.append(
+                        self._enqueue_run_input(
+                            tenant_id=tenant.id,
+                            run_id=run_id,
+                            project_name=project_name,
+                            message_id=mid,
+                            msg=m,
+                            status="claimed",
+                            routing_decision=decision,
+                        )
+                    )
+                # Ensure concurrent tasks don't re-route inputs already merged into this turn.
+                try:
+                    self.db.update_message_statuses(message_ids, "processing")
+                except Exception:
+                    pass
+                if not decision.get("reply_sent"):
+                    await self._send_interaction_instruction(
+                        workspace=workspace,
+                        tenant=tenant,
+                        msg=combined_msg,
+                        instruction=(
+                            "Acknowledge the user's request and say you're starting the work. "
+                            "Keep it brief and non-technical."
+                        ),
+                        run_id=run_id,
+                        message_id=latest_message_id,
+                        asset_paths=asset_paths,
+                    )
+
+                run_message_args = {
+                    "tenant": tenant,
+                    "msg": combined_msg,
+                    "message_id": latest_message_id,
+                    "message_ids": message_ids,
+                    "run_id": run_id,
+                    "run_input_ids": run_input_ids,
+                    "process_queue": True,
+                    "project_name": project_name,
+                    "billing_status": billing_status,
+                    "routing_decision": decision,
+                    "asset_paths": asset_paths,
+                }
+                interaction_session_status = "completed"
+            finally:
+                if interaction_session_status != "completed":
+                    self._rollback_interaction_processing_messages(interaction_session)
+                self._close_interaction_session(tenant.id, status=interaction_session_status)
+
+        if run_message_args is not None:
+            return await self._run_message(**run_message_args)
+
+        return OrchestratorResult(status="accepted")
 
     async def handle_event_job(
         self,
@@ -442,6 +890,16 @@ class Orchestrator:
             )
         return OrchestratorResult(status="accepted", detail="run_cancelled")
 
+    async def _download_message_assets(
+        self, msg: NormalizedMessage, workspace: Workspace
+    ) -> list[str]:
+        if not msg.images or not hasattr(self.messenger, "download_images"):
+            return []
+        try:
+            return await self.messenger.download_images(msg.images, workspace.assets_dir)
+        except Exception:
+            return []
+
     async def _run_message(
         self,
         tenant,
@@ -454,6 +912,7 @@ class Orchestrator:
         run_input_ids: list[str] | None = None,
         billing_status: dict[str, Any] | None = None,
         routing_decision: dict[str, Any] | None = None,
+        asset_paths: list[str] | None = None,
     ) -> OrchestratorResult:
         workspace = await self._resolve_workspace(tenant, project_name=project_name)
         message_ids = message_ids or ([message_id] if message_id else [])
@@ -461,8 +920,8 @@ class Orchestrator:
             self.db.update_message_statuses(message_ids, "processing")
         self._write_request_status(workspace, tenant)
 
-        asset_paths = []
-        if msg.images and hasattr(self.messenger, "download_images"):
+        asset_paths = asset_paths or []
+        if not asset_paths and msg.images and hasattr(self.messenger, "download_images"):
             asset_paths = await self.messenger.download_images(msg.images, workspace.assets_dir)
 
         if billing_status is None and msg.provider != "event":
@@ -800,6 +1259,8 @@ class Orchestrator:
         msg: NormalizedMessage,
         message_id: int,
         billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        inflight_stream: InflightTextStream | None = None,
     ) -> Any:
         router = getattr(self.agent, "route_interaction", None)
         if router is None:
@@ -810,7 +1271,7 @@ class Orchestrator:
                 pass
             raise RuntimeError("interaction_router_missing")
         try:
-            return await router(
+            router_args = dict(
                 workspace=workspace,
                 message=msg,
                 messenger=self.messenger,
@@ -822,7 +1283,15 @@ class Orchestrator:
                 tenant_external_id=msg.tenant_external_id,
                 message_id=message_id,
                 billing_checked=billing_checked,
+                asset_paths=asset_paths,
+                execution_bridge=self,
             )
+            try:
+                if "inflight_stream" in inspect.signature(router).parameters:
+                    router_args["inflight_stream"] = inflight_stream
+            except (TypeError, ValueError):
+                pass
+            return await router(**router_args)
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(
@@ -897,6 +1366,7 @@ class Orchestrator:
         inflight_run: Any | None,
         billing_status: dict[str, Any] | None,
         billing_checked_at: str | None,
+        asset_paths: list[str] | None = None,
     ) -> None:
         try:
             queued = self.db.count_run_inputs(
@@ -928,6 +1398,7 @@ class Orchestrator:
                     }
                     for image in msg.images
                 ],
+                "assets": asset_paths or [],
             },
             "project_name": project_name,
             "active_run": dict(active_run) if active_run else None,
@@ -1149,6 +1620,7 @@ class Orchestrator:
         msg: NormalizedMessage,
         *,
         message_id: int | None = None,
+        asset_paths: list[str] | None = None,
     ) -> None:
         user_text = (msg.text or "").strip()
         if not user_text and msg.images:
@@ -1167,6 +1639,7 @@ class Orchestrator:
             instruction=instruction,
             run_id=None,
             message_id=message_id,
+            asset_paths=asset_paths,
         )
         if sent:
             return
@@ -1187,6 +1660,7 @@ class Orchestrator:
         instruction: str,
         run_id: int | None = None,
         message_id: int | None = None,
+        asset_paths: list[str] | None = None,
     ) -> bool:
         sender = getattr(self.agent, "send_interaction_instruction", None)
         if sender is None:
@@ -1205,6 +1679,8 @@ class Orchestrator:
                 or getattr(tenant, "external_id", None),
                 run_id=run_id,
                 message_id=message_id,
+                asset_paths=asset_paths,
+                execution_bridge=self,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
             return True
@@ -1252,6 +1728,7 @@ class Orchestrator:
         text: str,
         run_id: int | None = None,
         message_id: int | None = None,
+        asset_paths: list[str] | None = None,
     ) -> None:
         sender = getattr(self.agent, "send_interaction_message", None)
         if sender is None:
@@ -1270,6 +1747,8 @@ class Orchestrator:
                 or getattr(tenant, "external_id", None),
                 run_id=run_id,
                 message_id=message_id,
+                asset_paths=asset_paths,
+                execution_bridge=self,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
         except Exception as exc:  # noqa: BLE001
@@ -1797,6 +2276,25 @@ class Orchestrator:
         except (OSError, json.JSONDecodeError):
             return False
         error = payload.get("error")
+        stop_reason = str(payload.get("stop_reason") or "").strip() or None
+        result_subtype = str(payload.get("result_subtype") or "").strip() or None
+        if not error and result_subtype and result_subtype.startswith("error_"):
+            error = f"agent_result_subtype:{result_subtype}"
+        if (
+            not error
+            and stop_reason
+            and stop_reason
+            in {
+                "max_tokens",
+                "refusal",
+                "model_context_window_exceeded",
+                "pause_turn",
+                "tool_use",
+            }
+        ):
+            error = f"agent_stop_reason:{stop_reason}"
+        if not error and stop_reason and stop_reason not in {"end_turn", "stop_sequence"}:
+            error = f"agent_stop_reason:{stop_reason}"
         status = "failed" if error else "completed"
         run_id = run["id"] if hasattr(run, "keys") else run.get("id")
         total_cost = payload.get("total_cost_usd")
@@ -1838,7 +2336,331 @@ class Orchestrator:
         return True
 
     def _supports_inflight_stream(self) -> bool:
-        return bool(getattr(self.agent, "supports_inflight_stream", False))
+        return bool(
+            getattr(self.agent, "supports_inflight_stream", False)
+            or getattr(self.agent, "supports_file_stream", False)
+        )
+
+    def _supports_file_streaming(self) -> bool:
+        return bool(getattr(self.agent, "supports_file_stream", False))
+
+    def list_execution_agents(
+        self,
+        *,
+        tenant_id: int,
+        tenant_key: str | None,
+        project_name: str | None = None,
+    ) -> list[dict[str, Any]]:
+        active_rows: list[dict[str, Any]] = []
+        if project_name:
+            active = self.db.get_active_run(tenant_id, project_name)
+            if isinstance(active, dict):
+                active_rows.append(active)
+        else:
+            try:
+                listed = self.db.list_active_runs(limit=200)
+            except Exception:
+                listed = []
+            for row in listed:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    row_tenant_id = int(row.get("tenant_id"))
+                except (TypeError, ValueError):
+                    continue
+                if row_tenant_id != int(tenant_id):
+                    continue
+                if project_name and str(row.get("project_name") or "") != str(project_name):
+                    continue
+                active_rows.append(row)
+            if not active_rows:
+                active = self.db.get_active_run(tenant_id, project_name)
+                if isinstance(active, dict):
+                    active_rows.append(active)
+        inflight = self.db.get_inflight_run(tenant_id, project_name)
+        seen: set[int] = set()
+        agents: list[dict[str, Any]] = []
+
+        def _append(
+            source: str,
+            run_row: dict[str, Any] | None,
+            active_row: dict[str, Any] | None,
+        ):
+            if not run_row and not active_row:
+                return
+            run_id = None
+            project = None
+            if active_row:
+                try:
+                    run_id = int(active_row.get("run_id"))
+                except (TypeError, ValueError):
+                    run_id = None
+                project = active_row.get("project_name")
+            if run_row and run_id is None:
+                try:
+                    run_id = int(run_row.get("id"))
+                except (TypeError, ValueError):
+                    run_id = None
+            if run_row and not project:
+                project = run_row.get("project_name")
+            if run_id is None or run_id in seen:
+                return
+            seen.add(run_id)
+            stream = None
+            if tenant_key and getattr(self.agent, "supports_inflight_stream", False):
+                stream = self._get_inflight_stream(tenant_key, project)
+            stream_supported = self._supports_inflight_stream()
+            stream_active = stream is not None or (
+                stream_supported and self._supports_file_streaming()
+            )
+            stream_accepting = bool(stream.accepting) if stream else stream_supported
+            agents.append(
+                {
+                    "run_id": run_id,
+                    "project_name": project,
+                    "status": run_row.get("status") if run_row else None,
+                    "started_at": run_row.get("started_at") if run_row else None,
+                    "lease_expires_at": (
+                        active_row.get("lease_expires_at") if active_row else None
+                    ),
+                    "source": source,
+                    "stream_supported": stream_supported,
+                    "stream_active": stream_active,
+                    "stream_accepting": stream_accepting,
+                }
+            )
+
+        active_by_project: dict[str, dict[str, Any]] = {}
+        for active in active_rows:
+            active_run_row = None
+            try:
+                active_run_id = int(active.get("run_id"))
+            except (TypeError, ValueError):
+                active_run_id = None
+            if active_run_id is not None:
+                try:
+                    active_run_row = self.db.get_run(active_run_id)
+                except Exception:
+                    active_run_row = None
+            _append("active_run", active_run_row, active)
+            key = str(active.get("project_name") or "")
+            if key not in active_by_project:
+                active_by_project[key] = active
+        inflight_active = None
+        if isinstance(inflight, dict):
+            inflight_active = active_by_project.get(str(inflight.get("project_name") or ""))
+        _append("inflight_run", inflight, inflight_active)
+        return agents
+
+    async def stream_to_execution_agent(
+        self,
+        *,
+        tenant_key: str,
+        project_name: str | None,
+        text: str,
+        run_id: int | None = None,
+    ) -> dict[str, Any]:
+        if not self._supports_inflight_stream():
+            return {"ok": False, "status": "unsupported"}
+        if not tenant_key:
+            return {"ok": False, "status": "missing_tenant_key"}
+        provider, external_id = self._split_tenant_key(tenant_key)
+        if not provider or not external_id:
+            return {"ok": False, "status": "missing_tenant_key"}
+        tenant = self.db.get_tenant_by_external(provider, external_id)
+        if tenant is None:
+            return {"ok": False, "status": "tenant_not_found"}
+        tenant_id = int(tenant.id)
+        explicit_run_id = run_id is not None
+        run_row = None
+        if explicit_run_id:
+            try:
+                run_row = self.db.get_run(int(run_id))
+            except Exception:
+                run_row = None
+            if not isinstance(run_row, dict):
+                return {"ok": False, "status": "not_found"}
+            try:
+                run_tenant_id = int(run_row.get("tenant_id"))
+            except (TypeError, ValueError):
+                run_tenant_id = None
+            if run_tenant_id != tenant_id:
+                return {"ok": False, "status": "not_found"}
+        if run_row and isinstance(run_row, dict):
+            project_name = str(run_row.get("project_name") or "").strip() or project_name
+
+        def _is_active_run_for_tenant(target_run_id: int) -> bool:
+            try:
+                active_rows = self.db.list_active_runs(limit=200)
+            except Exception:
+                active_rows = []
+            for active in active_rows or []:
+                if not isinstance(active, dict):
+                    continue
+                try:
+                    active_tenant_id = int(active.get("tenant_id"))
+                    active_run_id = int(active.get("run_id"))
+                except (TypeError, ValueError):
+                    continue
+                if active_tenant_id == tenant_id and active_run_id == int(target_run_id):
+                    return True
+            if project_name:
+                try:
+                    active = self.db.get_active_run(tenant_id, project_name)
+                except Exception:
+                    active = None
+                if isinstance(active, dict):
+                    try:
+                        return int(active.get("run_id")) == int(target_run_id)
+                    except (TypeError, ValueError):
+                        return False
+            return False
+
+        if run_id is not None and run_row is None:
+            try:
+                run_row = self.db.get_run(int(run_id))
+            except Exception:
+                run_row = None
+            if not isinstance(run_row, dict):
+                return {"ok": False, "status": "not_found"}
+            try:
+                run_tenant_id = int(run_row.get("tenant_id"))
+            except (TypeError, ValueError):
+                run_tenant_id = None
+            if run_tenant_id != tenant_id:
+                return {"ok": False, "status": "not_found"}
+        if run_row and isinstance(run_row, dict):
+            run_status = str(run_row.get("status") or "").strip().lower()
+            if run_status != "running":
+                return {"ok": False, "status": "no_active_run"}
+            if not _is_active_run_for_tenant(int(run_id or 0)):
+                return {"ok": False, "status": "no_active_run"}
+        if run_row is None:
+            candidates = self.list_execution_agents(
+                tenant_id=tenant_id,
+                tenant_key=tenant_key,
+                project_name=project_name,
+            )
+            if project_name:
+                filtered = [
+                    candidate
+                    for candidate in candidates
+                    if str(candidate.get("project_name") or "").strip() == str(project_name)
+                ]
+                if filtered:
+                    candidates = filtered
+            if len(candidates) > 1:
+                return {
+                    "ok": False,
+                    "status": "ambiguous_run",
+                    "candidates": [
+                        {
+                            "run_id": candidate.get("run_id"),
+                            "project_name": candidate.get("project_name"),
+                            "status": candidate.get("status"),
+                        }
+                        for candidate in candidates
+                    ],
+                }
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                try:
+                    run_id = int(candidate.get("run_id"))
+                except (TypeError, ValueError):
+                    run_id = None
+                if not project_name:
+                    project_name = str(candidate.get("project_name") or "").strip() or None
+        if run_id is not None and run_row is None:
+            try:
+                run_row = self.db.get_run(int(run_id))
+            except Exception:
+                run_row = None
+            if not isinstance(run_row, dict):
+                return {"ok": False, "status": "no_active_run"}
+            try:
+                run_tenant_id = int(run_row.get("tenant_id"))
+            except (TypeError, ValueError):
+                run_tenant_id = None
+            if run_tenant_id != tenant_id:
+                return {"ok": False, "status": "not_found"}
+            run_status = str(run_row.get("status") or "").strip().lower()
+            if run_status != "running":
+                return {"ok": False, "status": "no_active_run"}
+            if not _is_active_run_for_tenant(int(run_id)):
+                return {"ok": False, "status": "no_active_run"}
+        persisted_stream_id = None
+        if run_id is not None:
+            try:
+                persisted_stream_id = self.db.enqueue_execution_stream_input(
+                    tenant_id=tenant_id,
+                    run_id=int(run_id),
+                    project_name=project_name,
+                    message_id=None,
+                    provider_message_id=None,
+                    text=str(text or "").strip(),
+                    assets=[],
+                    status="pending",
+                )
+            except Exception:
+                persisted_stream_id = None
+        stream = None
+        if getattr(self.agent, "supports_inflight_stream", False):
+            stream = self._get_inflight_stream(tenant_key, project_name)
+        if stream and stream.accepting:
+            payload = str(text or "").strip()
+            if not payload:
+                return {"ok": False, "status": "empty"}
+            try:
+                stream.queue.put_nowait(payload)
+            except Exception:
+                return {"ok": False, "status": "enqueue_failed"}
+            return {
+                "ok": True,
+                "status": "streamed",
+                "run_id": run_id,
+                "project_name": project_name,
+                "stream_input_id": persisted_stream_id,
+            }
+        if run_id is None:
+            return {"ok": False, "status": "no_active_run"}
+        if persisted_stream_id is not None:
+            return {
+                "ok": True,
+                "status": "db_stream",
+                "run_id": run_id,
+                "project_name": project_name,
+                "stream_input_id": persisted_stream_id,
+            }
+        if self._supports_file_streaming():
+            return {
+                "ok": True,
+                "status": "file_stream",
+                "run_id": run_id,
+                "project_name": project_name,
+            }
+        return {"ok": False, "status": "no_stream"}
+
+    async def stop_execution_agent(
+        self,
+        *,
+        run_id: int,
+        reason: str = "user_requested",
+        notify: bool = True,
+    ) -> OrchestratorResult:
+        return await self.cancel_run(run_id, reason=reason, notify=notify)
+
+    @staticmethod
+    def _split_tenant_key(tenant_key: str) -> tuple[str | None, str | None]:
+        if not tenant_key:
+            return None, None
+        if ":" not in tenant_key:
+            return None, None
+        provider, external_id = tenant_key.split(":", 1)
+        provider = provider.strip()
+        external_id = external_id.strip()
+        if not provider or not external_id:
+            return None, None
+        return provider, external_id
 
     async def _github_runtime_env(
         self,
@@ -2301,6 +3123,8 @@ class Orchestrator:
             "summary": getattr(result, "summary", None),
             "total_cost_usd": getattr(result, "total_cost_usd", None),
             "usage": getattr(result, "usage", None),
+            "stop_reason": getattr(result, "stop_reason", None),
+            "result_subtype": getattr(result, "result_subtype", None),
             "tool_summary": tool_summary,
         }
         path = tasks_dir / "run_result.json"

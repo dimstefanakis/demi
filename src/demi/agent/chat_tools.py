@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from claude_agent_sdk import McpSdkServerConfig, SdkMcpTool, create_sdk_mcp_server, tool
 
@@ -33,9 +33,11 @@ class ChatToolContext:
     db: Database | None = None
     tenant_id: int | None = None
     payments: Any | None = None
+    execution_bridge: Any | None = None
     role: str = "primary"
     run_id: int | None = None
     message_id: int | None = None
+    on_interaction_message_sent: Callable[[], None] | None = None
 
 
 def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
@@ -143,6 +145,65 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             )
         except Exception:
             return
+
+    def _interaction_context_payload() -> dict[str, Any] | None:
+        path = context.tasks_dir / "interaction_context.json"
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _interaction_message_meta() -> dict[str, Any]:
+        payload = _interaction_context_payload() or {}
+        message = payload.get("message") if isinstance(payload.get("message"), dict) else {}
+        return {
+            "message_id": payload.get("message_id"),
+            "provider_message_id": message.get("provider_message_id"),
+            "assets": message.get("assets") or [],
+            "project_name": payload.get("project_name"),
+        }
+
+    def _append_inflight_update_file(
+        *,
+        text: str,
+        assets: list[str],
+        message_id: int | None,
+        provider_message_id: str | None,
+        run_id: int | None,
+    ) -> None:
+        path = context.tasks_dir / "inflight_updates.jsonl"
+        entry: dict[str, Any] = {
+            "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+            "text": text,
+            "assets": assets or [],
+        }
+        if run_id is not None:
+            entry["run_id"] = int(run_id)
+        if message_id is not None:
+            entry["message_id"] = message_id
+        if provider_message_id:
+            entry["provider_message_id"] = provider_message_id
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(entry, ensure_ascii=True) + "\n")
+        except OSError:
+            return
+
+    def _format_stream_text(text: str, assets: list[str]) -> str:
+        text = text.strip()
+        if assets:
+            suffix = "\n".join(f"- {path}" for path in assets if path)
+            if suffix:
+                header = "\n\nAttachments:\n"
+                if text:
+                    text = f"{text}{header}{suffix}"
+                else:
+                    text = f"Attachments:\n{suffix}"
+        return text
 
     def _enqueue_interaction_update(payload: dict[str, Any]) -> bool:
         if context.db is None:
@@ -294,6 +355,348 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         }
 
     @tool(
+        "find_execution_agent",
+        "Find active execution agent runs for this tenant/project.",
+        {"project_name": str},
+    )
+    async def find_execution_agent(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if str(context.role or "primary") != "interaction":
+            payload = {"ok": False, "status": "interaction_only"}
+            _log("find_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if context.execution_bridge is None:
+            payload = {"ok": False, "status": "bridge_unavailable"}
+            _log("find_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            payload = {"ok": False, "status": "missing_tenant"}
+            _log("find_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        project_name = str(args.get("project_name") or "").strip() or None
+        if not project_name:
+            meta = _interaction_message_meta()
+            project_name = str(meta.get("project_name") or "").strip() or None
+        try:
+            agents = context.execution_bridge.list_execution_agents(
+                tenant_id=tenant_id,
+                tenant_key=context.tenant_key,
+                project_name=project_name,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("find_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        payload = {"ok": True, "count": len(agents), "agents": agents}
+        _log("find_execution_agent", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "stream_to_execution_agent",
+        "Stream a new user message to an active execution agent.",
+        {
+            "text": str,
+            "project_name": str,
+            "run_id": int,
+            "assets": list,
+        },
+    )
+    async def stream_to_execution_agent(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if str(context.role or "primary") != "interaction":
+            payload = {"ok": False, "status": "interaction_only"}
+            _log("stream_to_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if context.execution_bridge is None:
+            payload = {"ok": False, "status": "bridge_unavailable"}
+            _log("stream_to_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        text = str(args.get("text") or "").strip()
+        raw_assets = args.get("assets") or []
+        assets = [str(item).strip() for item in raw_assets if str(item).strip()]
+        if not assets:
+            meta = _interaction_message_meta()
+            meta_assets = meta.get("assets") or []
+            assets = [str(item).strip() for item in meta_assets if str(item).strip()]
+        if not text and not assets:
+            payload = {"ok": False, "status": "empty"}
+            _log("stream_to_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        project_name = str(args.get("project_name") or "").strip() or None
+        run_id = args.get("run_id")
+        try:
+            run_id = int(run_id) if run_id is not None else None
+        except (TypeError, ValueError):
+            run_id = None
+        if not project_name:
+            meta = _interaction_message_meta()
+            project_name = str(meta.get("project_name") or "").strip() or None
+        stream_text = _format_stream_text(text, assets)
+        tenant_key = context.tenant_key
+        if not tenant_key and context.provider and context.tenant_external_id:
+            tenant_key = f"{context.provider}:{context.tenant_external_id}"
+        if not tenant_key:
+            payload = {"ok": False, "status": "missing_tenant_key"}
+            _log("stream_to_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if run_id is None:
+            tenant_id = _resolve_tenant_id()
+            if tenant_id is None:
+                tenant_id = 0
+            agents: list[dict[str, Any]] = []
+            try:
+                listed = context.execution_bridge.list_execution_agents(
+                    tenant_id=tenant_id,
+                    tenant_key=tenant_key,
+                    project_name=project_name,
+                )
+                agents = [agent for agent in listed if isinstance(agent, dict)]
+            except Exception:
+                agents = []
+            candidates = agents
+            if project_name:
+                project_filtered = [
+                    agent
+                    for agent in candidates
+                    if str(agent.get("project_name") or "").strip() == project_name
+                ]
+                if project_filtered:
+                    candidates = project_filtered
+            if len(candidates) == 1:
+                candidate = candidates[0]
+                try:
+                    run_id = int(candidate.get("run_id"))
+                except (TypeError, ValueError):
+                    run_id = None
+                if not project_name:
+                    project_name = str(candidate.get("project_name") or "").strip() or None
+            elif len(candidates) > 1:
+                payload = {
+                    "ok": False,
+                    "status": "ambiguous_run",
+                    "candidates": [
+                        {
+                            "run_id": agent.get("run_id"),
+                            "project_name": agent.get("project_name"),
+                            "status": agent.get("status"),
+                        }
+                        for agent in candidates
+                    ],
+                }
+                _log("stream_to_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+        try:
+            result = await context.execution_bridge.stream_to_execution_agent(
+                tenant_key=tenant_key,
+                project_name=project_name,
+                run_id=run_id,
+                text=stream_text,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("stream_to_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if result.get("ok") and str(result.get("status") or "") == "file_stream":
+            meta = _interaction_message_meta()
+            message_id = meta.get("message_id")
+            try:
+                message_id = int(message_id) if message_id is not None else None
+            except (TypeError, ValueError):
+                message_id = None
+            provider_message_id = meta.get("provider_message_id")
+            result_run_id = result.get("run_id")
+            try:
+                result_run_id = int(result_run_id) if result_run_id is not None else run_id
+            except (TypeError, ValueError):
+                result_run_id = run_id
+            _append_inflight_update_file(
+                text=text or "(attachment)",
+                assets=assets,
+                message_id=message_id,
+                provider_message_id=str(provider_message_id or "").strip() or None,
+                run_id=result_run_id,
+            )
+        payload = dict(result)
+        _log("stream_to_execution_agent", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": not bool(result.get("ok")),
+        }
+
+    @tool(
+        "stop_execution_agent",
+        "Stop an active execution agent run.",
+        {"run_id": int, "project_name": str, "reason": str, "notify": bool},
+    )
+    async def stop_execution_agent(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if str(context.role or "primary") != "interaction":
+            payload = {"ok": False, "status": "interaction_only"}
+            _log("stop_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if context.execution_bridge is None:
+            payload = {"ok": False, "status": "bridge_unavailable"}
+            _log("stop_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        run_id = args.get("run_id")
+        try:
+            run_id = int(run_id) if run_id is not None else None
+        except (TypeError, ValueError):
+            run_id = None
+        tenant_id = _resolve_tenant_id()
+        project_name = str(args.get("project_name") or "").strip() or None
+        run_row = None
+        if run_id is not None:
+            if context.db is None or tenant_id is None:
+                payload = {"ok": False, "status": "missing_db"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            try:
+                run_row = context.db.get_run(run_id)
+            except Exception:
+                run_row = None
+            if not isinstance(run_row, dict):
+                payload = {"ok": False, "status": "not_found"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            try:
+                run_tenant_id = int(run_row.get("tenant_id"))
+            except (TypeError, ValueError):
+                run_tenant_id = None
+            if run_tenant_id != int(tenant_id):
+                payload = {"ok": False, "status": "not_found"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            if not project_name:
+                project_name = str(run_row.get("project_name") or "").strip() or None
+        if run_id is None:
+            if tenant_id is None or context.db is None:
+                payload = {"ok": False, "status": "missing_run"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            if not project_name:
+                meta = _interaction_message_meta()
+                project_name = str(meta.get("project_name") or "").strip() or None
+            active = context.db.get_active_run(tenant_id, project_name)
+            if active:
+                try:
+                    run_id = int(active["run_id"])
+                except (TypeError, ValueError, KeyError):
+                    run_id = None
+                try:
+                    run_row = context.db.get_run(int(run_id)) if run_id is not None else None
+                except Exception:
+                    run_row = None
+        if run_id is None:
+            payload = {"ok": False, "status": "not_found"}
+            _log("stop_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if context.db is not None and tenant_id is not None and run_row is None:
+            try:
+                run_row = context.db.get_run(int(run_id))
+            except Exception:
+                run_row = None
+            if not isinstance(run_row, dict):
+                payload = {"ok": False, "status": "not_found"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            try:
+                run_tenant_id = int(run_row.get("tenant_id"))
+            except (TypeError, ValueError):
+                run_tenant_id = None
+            if run_tenant_id != int(tenant_id):
+                payload = {"ok": False, "status": "not_found"}
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+        reason = str(args.get("reason") or "user_requested").strip()
+        notify = bool(args.get("notify", True))
+        try:
+            result = await context.execution_bridge.stop_execution_agent(
+                run_id=run_id,
+                reason=reason,
+                notify=notify,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("stop_execution_agent", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        payload = {
+            "ok": True,
+            "status": getattr(result, "status", "accepted"),
+            "detail": getattr(result, "detail", None),
+            "run_id": run_id,
+        }
+        _log("stop_execution_agent", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
         "send_message",
         "Send a user-facing chat update via the active messaging provider.",
         {"text": str, "final": bool, "reply_to_message_id": str, "reply_to_text": str},
@@ -355,6 +758,13 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
+        send_ok, send_reason = _should_send(text, context)
+        if not send_ok:
+            _log("send_message", args, result={"skipped": send_reason}, start=start)
+            return {
+                "content": [{"type": "text", "text": f"Skipped: {send_reason}."}],
+                "is_error": False,
+            }
         try:
             await context.messenger.send_text(
                 context.tenant_external_id, text, reply_to_message_id=reply_to_message_id
@@ -370,6 +780,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         write_chat_history(context.tasks_dir)
         if final and run_id:
             _set_final_sent(context, run_id)
+        if str(context.role or "primary") == "interaction" and context.on_interaction_message_sent:
+            try:
+                context.on_interaction_message_sent()
+            except Exception:
+                pass
         _record_outbound_event(
             text=text,
             message_type="message",
@@ -576,6 +991,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         run_id = _current_run_id(context)
         if final and run_id:
             _set_final_sent(context, run_id)
+        if str(context.role or "primary") == "interaction" and context.on_interaction_message_sent:
+            try:
+                context.on_interaction_message_sent()
+            except Exception:
+                pass
         _record_outbound_event(
             text=message,
             message_type="payment_link",
@@ -1209,6 +1629,9 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         should_send_message,
         decide_project,
         check_for_status,
+        find_execution_agent,
+        stream_to_execution_agent,
+        stop_execution_agent,
         send_message,
         send_payment_link,
         record_deploy,
@@ -1228,6 +1651,86 @@ def build_chat_server(context: ChatToolContext) -> McpSdkServerConfig:
 
 
 def _is_duplicate_message(text: str, tasks_dir: Path, max_entries: int = 12) -> bool:
+    text = str(text or "").strip()
+    if not text:
+        return False
+
+    def _norm(value: str) -> str:
+        value = value.lower()
+        value = re.sub(r"https?://\S+", "<url>", value)
+        value = re.sub(r"[^a-z0-9_<>\s]+", " ", value)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
+
+    def _words(value: str) -> set[str]:
+        tokens = []
+        for token in value.split():
+            token = token.strip()
+            if len(token) < 3:
+                continue
+            tokens.append(token)
+        return set(tokens)
+
+    def _similar(a: str, b: str) -> bool:
+        if not a or not b:
+            return False
+        if a == b:
+            return True
+        if a in b or b in a:
+            return True
+        wa = _words(a)
+        wb = _words(b)
+        if not wa or not wb:
+            return False
+        union = wa | wb
+        if not union:
+            return False
+        jaccard = len(wa & wb) / len(union)
+        if jaccard >= 0.78:
+            return True
+        overlap = len(wa & wb) / max(len(wa), len(wb))
+        return overlap >= 0.9
+
+    normalized = _norm(text)
+    if not normalized:
+        return False
+
+    log_path = tasks_dir / "chat_log.jsonl"
+    if not log_path.exists():
+        return False
+    try:
+        lines = log_path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+
+    now = datetime.now(tz=timezone.utc)
+    window = timedelta(minutes=10)
+    recent = lines[-max_entries:]
+    for line in reversed(recent):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(payload, dict):
+            continue
+        if str(payload.get("tag") or "") != "assistant_message":
+            continue
+        ts_raw = payload.get("timestamp")
+        if ts_raw:
+            try:
+                ts = datetime.fromisoformat(str(ts_raw))
+                if ts.tzinfo is None:
+                    ts = ts.replace(tzinfo=timezone.utc)
+                if now - ts > window:
+                    break
+            except Exception:
+                pass
+        previous = _norm(str(payload.get("payload") or ""))
+        if _similar(normalized, previous):
+            return True
     return False
 
 
@@ -1247,6 +1750,8 @@ def _should_send(text: str, context: ChatToolContext) -> tuple[bool, str]:
     # run_id = _current_run_id(context)
     # if run_id and _final_sent_for_run(context, run_id):
     #     return False, "final_already_sent"
+    if _is_duplicate_message(text, context.tasks_dir):
+        return False, "duplicate"
     return True, "ok"
 
 
