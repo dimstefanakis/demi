@@ -1,3 +1,4 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
@@ -55,6 +56,13 @@ async def test_migrate_legacy_queue_moves_pending_messages(tmp_path):
     )
     message_id, _ = db.record_message(tenant.id, msg)
     db.update_message_status(message_id, "pending")
+    # Supabase reads can be briefly stale across sequential writes in CI; ensure
+    # pending status is visible before running migration assertions.
+    for _ in range(10):
+        row = db.get_message(message_id)
+        if row and row.get("status") == "pending":
+            break
+        await asyncio.sleep(0.05)
 
     migrated = await orchestrator.migrate_legacy_queue()
 

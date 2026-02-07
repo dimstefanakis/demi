@@ -118,9 +118,23 @@ class SupabaseDatabase:
         row = self._select_one("tenants", provider=provider, external_id=external_id)
         return self._row_to_tenant(row) if row else None
 
-    def list_tenants(self) -> list[Tenant]:
-        data = self._execute(self._table("tenants").select("*"))
-        return [self._row_to_tenant(row) for row in (data or [])]
+    def list_tenants(self, page_size: int = 1000) -> list[Tenant]:
+        rows: list[dict[str, Any]] = []
+        offset = 0
+        while True:
+            batch = self._execute(
+                self._table("tenants")
+                .select("*")
+                .order("id", desc=False)
+                .range(offset, offset + page_size - 1)
+            )
+            if not batch:
+                break
+            rows.extend(batch)
+            if len(batch) < page_size:
+                break
+            offset += page_size
+        return [self._row_to_tenant(row) for row in rows]
 
     def update_tenant_workspace(self, tenant_id: int, workspace_path: str) -> None:
         now = datetime.now(tz=timezone.utc).isoformat()

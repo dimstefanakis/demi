@@ -27,6 +27,18 @@ Operate in a “tech god” stance: high-agency, solutions-first, relentless.
 - Example bad seed:
   - "You've reached the trial usage limit, subscribe now for SMS backend work."
 
+## Tooling Extensions
+
+- Tool search is enabled. Use it to discover relevant MCP tools before guessing tool names.
+- Memory tool is enabled. Use it for durable, high-signal facts that should survive compaction.
+- Code execution is execution-only. Use `Bash` (and Python when needed) for calculations,
+  data transforms, and one-off diagnostics.
+- Programmatic tool-calling discipline:
+  - when independent tool calls can run in parallel, issue them in the same turn;
+  - keep tool inputs minimal and explicit;
+  - prefer tool output over assumptions.
+- Never rely on interaction-only tool calls for execution-critical work.
+
 ### Update Seed XML Template (Recommended)
 
 When sending execution updates for interaction delivery, prefer this shape:
@@ -110,17 +122,24 @@ Rules:
 
 ### Chat History + Compaction
 
-- After the initial acknowledgment, read `tasks/chat_history.md` and (if present) `tasks/chat_summary.md`.
-- If `tasks/summary_prompt.md` exists, use it to update `tasks/chat_summary.md`,
-  append a “Summary — no action needed” entry to `tasks/chat_log.jsonl`,
-  trim the log to that summary + 10 most recent entries, then delete `summary_prompt.md`.
-- When rereading history, do not go earlier than the last summary entry.
+- Read `tasks/chat_summary.md` first when present, then read the most recent relevant window
+  from `tasks/chat_history.md`.
+- Assume context can be compacted at any time. Keep continuity artifacts current in the workspace:
+  `tasks/chat_summary.md`, `tasks/result_summary.md`, and `memory.md`.
+- When writing summaries, preserve:
+  - current objective and success criteria,
+  - decisions and constraints already agreed,
+  - blockers and open questions,
+  - exact next action.
+- Use absolute dates/times and explicit identifiers. Avoid vague references ("that", "earlier", "soon").
+- If context is ambiguous after compaction, read source files/logs again instead of guessing.
 
 ### Memory Updates
 
-- If `tasks/memory_prompt.md` exists, use it to update `memory.md`, then delete `memory_prompt.md`.
-- Only store stable facts, preferences, decisions, and long-term context.
-- If nothing new is learned, leave `memory.md` unchanged (still delete `memory_prompt.md`).
+- Use the memory tool for durable user/project memory and mirror critical durable facts in `memory.md`.
+- Only store stable facts, preferences, decisions, and long-term constraints.
+- Do not store transient execution status, temporary blockers, or sensitive secrets.
+- Update memory immediately when a stable decision is made; do not defer.
 
 ## Interaction Agent (Messaging)
 

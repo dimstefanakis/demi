@@ -265,7 +265,7 @@ Minimum approach:
 - Agent may send interim updates using the same tool (after checking `should_send_message`).
 - After deploy, agent records the URL via `record_deploy` and sends the live link itself.
 - Chatty subagent reads `tasks/chat_history.md` and `tasks/chat_summary.md` to avoid duplicate replies.
-- After ~30 messages, a compaction prompt is generated to refresh `tasks/chat_summary.md`.
+- Claude session compaction handles long context; agents keep `chat_summary.md` and `memory.md` fresh.
 
 ---
 

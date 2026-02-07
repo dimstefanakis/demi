@@ -15,7 +15,14 @@ class DummyMessenger:
         return None
 
 
-def _patch_sdk(monkeypatch, *, stop_reason: str | None, subtype: str = "success", result: str = "ok"):
+def _patch_sdk(
+    monkeypatch,
+    *,
+    stop_reason: str | None,
+    subtype: str = "success",
+    result: str = "ok",
+    capture: dict | None = None,
+):
     class FakeSystemMessage:
         def __init__(self, subtype: str, data: dict | None = None):
             self.subtype = subtype
@@ -33,6 +40,8 @@ def _patch_sdk(monkeypatch, *, stop_reason: str | None, subtype: str = "success"
     class FakeClient:
         def __init__(self, options):
             self.options = options
+            if capture is not None:
+                capture["options"] = options
 
         async def connect(self):
             return None
@@ -62,6 +71,19 @@ def _tenant_stop_reason_events(db, tenant_id: int) -> list[dict]:
             .select("*")
             .eq("tenant_id", tenant_id)
             .eq("event_type", "agent_stop_reason")
+            .order("received_at", desc=False)
+        )
+        or []
+    )
+
+
+def _tenant_usage_events(db, tenant_id: int) -> list[dict]:
+    return list(
+        db._execute(
+            db._table("tenant_events")
+            .select("*")
+            .eq("tenant_id", tenant_id)
+            .eq("event_type", "agent_usage")
             .order("received_at", desc=False)
         )
         or []
@@ -229,3 +251,54 @@ async def test_prepare_context_fails_on_error_subtype_even_with_end_turn(tmp_pat
     assert payload["result_subtype"] == "error_max_turns"
     assert payload["status"] == "error"
     assert payload["run_id"] == 444
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_sets_tool_search_memory_env_and_records_usage(
+    tmp_path, monkeypatch
+):
+    capture: dict = {}
+    _patch_sdk(monkeypatch, stop_reason="end_turn", capture=capture)
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.write_task("# Task\n\nDo work\n")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="stop-env-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a site",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    await agent.prepare_context(
+        workspace=workspace,
+        task_path=task_path,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+        run_id=555,
+        runtime_env={"GITHUB_TOKEN": "ghs_runtime_token"},
+    )
+
+    options = capture.get("options")
+    assert options is not None
+    assert options.env.get("ENABLE_TOOL_SEARCH") == "1"
+    assert options.env.get("CLAUDE_CODE_ENABLE_MEMORY_TOOL") == "true"
+    assert options.env.get("CLAUDE_CODE_MEMORY_FILE_PATH") == str(workspace.memory_path)
+    assert options.env.get("GITHUB_TOKEN") == "ghs_runtime_token"
+
+    events = _tenant_usage_events(db, tenant.id)
+    assert events
+    payload = events[-1]["payload_json"]
+    assert payload["context"] == "prepare_context"
+    assert payload["total_cost_usd"] == pytest.approx(0.01)
+    assert payload["run_id"] == 555
+    usage = payload["usage"] or {}
+    assert usage["output_tokens"] == 1

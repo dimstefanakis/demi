@@ -16,7 +16,6 @@ from demi.models import Attachment, NormalizedMessage, OrchestratorResult
 from demi.workspace.core import Workspace, WorkspaceManager
 from demi.messaging.telegram import TelegramUpdateParser
 from demi.agent.inflight import InflightTextStream
-from demi.memory import build_memory_prompt, build_summarization_prompt, read_logs
 from demi.memory.logs import append_log, write_chat_history
 
 from demi.failure_guard import clear_block, get_block, record_hard_failure
@@ -25,7 +24,10 @@ from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager, MAX_REPO
 from demi.config import Settings
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-INTERACTION_SESSION_KEY = "claude_session"
+# Keep routing and instruction sessions separate so prior instruction-mode
+# messages cannot leak into routing decisions for new user input.
+INTERACTION_ROUTE_SESSION_KEY = "claude_route_session"
+INTERACTION_INSTRUCTION_SESSION_KEY = "claude_instruction_session"
 
 
 @dataclass
@@ -71,19 +73,31 @@ class Orchestrator:
             self.interaction_route_sessions = {}
         self.interaction_route_sessions[session.tenant_id] = session
 
-    def _get_interaction_session_id(self, tenant_id: int) -> str | None:
+    @staticmethod
+    def _interaction_session_key(mode: str) -> str:
+        if mode == "instruction":
+            return INTERACTION_INSTRUCTION_SESSION_KEY
+        return INTERACTION_ROUTE_SESSION_KEY
+
+    def _get_interaction_session_id(self, tenant_id: int, *, mode: str = "route") -> str | None:
         try:
             payload = self.db.get_tenant_kv(
                 int(tenant_id),
                 INTERACTION_SESSION_NAMESPACE,
-                INTERACTION_SESSION_KEY,
+                self._interaction_session_key(mode),
             ) or {}
         except Exception:
             return None
         value = str(payload.get("session_id") or "").strip()
         return value or None
 
-    def _set_interaction_session_id(self, tenant_id: int, session_id: str | None) -> None:
+    def _set_interaction_session_id(
+        self,
+        tenant_id: int,
+        session_id: str | None,
+        *,
+        mode: str = "route",
+    ) -> None:
         # Interaction and execution sessions must be tracked independently so a stale
         # execution resume token cannot contaminate user-facing interaction routing.
         cleaned = str(session_id or "").strip()
@@ -92,7 +106,7 @@ class Orchestrator:
             self.db.set_tenant_kv(
                 int(tenant_id),
                 INTERACTION_SESSION_NAMESPACE,
-                INTERACTION_SESSION_KEY,
+                self._interaction_session_key(mode),
                 payload,
             )
         except Exception:
@@ -971,8 +985,6 @@ class Orchestrator:
         task_path = workspace.write_task(task_content)
 
         self._clear_run_artifacts(workspace.tasks_dir)
-        self._maybe_prepare_compaction(workspace.tasks_dir)
-        self._maybe_prepare_memory_update(workspace.tasks_dir, workspace.memory_path)
 
         settings = Settings()
         if run_id is None:
@@ -1308,7 +1320,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id)),
+                session_id=self._get_interaction_session_id(int(tenant.id), mode="route"),
                 provider=msg.provider,
                 tenant_external_id=msg.tenant_external_id,
                 message_id=message_id,
@@ -1328,7 +1340,11 @@ class Orchestrator:
             else:
                 session_from_result = str(getattr(result, "session_id", "") or "").strip()
             if session_from_result:
-                self._set_interaction_session_id(int(tenant.id), session_from_result)
+                self._set_interaction_session_id(
+                    int(tenant.id),
+                    session_from_result,
+                    mode="route",
+                )
             return result
         except Exception as exc:  # noqa: BLE001
             try:
@@ -1711,7 +1727,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id)),
+                session_id=self._get_interaction_session_id(int(tenant.id), mode="instruction"),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -1723,7 +1739,11 @@ class Orchestrator:
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
             session_from_result = str(getattr(result, "session_id", "") or "").strip()
             if session_from_result:
-                self._set_interaction_session_id(int(tenant.id), session_from_result)
+                self._set_interaction_session_id(
+                    int(tenant.id),
+                    session_from_result,
+                    mode="instruction",
+                )
             return True
         except Exception as exc:  # noqa: BLE001
             try:
@@ -1782,7 +1802,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id)),
+                session_id=self._get_interaction_session_id(int(tenant.id), mode="instruction"),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -1794,7 +1814,11 @@ class Orchestrator:
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
             session_from_result = str(getattr(result, "session_id", "") or "").strip()
             if session_from_result:
-                self._set_interaction_session_id(int(tenant.id), session_from_result)
+                self._set_interaction_session_id(
+                    int(tenant.id),
+                    session_from_result,
+                    mode="instruction",
+                )
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(
@@ -2912,8 +2936,6 @@ class Orchestrator:
             "deploy_url.txt",
             "user_reply.txt",
             "result_summary.md",
-            "summary_prompt.md",
-            "memory_prompt.md",
             "tool_runs.jsonl",
         ):
             path = tasks_dir / name
@@ -3065,42 +3087,6 @@ class Orchestrator:
             "purpose": purpose[:40],
             "purpose_label": label,
         }
-
-    @staticmethod
-    def _maybe_prepare_compaction(
-        tasks_dir: Path, max_entries: int = 30, keep_last: int = 10
-    ) -> None:
-        entries = read_logs(tasks_dir)
-        if len(entries) <= max_entries:
-            return
-        summary_path = tasks_dir / "chat_summary.md"
-        previous_summary = summary_path.read_text() if summary_path.exists() else ""
-        to_summarize = entries[:-keep_last]
-        prompt = build_summarization_prompt(previous_summary, to_summarize)
-        summary_prompt_path = tasks_dir / "summary_prompt.md"
-        summary_prompt_path.write_text(
-            f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
-            f"{prompt.messages[0]['content']}\n"
-        )
-
-    @staticmethod
-    def _maybe_prepare_memory_update(
-        tasks_dir: Path, memory_path: Path, max_entries: int = 40
-    ) -> None:
-        entries = read_logs(tasks_dir)
-        if not entries:
-            return
-        recent = entries[-max_entries:]
-        try:
-            previous_memory = memory_path.read_text(encoding="utf-8")
-        except OSError:
-            previous_memory = ""
-        prompt = build_memory_prompt(previous_memory, recent)
-        memory_prompt_path = tasks_dir / "memory_prompt.md"
-        memory_prompt_path.write_text(
-            f"SYSTEM_PROMPT:\n{prompt.system_prompt}\n\nUSER_MESSAGE:\n"
-            f"{prompt.messages[0]['content']}\n"
-        )
 
     @staticmethod
     def _build_tool_summary(tasks_dir: Path) -> dict[str, Any] | None:

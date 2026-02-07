@@ -9,7 +9,9 @@ from pathlib import Path
 from demi.db.core import Database
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-INTERACTION_SESSION_KEY = "claude_session"
+# Outbox updates are instruction-mode interaction messages; keep them isolated
+# from routing-mode interaction session continuity.
+INTERACTION_SESSION_KEY = "claude_instruction_session"
 
 
 @dataclass

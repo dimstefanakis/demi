@@ -205,6 +205,55 @@ class SessionResultRouteAgent(FakeAgent):
         )()
 
 
+class InstructionSessionAgent(FakeAgent):
+    def __init__(self, decision):
+        super().__init__(decision)
+        self.instruction_calls: list[str | None] = []
+
+    async def send_interaction_instruction(
+        self,
+        *,
+        workspace,
+        instruction,
+        messenger=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        run_id=None,
+        message_id=None,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        del (
+            workspace,
+            instruction,
+            messenger,
+            tenant_id,
+            db,
+            payments,
+            provider,
+            tenant_external_id,
+            run_id,
+            message_id,
+            asset_paths,
+            execution_bridge,
+        )
+        self.instruction_calls.append(session_id)
+        return type(
+            "AgentResult",
+            (),
+            {
+                "session_id": "interaction-session-instruction-next",
+                "summary": "ok",
+                "total_cost_usd": None,
+                "usage": None,
+            },
+        )()
+
+
 class MergeFreezeOrchestrator(Orchestrator):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -350,7 +399,7 @@ async def test_interaction_routing_uses_interaction_session_state(tmp_path):
     db.set_tenant_kv(
         tenant.id,
         "interaction",
-        "claude_session",
+        "claude_route_session",
         {"session_id": "interaction-session-1"},
     )
 
@@ -407,8 +456,74 @@ async def test_interaction_routing_persists_returned_session_id(tmp_path):
     assert result.status == "accepted"
     tenant = db.get_tenant_by_external("telegram", tenant_external_id)
     assert tenant is not None
-    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") or {}
     assert payload.get("session_id") == "interaction-session-2"
+
+
+@pytest.mark.asyncio
+async def test_instruction_session_state_isolated_from_route_state(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    decision = {
+        "ok": True,
+        "project_name": "main",
+        "should_run": False,
+        "queue_run": False,
+        "dedupe": True,
+        "ask_questions": [],
+    }
+    agent = InstructionSessionAgent(decision)
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    tenant = db.get_or_create_tenant("telegram", tenant_external_id)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    db.set_tenant_kv(
+        tenant.id,
+        "interaction",
+        "claude_route_session",
+        {"session_id": "interaction-session-route-prev"},
+    )
+    db.set_tenant_kv(
+        tenant.id,
+        "interaction",
+        "claude_instruction_session",
+        {"session_id": "interaction-session-instruction-prev"},
+    )
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="i-instruction-session-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="hello",
+        images=[],
+        raw={},
+    )
+
+    sent = await orchestrator._send_interaction_instruction(
+        workspace=workspace,
+        tenant=tenant,
+        msg=msg,
+        instruction="test instruction",
+        run_id=None,
+        message_id=None,
+        asset_paths=None,
+    )
+
+    assert sent is True
+    assert agent.instruction_calls == ["interaction-session-instruction-prev"]
+    route_payload = db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") or {}
+    assert route_payload.get("session_id") == "interaction-session-route-prev"
+    instruction_payload = (
+        db.get_tenant_kv(tenant.id, "interaction", "claude_instruction_session") or {}
+    )
+    assert instruction_payload.get("session_id") == "interaction-session-instruction-next"
 
 
 @pytest.mark.asyncio

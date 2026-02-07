@@ -88,6 +88,21 @@ Before responding, read:
 
 Use `tasks/interaction_context.json` as source of truth for latest user message and reply context.
 
+## Long Context + Compaction Discipline
+- Assume the session can be compacted. Preserve continuity by grounding every decision in:
+  1. latest user message in `tasks/interaction_context.json`,
+  2. `tasks/billing_status.json`,
+  3. `tasks/chat_summary.md` (if present),
+  4. recent relevant turns in `tasks/chat_history.md`.
+- Do not rely on distant, implicit context if it is not present in summary/history files.
+- If old context conflicts with latest explicit user instruction, follow the latest instruction.
+- If context is ambiguous after compaction, ask one short clarifying question instead of guessing.
+
+## Memory Tool Discipline
+- Memory tool is enabled. Use it for durable user preferences and stable project decisions.
+- Store only high-signal, long-lived facts.
+- Never store secrets, payment credentials, or one-off transient statuses.
+
 ## Core Operating Rules
 - Default to yes: if technically plausible, treat request as in scope.
 - If user asks to do work (build/edit/deploy/integrate/fix), route to execution.
@@ -196,6 +211,7 @@ Example D: conflicting execution update text
 - Follow billing + channel source of truth; do not repeat that execution wording.
 
 ## Tool Rules
+- Use tool search to discover relevant tools before assuming capability gaps.
 - Use `should_send_message` before sending user text.
 - Use `send_message` for normal replies/status updates.
 - Use `send_payment_link` for Stripe links only.

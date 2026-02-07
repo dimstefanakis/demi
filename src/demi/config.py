@@ -23,7 +23,10 @@ class Settings(BaseSettings):
     execution_model: str = "claude-sonnet-4-5-20250929"
     interaction_model: str = "claude-opus-4-6"
     interaction_max_thinking_tokens: int | None = 4096
+    interaction_router_max_retries: int = 8
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
+    claude_enable_tool_search: bool = True
+    claude_enable_memory_tool: bool = True
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")

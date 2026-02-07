@@ -12,7 +12,9 @@ from demi.config import Settings
 from demi.runtime.docker_pool import DockerPool
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-INTERACTION_SESSION_KEY = "claude_session"
+# Forwarded execution updates are instruction-mode interaction messages, so
+# they should not reuse routing-mode session context.
+INTERACTION_SESSION_KEY = "claude_instruction_session"
 
 
 def load_env_file_values(settings: Settings) -> dict[str, str]:
@@ -345,6 +347,8 @@ class DockerAgent:
             "EXECUTION_MODEL",
             "INTERACTION_MODEL",
             "INTERACTION_MAX_THINKING_TOKENS",
+            "CLAUDE_ENABLE_TOOL_SEARCH",
+            "CLAUDE_ENABLE_MEMORY_TOOL",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
         ]
@@ -409,6 +413,8 @@ class DockerAgent:
             "EXECUTION_MODEL": self.settings.execution_model,
             "INTERACTION_MODEL": self.settings.interaction_model,
             "INTERACTION_MAX_THINKING_TOKENS": self.settings.interaction_max_thinking_tokens,
+            "CLAUDE_ENABLE_TOOL_SEARCH": self.settings.claude_enable_tool_search,
+            "CLAUDE_ENABLE_MEMORY_TOOL": self.settings.claude_enable_memory_tool,
             "GEMINI_API_KEY": self.settings.gemini_api_key,
             "GOOGLE_API_KEY": self.settings.google_api_key,
         }

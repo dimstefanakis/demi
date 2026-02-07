@@ -168,6 +168,8 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   `INTERACTION_MAX_THINKING_TOKENS`
 - `INTERACTION_SESSION_CACHE_DIR` stores tenant-scoped Claude interaction session/cache files
   for SDK `resume` continuity (default `data/interaction_sessions`)
+- `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
+- `CLAUDE_ENABLE_MEMORY_TOOL=true` enables Claude Code memory tool (persisted to project `memory.md`)
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
 
@@ -242,8 +244,6 @@ data/<tenant_key>/
         │   ├── chat_log.jsonl
         │   ├── chat_history.md
         │   ├── chat_summary.md
-        │   ├── summary_prompt.md
-        │   ├── memory_prompt.md
         │   ├── request_status.md
         │   ├── billing_status.json
         │   ├── billing_status_<run_id>.json
@@ -267,8 +267,9 @@ data/<tenant_key>/
 - `memory.md` stores durable business facts and decisions.
 - `chat_log.jsonl` captures conversation events.
 - `chat_history.md` keeps a short recent transcript.
-- `chat_summary.md` is the rolling summary the agent maintains when prompted.
-- `summary_prompt.md` and `memory_prompt.md` are generated prompts the agent uses to refresh summaries and memory.
+- `chat_summary.md` is a rolling compact summary that execution updates directly when needed.
+- Compaction is handled by Claude session compaction + workspace continuity files; the orchestrator
+  no longer generates `summary_prompt.md` / `memory_prompt.md`.
 - `tenant.sqlite` is an execution-agent scratchpad database. It is not used for orchestration or queues.
 
 **Project routing**
@@ -282,13 +283,16 @@ data/<tenant_key>/
 
 Execution and interaction sessions are tracked separately:
 - Execution session IDs: `tenants.session_id` (used by `prepare_context` runs).
-- Interaction session IDs: `tenant_state(namespace='interaction', key='claude_session')`.
+- Interaction routing session IDs: `tenant_state(namespace='interaction', key='claude_route_session')`.
+- Interaction instruction/update session IDs:
+  `tenant_state(namespace='interaction', key='claude_instruction_session')`.
 - Interaction session cache files are written under `INTERACTION_SESSION_CACHE_DIR/tenant-<id>/`.
   This path is not mounted into execution containers.
 
 Flow:
 1. The orchestrator passes execution `session_id` into `ClaudeAgent.prepare_context`.
-2. Interaction routing/message delivery uses the interaction session ID and SDK `resume`.
+2. Interaction routing and instruction/update delivery each use their own interaction
+   session ID with SDK `resume`.
 3. Both execution and interaction agents return updated session IDs.
 4. The orchestrator/workers persist each session ID in its own scope.
 5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
@@ -301,6 +305,8 @@ Flow:
 - `runs.usage_json` stores structured usage data:
 - `primary`: the main agent usage payload.
 - `interaction`: a list of interaction-agent usage payloads.
+- `tenant_events` also records `event_type='agent_usage'` for per-turn usage/cost observability,
+  including interaction turns that are not attached to a run.
 
 **Admin views (Supabase main DB)**
 - `admin_run_costs`: per-run cost + token breakdown (primary + interaction).
@@ -331,6 +337,10 @@ happened in Supabase dashboards.
 - Claude Agent SDK result stop telemetry persisted to Supabase for observability.
 - Payload fields include `context` (`prepare_context|route_interaction|send_interaction_message|send_interaction_instruction`),
   `stop_reason`, `result_subtype`, derived `status`, and run/message metadata when available.
+
+- `tenant_events` (`event_type='agent_usage'`)
+- Claude Agent SDK usage/cost telemetry persisted per turn.
+- Payload fields include `context`, `total_cost_usd`, raw `usage`, and run/message metadata when available.
 
 Execution runtime consumption:
 - Agent runtime claims `execution_stream_inputs.status='pending'` for its `run_id`,

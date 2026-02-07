@@ -153,7 +153,7 @@ Minimum approach:
 - Claude can send interim updates using the same tool (after `should_send_message`).
 - Claude sends the final completion + live URL itself (after calling `record_deploy`).
 - Orchestrator maintains `tasks/chat_history.md` (last N messages) and `tasks/chat_summary.md` (compact memory).
-- When logs exceed ~30 entries, it writes `tasks/summary_prompt.md` for the agent to refresh summary and prune logs.
+- Session compaction is handled by Claude; agents keep `chat_summary.md` and `memory.md` current for continuity.
 
 ---
 

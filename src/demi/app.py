@@ -113,6 +113,14 @@ def create_app() -> FastAPI:
 
     app = FastAPI()
 
+    def _log_background_task_result(task: asyncio.Task[Any], *, label: str) -> None:
+        try:
+            _ = task.result()
+        except asyncio.CancelledError:
+            return
+        except Exception:  # noqa: BLE001
+            logger.exception("Background task failed: %s", label)
+
     def _require_admin(request: Request) -> None:
         token = settings.admin_api_token
         if not token:
@@ -222,7 +230,10 @@ def create_app() -> FastAPI:
         msg = TelegramUpdateParser.parse(payload)
         if not msg:
             return {"status": "ignored"}
-        asyncio.create_task(orchestrator.handle_message(msg))
+        task = asyncio.create_task(orchestrator.handle_message(msg))
+        task.add_done_callback(
+            lambda t: _log_background_task_result(t, label="telegram_webhook.handle_message")
+        )
         return {"status": "accepted"}
 
     @app.post("/events")

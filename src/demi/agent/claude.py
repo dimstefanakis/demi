@@ -8,7 +8,7 @@ from pathlib import Path
 import os
 import re
 from typing import Any, Callable, Literal
-from contextlib import asynccontextmanager, suppress
+from contextlib import suppress
 import asyncio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
@@ -43,28 +43,13 @@ from demi.models import NormalizedMessage
 from demi.workspace.core import Workspace
 
 
-_ENV_LOCK = asyncio.Lock()
 INTERACTION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 INTERACTION_SESSION_NAMESPACE = "interaction"
-INTERACTION_SESSION_KEY = "claude_session"
-
-
-@asynccontextmanager
-async def _apply_runtime_env(runtime_env: dict[str, str] | None):
-    if not runtime_env:
-        yield
-        return
-    async with _ENV_LOCK:
-        previous = {key: os.environ.get(key) for key in runtime_env}
-        os.environ.update({key: str(value) for key, value in runtime_env.items()})
-        try:
-            yield
-        finally:
-            for key, value in previous.items():
-                if value is None:
-                    os.environ.pop(key, None)
-                else:
-                    os.environ[key] = value
+INTERACTION_ROUTE_SESSION_KEY = "claude_route_session"
+INTERACTION_INSTRUCTION_SESSION_KEY = "claude_instruction_session"
+TOOL_SEARCH_ENV_KEY = "ENABLE_TOOL_SEARCH"
+MEMORY_TOOL_ENABLED_ENV_KEY = "CLAUDE_CODE_ENABLE_MEMORY_TOOL"
+MEMORY_TOOL_PATH_ENV_KEY = "CLAUDE_CODE_MEMORY_FILE_PATH"
 
 
 @dataclass
@@ -154,7 +139,14 @@ class ClaudeAgent:
         plugins: list[dict] | None = None,
         agents: dict[str, AgentDefinition] | None = None,
     ):
-        self.allowed_tools = allowed_tools or self.DEFAULT_ALLOWED_TOOLS
+        settings = Settings()
+        if allowed_tools is None:
+            base_tools = list(self.DEFAULT_ALLOWED_TOOLS)
+            if settings.claude_enable_memory_tool and "Memory" not in base_tools:
+                base_tools.append("Memory")
+            self.allowed_tools = base_tools
+        else:
+            self.allowed_tools = allowed_tools
         self.permission_mode = permission_mode
         self.system_prompt = system_prompt
         self.setting_sources = setting_sources or ["project", "local"]
@@ -254,6 +246,46 @@ class ClaudeAgent:
             except Exception:
                 pass
 
+    @classmethod
+    def _record_usage_event(
+        cls,
+        *,
+        tasks_dir: Path,
+        db: Any | None,
+        tenant_id: int | None,
+        context: str,
+        total_cost_usd: float | None,
+        usage: dict[str, Any] | None,
+        session_id: str | None = None,
+        run_id: int | None = None,
+        message_id: int | None = None,
+        project_name: str | None = None,
+    ) -> None:
+        if total_cost_usd is None and not usage:
+            return
+        payload: dict[str, Any] = {
+            "context": context,
+            "total_cost_usd": total_cost_usd,
+            "usage": usage,
+        }
+        if session_id:
+            payload["session_id"] = session_id
+        if run_id is not None:
+            payload["run_id"] = int(run_id)
+        if message_id is not None:
+            payload["message_id"] = int(message_id)
+        if project_name:
+            payload["project_name"] = project_name
+        try:
+            log_agent_event(tasks_dir, "agent_usage", payload)
+        except Exception:
+            pass
+        if db is not None and tenant_id is not None:
+            try:
+                db.record_tenant_event(int(tenant_id), "agent_usage", payload)
+            except Exception:
+                pass
+
     @staticmethod
     def _is_resume_error(exc: Exception) -> bool:
         text = str(exc).strip().lower()
@@ -278,32 +310,116 @@ class ClaudeAgent:
     ) -> None:
         if db is None or tenant_id is None:
             return
-        try:
-            db.set_tenant_kv(
-                int(tenant_id),
-                INTERACTION_SESSION_NAMESPACE,
-                INTERACTION_SESSION_KEY,
-                None,
-            )
-        except Exception:
-            pass
+        for key in (INTERACTION_ROUTE_SESSION_KEY, INTERACTION_INSTRUCTION_SESSION_KEY):
+            try:
+                db.set_tenant_kv(
+                    int(tenant_id),
+                    INTERACTION_SESSION_NAMESPACE,
+                    key,
+                    None,
+                )
+            except Exception:
+                continue
 
     @staticmethod
-    def _interaction_runtime_env(
+    def _load_env_file_values(settings: Settings) -> dict[str, str]:
+        env_file = settings.model_config.get("env_file")
+        if not env_file:
+            return {}
+        if isinstance(env_file, (list, tuple)):
+            files = list(env_file)
+        else:
+            files = [env_file]
+        values: dict[str, str] = {}
+        for entry in files:
+            path = Path(entry)
+            if not path.is_absolute():
+                path = (settings.root_dir / path).resolve()
+            if not path.exists():
+                continue
+            try:
+                lines = path.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                raw = line.strip()
+                if not raw or raw.startswith("#"):
+                    continue
+                if raw.startswith("export "):
+                    raw = raw[len("export ") :].strip()
+                if "=" not in raw:
+                    continue
+                key, value = raw.split("=", 1)
+                key = key.strip()
+                if not key:
+                    continue
+                value = value.strip()
+                if (
+                    (value.startswith('"') and value.endswith('"'))
+                    or (value.startswith("'") and value.endswith("'"))
+                ):
+                    value = value[1:-1]
+                if value:
+                    values[key] = value
+        return values
+
+    @staticmethod
+    def _base_agent_env(
         *,
         settings: Settings,
+        workspace: Workspace,
+    ) -> dict[str, str]:
+        # Explicitly hydrate SDK subprocess env from .env so interaction/runtime
+        # agents do not depend on shell-exported variables.
+        env = ClaudeAgent._load_env_file_values(settings)
+        if settings.anthropic_api_key:
+            # Interaction sessions use tenant-scoped HOME, so auth must come from env
+            # instead of relying on per-home Claude CLI login state.
+            env["ANTHROPIC_API_KEY"] = str(settings.anthropic_api_key)
+        if settings.claude_api_key:
+            env["CLAUDE_API_KEY"] = str(settings.claude_api_key)
+        if settings.claude_enable_tool_search:
+            # Enables MCP Tool Search in Claude Code / Agent SDK.
+            env[TOOL_SEARCH_ENV_KEY] = "1"
+        if settings.claude_enable_memory_tool:
+            # Point memory tool writes at the project-local durable memory file.
+            env[MEMORY_TOOL_ENABLED_ENV_KEY] = "true"
+            env[MEMORY_TOOL_PATH_ENV_KEY] = str(workspace.memory_path)
+        return env
+
+    @classmethod
+    def _execution_runtime_env(
+        cls,
+        *,
+        settings: Settings,
+        workspace: Workspace,
+        runtime_env: dict[str, str] | None,
+    ) -> dict[str, str]:
+        env = cls._base_agent_env(settings=settings, workspace=workspace)
+        if runtime_env:
+            env.update({key: str(value) for key, value in runtime_env.items() if value is not None})
+        return env
+
+    @classmethod
+    def _interaction_runtime_env(
+        cls,
+        *,
+        settings: Settings,
+        workspace: Workspace,
         tenant_id: int | None,
     ) -> dict[str, str]:
+        env = cls._base_agent_env(settings=settings, workspace=workspace)
         if tenant_id is None:
-            return {}
+            return env
         # Keep interaction-agent session/cache data tenant-scoped to prevent cross-tenant
         # leakage while still persisting across API/worker container restarts.
         home_dir = settings.resolved_interaction_session_cache_dir() / f"tenant-{int(tenant_id)}"
         try:
             home_dir.mkdir(parents=True, exist_ok=True)
         except OSError:
-            return {}
-        return {"HOME": str(home_dir)}
+            return env
+        env["HOME"] = str(home_dir)
+        return env
 
     @staticmethod
     def _interaction_add_dirs(workspace: Workspace) -> list[Path]:
@@ -378,6 +494,11 @@ class ClaudeAgent:
         )
         if chrome_mcp:
             mcp_servers[self.CHROME_DEVTOOLS_MCP_SERVER_NAME] = chrome_mcp
+        execution_env = self._execution_runtime_env(
+            settings=settings,
+            workspace=workspace,
+            runtime_env=runtime_env,
+        )
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
             permission_mode=self.permission_mode,
@@ -386,6 +507,7 @@ class ClaudeAgent:
             model=settings.execution_model,
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
+            env=execution_env,
             plugins=self.plugins,
             agents=self.agents,
             mcp_servers=mcp_servers,
@@ -424,53 +546,63 @@ class ClaudeAgent:
 
         query_task: asyncio.Task[None] | None = None
         try:
-            async with _apply_runtime_env(runtime_env):
-                query_task = asyncio.create_task(
-                    client.query(
-                        self._prompt_stream(
-                            prompt,
-                            inflight_stream=inflight_stream,
-                            stop_event=stop_event,
-                        ),
-                        session_id=session_id or "default",
-                    )
+            query_task = asyncio.create_task(
+                client.query(
+                    self._prompt_stream(
+                        prompt,
+                        inflight_stream=inflight_stream,
+                        stop_event=stop_event,
+                    ),
+                    session_id=session_id or "default",
                 )
-                async for msg in client.receive_messages():
-                    log_agent_event(
-                        workspace.tasks_dir,
-                        "sdk_message",
-                        _sdk_message_log_data(msg),
+            )
+            async for msg in client.receive_messages():
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "sdk_message",
+                    _sdk_message_log_data(msg),
+                )
+                if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                    new_session_id = msg.data.get("session_id", new_session_id)
+                if isinstance(msg, ResultMessage):
+                    new_session_id = msg.session_id or new_session_id
+                    stop_reason = self._normalize_stop_reason(
+                        getattr(msg, "stop_reason", None)
                     )
-                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                        new_session_id = msg.data.get("session_id", new_session_id)
-                    if isinstance(msg, ResultMessage):
-                        new_session_id = msg.session_id or new_session_id
-                        stop_reason = self._normalize_stop_reason(
-                            getattr(msg, "stop_reason", None)
-                        )
-                        result_subtype = self._normalize_result_subtype(
-                            getattr(msg, "subtype", None)
-                        )
-                        self._record_stop_reason_event(
-                            tasks_dir=workspace.tasks_dir,
-                            db=db,
-                            tenant_id=tenant_id,
-                            context="prepare_context",
-                            stop_reason=stop_reason,
-                            result_subtype=result_subtype,
-                            session_id=new_session_id,
-                            run_id=run_id,
-                            project_name=workspace.project_name,
-                        )
-                        stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
-                        if stop_reason_error:
-                            raise RuntimeError(stop_reason_error)
-                        summary = msg.result
-                        total_cost_usd = msg.total_cost_usd
-                        usage = msg.usage
-                        if stop_event is not None:
-                            stop_event.set()
-                        break
+                    result_subtype = self._normalize_result_subtype(
+                        getattr(msg, "subtype", None)
+                    )
+                    self._record_stop_reason_event(
+                        tasks_dir=workspace.tasks_dir,
+                        db=db,
+                        tenant_id=tenant_id,
+                        context="prepare_context",
+                        stop_reason=stop_reason,
+                        result_subtype=result_subtype,
+                        session_id=new_session_id,
+                        run_id=run_id,
+                        project_name=workspace.project_name,
+                    )
+                    summary = msg.result
+                    total_cost_usd = msg.total_cost_usd
+                    usage = msg.usage
+                    self._record_usage_event(
+                        tasks_dir=workspace.tasks_dir,
+                        db=db,
+                        tenant_id=tenant_id,
+                        context="prepare_context",
+                        total_cost_usd=total_cost_usd,
+                        usage=usage,
+                        session_id=new_session_id,
+                        run_id=run_id,
+                        project_name=workspace.project_name,
+                    )
+                    stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
+                    if stop_reason_error:
+                        raise RuntimeError(stop_reason_error)
+                    if stop_event is not None:
+                        stop_event.set()
+                    break
         finally:
             if stop_event is not None:
                 stop_event.set()
@@ -526,7 +658,11 @@ class ClaudeAgent:
     ) -> AgentResult | None:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
-        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
+        interaction_env = self._interaction_runtime_env(
+            settings=settings,
+            workspace=workspace,
+            tenant_id=tenant_id,
+        )
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -548,21 +684,24 @@ class ClaudeAgent:
 
         async def _run_once(resume_session_id: str | None) -> AgentResult:
             # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
+            allowed_tools = [
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+            ]
+            if settings.claude_enable_memory_tool:
+                allowed_tools.append("Memory")
             options = ClaudeAgentOptions(
-                allowed_tools=[
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Grep",
-                    "Glob",
-                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                    SEND_MESSAGE_TOOL,
-                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                ],
+                allowed_tools=allowed_tools,
                 permission_mode=self.permission_mode,
                 system_prompt=interaction_prompt,
                 setting_sources=self.setting_sources,
@@ -624,6 +763,18 @@ class ClaudeAgent:
                         )
                         total_cost_usd = msg.total_cost_usd
                         usage = msg.usage
+                        self._record_usage_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="send_interaction_message",
+                            total_cost_usd=total_cost_usd,
+                            usage=usage,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
                         break
             finally:
                 await client.disconnect()
@@ -664,7 +815,11 @@ class ClaudeAgent:
     ) -> InteractionRouteResult:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_router_prompt_path)
-        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
+        interaction_env = self._interaction_runtime_env(
+            settings=settings,
+            workspace=workspace,
+            tenant_id=tenant_id,
+        )
         stream_close_event = asyncio.Event() if inflight_stream is not None else None
 
         def _on_interaction_message_sent() -> None:
@@ -705,28 +860,32 @@ class ClaudeAgent:
             return isinstance(payload.get("should_run"), bool)
 
         def _build_options(resume_session_id: str | None) -> ClaudeAgentOptions:
+            allowed_tools = [
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__decide_project",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+            ]
+            if settings.claude_enable_memory_tool:
+                allowed_tools.append("Memory")
             return ClaudeAgentOptions(
-                allowed_tools=[
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Grep",
-                    "Glob",
-                    f"mcp__{CHAT_SERVER_NAME}__decide_project",
-                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                    SEND_MESSAGE_TOOL,
-                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                    f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
-                ],
+                allowed_tools=allowed_tools,
                 permission_mode=self.permission_mode,
                 system_prompt=interaction_prompt,
                 setting_sources=self.setting_sources,
                 model=settings.interaction_model,
                 max_thinking_tokens=settings.interaction_max_thinking_tokens,
+                output_format=self._router_output_schema(),
                 # Resume only from the tenant-scoped interaction session state.
                 resume=resume_session_id or None,
                 cwd=workspace.root,
@@ -793,8 +952,23 @@ class ClaudeAgent:
                         )
                         total_cost_usd = msg.total_cost_usd
                         usage = msg.usage
+                        self._record_usage_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="route_interaction",
+                            total_cost_usd=total_cost_usd,
+                            usage=usage,
+                            session_id=new_session_id,
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
                         raw_output = msg.result
-                        decision = self._parse_router_json(msg.result)
+                        structured_output = getattr(msg, "structured_output", None)
+                        if isinstance(structured_output, dict):
+                            decision = dict(structured_output)
+                        else:
+                            decision = self._parse_router_json(msg.result)
                         if stop_event is not None:
                             stop_event.set()
                         break
@@ -812,28 +986,62 @@ class ClaudeAgent:
                         pass
                 await client.disconnect()
 
-        try:
-            await _query_router(resume_session_id=session_id)
-        except Exception as exc:
-            if session_id and self._is_resume_error(exc):
-                self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
-                new_session_id = None
-                await _query_router(resume_session_id=None)
-            else:
-                raise
-        if not _decision_valid(decision):
+        async def _query_router_with_resume(
+            *,
+            resume_session_id: str | None,
+            retry_note: str | None = None,
+        ) -> None:
+            nonlocal new_session_id
+            try:
+                await _query_router(
+                    resume_session_id=resume_session_id,
+                    retry_note=retry_note,
+                )
+            except Exception as exc:
+                if resume_session_id and self._is_resume_error(exc):
+                    self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
+                    new_session_id = None
+                    await _query_router(
+                        resume_session_id=None,
+                        retry_note=retry_note,
+                    )
+                else:
+                    raise
+
+        max_attempts = max(1, int(settings.interaction_router_max_retries) + 1)
+        attempt = 1
+        retry_note: str | None = None
+        resume_session_id = session_id
+        while True:
+            await _query_router_with_resume(
+                resume_session_id=resume_session_id,
+                retry_note=retry_note,
+            )
+            if _decision_valid(decision):
+                break
+            if attempt >= max_attempts:
+                raise RuntimeError("interaction_router_invalid_output")
+            attempt += 1
+            resume_session_id = new_session_id
             retry_note = (
                 "Your previous output was invalid. "
                 "Return ONLY valid JSON with required boolean field `should_run` "
                 "and do not include any prose or formatting.\n"
+                f"Attempt {attempt}/{max_attempts}.\n"
                 f"Previous output:\n{raw_output}"
             )
-            await _query_router(
-                resume_session_id=new_session_id,
-                retry_note=retry_note,
-            )
-            if not _decision_valid(decision):
-                raise RuntimeError("interaction_router_invalid_output")
+            try:
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "interaction_router_retry",
+                    {
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "raw_output": raw_output,
+                    },
+                )
+            except Exception:
+                pass
         return InteractionRouteResult(
             decision=decision,
             session_id=new_session_id,
@@ -861,7 +1069,11 @@ class ClaudeAgent:
     ) -> AgentResult | None:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
-        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
+        interaction_env = self._interaction_runtime_env(
+            settings=settings,
+            workspace=workspace,
+            tenant_id=tenant_id,
+        )
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -883,22 +1095,25 @@ class ClaudeAgent:
 
         async def _run_once(resume_session_id: str | None) -> AgentResult:
             # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
+            allowed_tools = [
+                "Read",
+                "Write",
+                "Edit",
+                "Grep",
+                "Glob",
+                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                SEND_MESSAGE_TOOL,
+                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+            ]
+            if settings.claude_enable_memory_tool:
+                allowed_tools.append("Memory")
             options = ClaudeAgentOptions(
-                allowed_tools=[
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Grep",
-                    "Glob",
-                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                    SEND_MESSAGE_TOOL,
-                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                    f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
-                ],
+                allowed_tools=allowed_tools,
                 permission_mode=self.permission_mode,
                 system_prompt=interaction_prompt,
                 setting_sources=self.setting_sources,
@@ -951,6 +1166,18 @@ class ClaudeAgent:
                         )
                         total_cost_usd = msg.total_cost_usd
                         usage = msg.usage
+                        self._record_usage_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="send_interaction_instruction",
+                            total_cost_usd=total_cost_usd,
+                            usage=usage,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
                         break
             finally:
                 await client.disconnect()
@@ -988,6 +1215,39 @@ class ClaudeAgent:
             except json.JSONDecodeError:
                 return {}
         return {}
+
+    @staticmethod
+    def _router_output_schema() -> dict[str, Any]:
+        # Enforce structured router output so invalid free-form prose does not break
+        # orchestration when the interaction router is compacted or tool-heavy.
+        return {
+            "type": "json_schema",
+            "name": "interaction_router_decision",
+            "schema": {
+                "type": "object",
+                "properties": {
+                    "ok": {"type": "boolean"},
+                    "project_name": {"type": ["string", "null"]},
+                    "should_run": {"type": "boolean"},
+                    "queue_run": {"type": "boolean"},
+                    "supersede_active_run": {"type": "boolean"},
+                    "dedupe": {"type": "boolean"},
+                    "reply_sent": {"type": "boolean"},
+                    "facts_only": {"type": "boolean"},
+                    "billing_check": {"type": "boolean"},
+                    "billing_checked": {"type": "boolean"},
+                    "purpose": {"type": "string"},
+                    "plan": {"type": "string"},
+                    "repo_name": {"type": "string"},
+                    "ask_questions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["should_run"],
+                "additionalProperties": True,
+            },
+        }
 
     def _build_supabase_mcp_config(
         self,
@@ -1243,24 +1503,27 @@ class ClaudeAgent:
         interaction_subagent_model = ClaudeAgent._agent_definition_model(
             settings.interaction_model
         )
+        interaction_tools = [
+            "Read",
+            "Write",
+            "Edit",
+            "Grep",
+            "Glob",
+            f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+            f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+            f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+            f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+            f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+            SEND_MESSAGE_TOOL,
+            f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+        ]
+        if settings.claude_enable_memory_tool:
+            interaction_tools.append("Memory")
         return {
             "interaction-agent": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
                 prompt=interaction_prompt,
-                tools=[
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Grep",
-                    "Glob",
-                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                    SEND_MESSAGE_TOOL,
-                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                ],
+                tools=interaction_tools,
                 model=interaction_subagent_model,
             )
         }

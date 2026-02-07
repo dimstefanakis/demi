@@ -2104,8 +2104,6 @@ def _migrate_current_task_context(tasks_dir: Path, target_tasks_dir: Path) -> bo
         "chat_log.jsonl",
         "chat_history.md",
         "chat_summary.md",
-        "summary_prompt.md",
-        "memory_prompt.md",
         "inflight_updates.jsonl",
         "inflight_consumed.jsonl",
         "interaction_updates.jsonl",
