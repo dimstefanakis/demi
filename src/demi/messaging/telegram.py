@@ -114,7 +114,27 @@ class TelegramClient:
                 payload["reply_to_message_id"] = int(reply_to_message_id)
             except (TypeError, ValueError):
                 pass
-        await self._client.post(url, json=payload)
+        response = await self._client.post(url, json=payload)
+        response.raise_for_status()
+
+        # Telegram can return HTTP 200 with {"ok": false}; treat that as send failure.
+        try:
+            payload_json = response.json()
+        except ValueError as exc:
+            raise RuntimeError("telegram_send_invalid_json") from exc
+        if isinstance(payload_json, dict) and payload_json.get("ok") is True:
+            return
+
+        details: list[str] = []
+        if isinstance(payload_json, dict):
+            error_code = payload_json.get("error_code")
+            description = str(payload_json.get("description") or "").strip()
+            if error_code is not None:
+                details.append(f"error_code={error_code}")
+            if description:
+                details.append(f"description={description}")
+        detail_text = ", ".join(details) if details else "unknown_error"
+        raise RuntimeError(f"telegram_send_failed: {detail_text}")
 
     async def download_images(self, images: list[Attachment], dest_dir: Path) -> list[str]:
         dest_dir.mkdir(parents=True, exist_ok=True)
