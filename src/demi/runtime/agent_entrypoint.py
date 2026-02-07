@@ -6,9 +6,13 @@ import contextlib
 from dataclasses import asdict
 from datetime import datetime, timedelta, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import uuid
+
+from realtime.types import RealtimePostgresChangesListenEvent
+from supabase import acreate_client
 
 from demi.agent.claude import ClaudeAgent
 from demi.agent.inflight import InflightTextStream
@@ -18,6 +22,8 @@ from demi.messaging.file import FileMessenger
 from demi.messaging.telegram import TelegramClient, TelegramConfig, TelegramUpdateParser
 from demi.models import NormalizedMessage
 from demi.workspace.core import WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 
 class RunLeaseHeartbeat:
@@ -91,6 +97,97 @@ class RunLeaseHeartbeat:
         return max(5.0, min(30.0, self.lease_seconds / 4))
 
 
+class _ExecutionStreamRealtimeWatcher:
+    """Wake the inflight stream pump when new DB stream inputs are inserted."""
+
+    def __init__(
+        self,
+        *,
+        supabase_url: str,
+        supabase_service_key: str,
+        run_id: int,
+        wake_event: asyncio.Event,
+    ) -> None:
+        self.supabase_url = supabase_url
+        self.supabase_service_key = supabase_service_key
+        self.run_id = int(run_id)
+        self.wake_event = wake_event
+        self._client = None
+        self._channel = None
+        self._loop: asyncio.AbstractEventLoop | None = None
+
+    async def start(self) -> bool:
+        if not self.supabase_url or not self.supabase_service_key:
+            return False
+        try:
+            self._loop = asyncio.get_running_loop()
+            self._client = await acreate_client(self.supabase_url, self.supabase_service_key)
+            topic = f"execution-stream-{self.run_id}-{uuid.uuid4().hex[:8]}"
+            channel = self._client.channel(topic)
+            channel.on_postgres_changes(
+                RealtimePostgresChangesListenEvent.Insert,
+                self._on_change,
+                schema="public",
+                table="execution_stream_inputs",
+                filter=f"run_id=eq.{self.run_id}",
+            )
+            await channel.subscribe()
+            self._channel = channel
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("execution_stream_realtime_unavailable run_id=%s error=%s", self.run_id, exc)
+            await self.stop()
+            return False
+
+    async def stop(self) -> None:
+        if self._client is None:
+            self._channel = None
+            return
+        with contextlib.suppress(Exception):
+            if self._channel is not None:
+                await self._client.remove_channel(self._channel)
+            else:
+                await self._client.remove_all_channels()
+        self._channel = None
+        self._client = None
+
+    def _on_change(self, _payload) -> None:
+        if self._loop is None:
+            self.wake_event.set()
+            return
+        self._loop.call_soon_threadsafe(self.wake_event.set)
+
+
+async def _wait_for_stop_or_wake(
+    *,
+    stop_event: asyncio.Event,
+    wake_event: asyncio.Event,
+    timeout_seconds: float,
+) -> None:
+    if stop_event.is_set() or wake_event.is_set():
+        return
+    stop_task = asyncio.create_task(stop_event.wait())
+    wake_task = asyncio.create_task(wake_event.wait())
+    try:
+        done, pending = await asyncio.wait(
+            {stop_task, wake_task},
+            timeout=max(0.05, float(timeout_seconds)),
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        for task in pending:
+            task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.gather(*pending)
+        if done:
+            return
+    finally:
+        for task in (stop_task, wake_task):
+            if not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+
 async def _pump_inflight_updates(
     tasks_dir: Path,
     inflight_stream: InflightTextStream,
@@ -98,17 +195,95 @@ async def _pump_inflight_updates(
     *,
     db=None,
     run_id: int | None = None,
+    poll_interval_seconds: float = 5.0,
+    realtime_enabled: bool = True,
+    supabase_url: str | None = None,
+    supabase_service_key: str | None = None,
 ) -> None:
     path = tasks_dir / "inflight_updates.jsonl"
-    while not stop_event.is_set():
-        if db is not None and run_id is not None:
-            try:
-                rows = db.claim_execution_stream_inputs(run_id=run_id, limit=25)
-            except Exception:
-                rows = []
-            for row in rows or []:
-                text = str(row.get("text") or "").strip()
-                assets = row.get("assets_json") or row.get("assets") or []
+    poll_interval_seconds = max(0.05, float(poll_interval_seconds))
+    db_stream_enabled = db is not None and run_id is not None
+    wake_event = asyncio.Event()
+    if db_stream_enabled:
+        wake_event.set()
+    watcher: _ExecutionStreamRealtimeWatcher | None = None
+    if realtime_enabled and db_stream_enabled:
+        url = str(supabase_url or getattr(db, "url", "") or "").strip()
+        key = str(supabase_service_key or getattr(db, "service_key", "") or "").strip()
+        if url and key:
+            watcher = _ExecutionStreamRealtimeWatcher(
+                supabase_url=url,
+                supabase_service_key=key,
+                run_id=int(run_id),
+                wake_event=wake_event,
+            )
+            if not await watcher.start():
+                watcher = None
+    try:
+        while not stop_event.is_set():
+            should_claim_db = False
+            if db_stream_enabled and wake_event.is_set():
+                should_claim_db = True
+            if db_stream_enabled and watcher is None:
+                should_claim_db = True
+            if should_claim_db:
+                if wake_event.is_set():
+                    wake_event.clear()
+                try:
+                    rows = db.claim_execution_stream_inputs(run_id=run_id, limit=25)
+                except Exception:
+                    rows = []
+                for row in rows or []:
+                    text = str(row.get("text") or "").strip()
+                    assets = row.get("assets_json") or row.get("assets") or []
+                    attachments = "\n".join(f"- {item}" for item in assets if item)
+                    if attachments:
+                        if text:
+                            text = f"{text}\n\nAttachments:\n{attachments}"
+                        else:
+                            text = f"Attachments:\n{attachments}"
+                    if not text:
+                        continue
+                    try:
+                        inflight_stream.queue.put_nowait(text)
+                    except Exception:
+                        pass
+
+            snapshot_path = tasks_dir / f".inflight_updates.{uuid.uuid4().hex}.jsonl"
+            lines: list[str] = []
+            if path.exists():
+                try:
+                    path.replace(snapshot_path)
+                except OSError:
+                    snapshot_path = None
+                if snapshot_path is not None:
+                    try:
+                        lines = snapshot_path.read_text(encoding="utf-8").splitlines()
+                    except OSError:
+                        lines = []
+                    finally:
+                        try:
+                            snapshot_path.unlink()
+                        except OSError:
+                            pass
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                payload_run_id = payload.get("run_id")
+                if run_id is not None:
+                    try:
+                        payload_run_id = int(payload_run_id)
+                    except (TypeError, ValueError):
+                        payload_run_id = None
+                    if payload_run_id != int(run_id):
+                        continue
+                text = str(payload.get("text") or "").strip()
+                assets = payload.get("assets") or []
                 attachments = "\n".join(f"- {item}" for item in assets if item)
                 if attachments:
                     if text:
@@ -121,54 +296,22 @@ async def _pump_inflight_updates(
                     inflight_stream.queue.put_nowait(text)
                 except Exception:
                     pass
-        snapshot_path = tasks_dir / f".inflight_updates.{uuid.uuid4().hex}.jsonl"
-        lines: list[str] = []
-        if path.exists():
-            try:
-                path.replace(snapshot_path)
-            except OSError:
-                snapshot_path = None
-            if snapshot_path is not None:
-                try:
-                    lines = snapshot_path.read_text(encoding="utf-8").splitlines()
-                except OSError:
-                    lines = []
-                finally:
-                    try:
-                        snapshot_path.unlink()
-                    except OSError:
-                        pass
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                payload = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            payload_run_id = payload.get("run_id")
-            if run_id is not None:
-                try:
-                    payload_run_id = int(payload_run_id)
-                except (TypeError, ValueError):
-                    payload_run_id = None
-                if payload_run_id != int(run_id):
-                    continue
-            text = str(payload.get("text") or "").strip()
-            assets = payload.get("assets") or []
-            attachments = "\n".join(f"- {item}" for item in assets if item)
-            if attachments:
-                if text:
-                    text = f"{text}\n\nAttachments:\n{attachments}"
-                else:
-                    text = f"Attachments:\n{attachments}"
-            if not text:
-                continue
-            try:
-                inflight_stream.queue.put_nowait(text)
-            except Exception:
-                pass
-        await asyncio.sleep(0.05)
+            if watcher is not None:
+                await _wait_for_stop_or_wake(
+                    stop_event=stop_event,
+                    wake_event=wake_event,
+                    timeout_seconds=poll_interval_seconds,
+                )
+                # Keep a periodic safety poll in case realtime notifications are delayed
+                # or dropped; realtime still wakes immediately for normal updates.
+                if not stop_event.is_set() and not wake_event.is_set():
+                    wake_event.set()
+            else:
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_seconds)
+    finally:
+        if watcher is not None:
+            await watcher.stop()
 
 _GITHUB_RUNTIME_ENV_KEYS = (
     "GITHUB_TOKEN",
@@ -391,6 +534,10 @@ async def _run(run_id: int) -> int:
                 inflight_stop,
                 db=db,
                 run_id=run_id,
+                poll_interval_seconds=settings.execution_stream_poll_interval,
+                realtime_enabled=settings.execution_stream_realtime_enabled,
+                supabase_url=settings.main_db_supabase_url,
+                supabase_service_key=settings.main_db_supabase_service_key,
             )
         )
         try:

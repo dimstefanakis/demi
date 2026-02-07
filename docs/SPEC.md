@@ -173,6 +173,10 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   for SDK `resume` continuity (default `data/interaction_sessions`)
 - `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
 - `CLAUDE_ENABLE_MEMORY_TOOL=true` enables Claude Code memory tool (persisted to project `memory.md`)
+- Execution stream wake controls:
+  - `EXECUTION_STREAM_REALTIME_ENABLED` (default `true`) subscribes runtime containers to Supabase
+    realtime `INSERT` events on `execution_stream_inputs` scoped by `run_id`
+  - `EXECUTION_STREAM_POLL_INTERVAL` fallback interval used when realtime is unavailable
 - Outbox retry controls:
   - `OUTBOX_SEND_TIMEOUT_SECONDS`
   - `OUTBOX_MAX_ATTEMPTS`
@@ -355,7 +359,8 @@ happened in Supabase dashboards.
 Execution runtime consumption:
 - Agent runtime claims `execution_stream_inputs.status='pending'` for its `run_id`,
   pushes payloads into the in-memory inflight stream, then marks rows `streamed`.
-- If direct memory streaming is unavailable, rows remain visible and are still consumed by the runtime poller.
+- Runtime uses Supabase realtime `INSERT` notifications (single channel per run process) to wake
+  claim loops without constant polling; periodic polling remains as a safety fallback.
 - `inflight_updates.jsonl` is only written for true file-stream fallback cases to avoid duplicate runtime ingestion
   when DB-backed streaming is available.
 - File-fallback entries include `run_id`; runtime only accepts matching `run_id` entries and drains the file via

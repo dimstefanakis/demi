@@ -349,6 +349,8 @@ class DockerAgent:
             "INTERACTION_MAX_THINKING_TOKENS",
             "CLAUDE_ENABLE_TOOL_SEARCH",
             "CLAUDE_ENABLE_MEMORY_TOOL",
+            "EXECUTION_STREAM_REALTIME_ENABLED",
+            "EXECUTION_STREAM_POLL_INTERVAL",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
         ]
@@ -415,6 +417,8 @@ class DockerAgent:
             "INTERACTION_MAX_THINKING_TOKENS": self.settings.interaction_max_thinking_tokens,
             "CLAUDE_ENABLE_TOOL_SEARCH": self.settings.claude_enable_tool_search,
             "CLAUDE_ENABLE_MEMORY_TOOL": self.settings.claude_enable_memory_tool,
+            "EXECUTION_STREAM_REALTIME_ENABLED": self.settings.execution_stream_realtime_enabled,
+            "EXECUTION_STREAM_POLL_INTERVAL": self.settings.execution_stream_poll_interval,
             "GEMINI_API_KEY": self.settings.gemini_api_key,
             "GOOGLE_API_KEY": self.settings.google_api_key,
         }

@@ -102,6 +102,8 @@ class Settings(BaseSettings):
 
     run_lease_seconds: int = 300
     run_activity_poll_interval: float = 2.5
+    execution_stream_realtime_enabled: bool = True
+    execution_stream_poll_interval: float = 5.0
 
     unsplash_app_id: str | None = None
     unsplash_access_key: str | None = None
