@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     execution_model: str = "claude-sonnet-4-5-20250929"
     interaction_model: str = "claude-opus-4-6"
     interaction_max_thinking_tokens: int | None = 4096
+    interaction_session_cache_dir: Path = Path("data/interaction_sessions")
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")
@@ -119,6 +120,12 @@ class Settings(BaseSettings):
 
     def resolved_design_prompt_path(self) -> Path:
         path = self.design_prompt_path
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
+
+    def resolved_interaction_session_cache_dir(self) -> Path:
+        path = self.interaction_session_cache_dir
         if path.is_absolute():
             return path
         return (self.root_dir / path).resolve()

@@ -24,6 +24,9 @@ from demi.workspace.project_decider import decide_project
 from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager, MAX_REPO_NAME_LENGTH
 from demi.config import Settings
 
+INTERACTION_SESSION_NAMESPACE = "interaction"
+INTERACTION_SESSION_KEY = "claude_session"
+
 
 @dataclass
 class InteractionRouteSession:
@@ -67,6 +70,33 @@ class Orchestrator:
         if self.interaction_route_sessions is None:
             self.interaction_route_sessions = {}
         self.interaction_route_sessions[session.tenant_id] = session
+
+    def _get_interaction_session_id(self, tenant_id: int) -> str | None:
+        try:
+            payload = self.db.get_tenant_kv(
+                int(tenant_id),
+                INTERACTION_SESSION_NAMESPACE,
+                INTERACTION_SESSION_KEY,
+            ) or {}
+        except Exception:
+            return None
+        value = str(payload.get("session_id") or "").strip()
+        return value or None
+
+    def _set_interaction_session_id(self, tenant_id: int, session_id: str | None) -> None:
+        # Interaction and execution sessions must be tracked independently so a stale
+        # execution resume token cannot contaminate user-facing interaction routing.
+        cleaned = str(session_id or "").strip()
+        payload = {"session_id": cleaned} if cleaned else None
+        try:
+            self.db.set_tenant_kv(
+                int(tenant_id),
+                INTERACTION_SESSION_NAMESPACE,
+                INTERACTION_SESSION_KEY,
+                payload,
+            )
+        except Exception:
+            pass
 
     def _close_interaction_session(self, tenant_id: int, *, status: str = "completed") -> None:
         if self.interaction_route_sessions is None:
@@ -1278,7 +1308,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=getattr(tenant, "session_id", None),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=msg.provider,
                 tenant_external_id=msg.tenant_external_id,
                 message_id=message_id,
@@ -1291,7 +1321,15 @@ class Orchestrator:
                     router_args["inflight_stream"] = inflight_stream
             except (TypeError, ValueError):
                 pass
-            return await router(**router_args)
+            result = await router(**router_args)
+            session_from_result = ""
+            if isinstance(result, dict):
+                session_from_result = str(result.get("session_id") or "").strip()
+            else:
+                session_from_result = str(getattr(result, "session_id", "") or "").strip()
+            if session_from_result:
+                self._set_interaction_session_id(int(tenant.id), session_from_result)
+            return result
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(
@@ -1673,7 +1711,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=getattr(tenant, "session_id", None),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -1683,6 +1721,9 @@ class Orchestrator:
                 execution_bridge=self,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
+            session_from_result = str(getattr(result, "session_id", "") or "").strip()
+            if session_from_result:
+                self._set_interaction_session_id(int(tenant.id), session_from_result)
             return True
         except Exception as exc:  # noqa: BLE001
             try:
@@ -1741,7 +1782,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=getattr(tenant, "session_id", None),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -1751,6 +1792,9 @@ class Orchestrator:
                 execution_bridge=self,
             )
             self._record_interaction_usage(run_id, result, workspace.tasks_dir)
+            session_from_result = str(getattr(result, "session_id", "") or "").strip()
+            if session_from_result:
+                self._set_interaction_session_id(int(tenant.id), session_from_result)
         except Exception as exc:  # noqa: BLE001
             try:
                 append_log(

@@ -11,6 +11,9 @@ from demi.agent.claude import ClaudeAgent
 from demi.config import Settings
 from demi.runtime.docker_pool import DockerPool
 
+INTERACTION_SESSION_NAMESPACE = "interaction"
+INTERACTION_SESSION_KEY = "claude_session"
+
 
 def load_env_file_values(settings: Settings) -> dict[str, str]:
     env_file = settings.model_config.get("env_file")
@@ -447,6 +450,17 @@ class DockerAgent:
         session_id: str | None,
     ) -> None:
         interaction_agent = ClaudeAgent()
+        interaction_session_id = session_id
+        if db is not None and tenant_id is not None:
+            try:
+                payload = db.get_tenant_kv(
+                    int(tenant_id),
+                    INTERACTION_SESSION_NAMESPACE,
+                    INTERACTION_SESSION_KEY,
+                ) or {}
+                interaction_session_id = str(payload.get("session_id") or "").strip() or None
+            except Exception:
+                pass
         for line in outbound_path.read_text().splitlines():
             try:
                 payload = json.loads(line)
@@ -457,16 +471,28 @@ class DockerAgent:
                 continue
             reply_to_message_id = str(payload.get("reply_to_message_id") or "").strip() or None
             reply_to_text = str(payload.get("reply_to_text") or "").strip() or None
-            await interaction_agent.send_interaction_message(
+            result = await interaction_agent.send_interaction_message(
                 workspace=workspace,
                 text=text,
                 messenger=messenger,
                 tenant_id=tenant_id,
                 db=db,
                 payments=None,
-                session_id=session_id,
+                session_id=interaction_session_id,
                 provider=provider,
                 tenant_external_id=tenant_external_id,
                 reply_to_message_id=reply_to_message_id,
                 reply_to_text=reply_to_text,
             )
+            session_from_result = str(getattr(result, "session_id", "") or "").strip()
+            if session_from_result and db is not None and tenant_id is not None:
+                interaction_session_id = session_from_result
+                try:
+                    db.set_tenant_kv(
+                        int(tenant_id),
+                        INTERACTION_SESSION_NAMESPACE,
+                        INTERACTION_SESSION_KEY,
+                        {"session_id": interaction_session_id},
+                    )
+                except Exception:
+                    pass

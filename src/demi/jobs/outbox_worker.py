@@ -8,6 +8,9 @@ from pathlib import Path
 
 from demi.db.core import Database
 
+INTERACTION_SESSION_NAMESPACE = "interaction"
+INTERACTION_SESSION_KEY = "claude_session"
+
 
 @dataclass
 class OutboxWorkerConfig:
@@ -26,6 +29,32 @@ class OutboxWorker:
 
     async def _db_call(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
+
+    def _get_interaction_session_id(self, tenant_id: int) -> str | None:
+        try:
+            payload = self.db.get_tenant_kv(
+                int(tenant_id),
+                INTERACTION_SESSION_NAMESPACE,
+                INTERACTION_SESSION_KEY,
+            ) or {}
+        except Exception:
+            return None
+        value = str(payload.get("session_id") or "").strip()
+        return value or None
+
+    def _set_interaction_session_id(self, tenant_id: int, session_id: str | None) -> None:
+        # Keep interaction continuity isolated from execution session IDs.
+        cleaned = str(session_id or "").strip()
+        payload = {"session_id": cleaned} if cleaned else None
+        try:
+            self.db.set_tenant_kv(
+                int(tenant_id),
+                INTERACTION_SESSION_NAMESPACE,
+                INTERACTION_SESSION_KEY,
+                payload,
+            )
+        except Exception:
+            pass
 
     async def run_forever(self) -> None:
         self._running = True
@@ -375,12 +404,15 @@ class OutboxWorker:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=None,
-                session_id=getattr(tenant, "session_id", None),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=payload.get("provider") or tenant.provider,
                 tenant_external_id=payload.get("tenant_external_id") or tenant.external_id,
                 run_id=run_id,
             )
             self._record_interaction_usage(run_id, result)
+            session_from_result = str(getattr(result, "session_id", "") or "").strip()
+            if session_from_result:
+                self._set_interaction_session_id(int(tenant.id), session_from_result)
             return True
         except Exception:
             return False

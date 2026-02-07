@@ -45,6 +45,8 @@ from demi.workspace.core import Workspace
 
 _ENV_LOCK = asyncio.Lock()
 INTERACTION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
+INTERACTION_SESSION_NAMESPACE = "interaction"
+INTERACTION_SESSION_KEY = "claude_session"
 
 
 @asynccontextmanager
@@ -78,6 +80,7 @@ class AgentResult:
 @dataclass
 class InteractionRouteResult:
     decision: dict[str, Any]
+    session_id: str | None = None
     total_cost_usd: float | None = None
     usage: dict[str, Any] | None = None
     stop_reason: str | None = None
@@ -250,6 +253,63 @@ class ClaudeAgent:
                 db.record_tenant_event(int(tenant_id), "agent_stop_reason", payload)
             except Exception:
                 pass
+
+    @staticmethod
+    def _is_resume_error(exc: Exception) -> bool:
+        text = str(exc).strip().lower()
+        if not text:
+            return False
+        # Claude CLI resume failures are text-only across SDK layers.
+        needles = (
+            "resume",
+            "invalid session",
+            "session not found",
+            "could not find session",
+            "unknown session",
+            "conversation not found",
+        )
+        return any(needle in text for needle in needles)
+
+    @staticmethod
+    def _clear_interaction_session_state(
+        *,
+        db: Any | None,
+        tenant_id: int | None,
+    ) -> None:
+        if db is None or tenant_id is None:
+            return
+        try:
+            db.set_tenant_kv(
+                int(tenant_id),
+                INTERACTION_SESSION_NAMESPACE,
+                INTERACTION_SESSION_KEY,
+                None,
+            )
+        except Exception:
+            pass
+
+    @staticmethod
+    def _interaction_runtime_env(
+        *,
+        settings: Settings,
+        tenant_id: int | None,
+    ) -> dict[str, str]:
+        if tenant_id is None:
+            return {}
+        # Keep interaction-agent session/cache data tenant-scoped to prevent cross-tenant
+        # leakage while still persisting across API/worker container restarts.
+        home_dir = settings.resolved_interaction_session_cache_dir() / f"tenant-{int(tenant_id)}"
+        try:
+            home_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return {}
+        return {"HOME": str(home_dir)}
+
+    @staticmethod
+    def _interaction_add_dirs(workspace: Workspace) -> list[Path]:
+        # Restrict interaction file access to the tenant workspace scope.
+        tenant_root = getattr(workspace, "tenant_root", workspace.root)
+        return [Path(tenant_root)]
 
     async def prepare_context(
         self,
@@ -466,6 +526,7 @@ class ClaudeAgent:
     ) -> AgentResult | None:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
+        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -484,87 +545,104 @@ class ClaudeAgent:
                 message_id=message_id,
             )
         )
-        options = ClaudeAgentOptions(
-            allowed_tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "Grep",
-                "Glob",
-                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                SEND_MESSAGE_TOOL,
-                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-            ],
-            permission_mode=self.permission_mode,
-            system_prompt=interaction_prompt,
-            setting_sources=self.setting_sources,
-            model=settings.interaction_model,
-            max_thinking_tokens=settings.interaction_max_thinking_tokens,
-            cwd=workspace.root,
-            add_dirs=[Path.cwd()],
-            plugins=self.plugins,
-            agents=None,
-            mcp_servers={CHAT_SERVER_NAME: chat_server},
-            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_update"),
-        )
-        client = ClaudeSDKClient(options=options)
-        await client.connect()
-        total_cost_usd = None
-        usage: dict[str, Any] | None = None
-        stop_reason: str | None = None
-        result_subtype: str | None = None
-        try:
-            reply_to_message_id = str(reply_to_message_id or "").strip()
-            reply_to_text = str(reply_to_text or "").strip()
-            prompt = (
-                "Send the following user update if it fits the current context. "
-                "If it would be redundant, do not send.\n"
+
+        async def _run_once(resume_session_id: str | None) -> AgentResult:
+            # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
+            options = ClaudeAgentOptions(
+                allowed_tools=[
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Grep",
+                    "Glob",
+                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                    SEND_MESSAGE_TOOL,
+                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                ],
+                permission_mode=self.permission_mode,
+                system_prompt=interaction_prompt,
+                setting_sources=self.setting_sources,
+                model=settings.interaction_model,
+                max_thinking_tokens=settings.interaction_max_thinking_tokens,
+                resume=resume_session_id or None,
+                cwd=workspace.root,
+                add_dirs=self._interaction_add_dirs(workspace),
+                env=interaction_env,
+                plugins=self.plugins,
+                agents=None,
+                mcp_servers={CHAT_SERVER_NAME: chat_server},
+                stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_update"),
             )
-            if reply_to_message_id or reply_to_text:
-                prompt += (
-                    "If you send a message, use send_message with reply_to_message_id/reply_to_text "
-                    "from the reply context.\n"
-                    f"Reply context: id={reply_to_message_id or 'n/a'} "
-                    f"text={reply_to_text or 'n/a'}\n"
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            total_cost_usd = None
+            usage: dict[str, Any] | None = None
+            stop_reason: str | None = None
+            result_subtype: str | None = None
+            new_session_id = resume_session_id
+            try:
+                reply_id = str(reply_to_message_id or "").strip()
+                reply_text = str(reply_to_text or "").strip()
+                prompt = (
+                    "Send the following user update if it fits the current context. "
+                    "If it would be redundant, do not send.\n"
                 )
-            prompt += f"\nUPDATE:\n{text}"
-            await client.query(
-                self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
-                session_id=session_id or "interaction",
-            )
-            async for msg in client.receive_messages():
-                if isinstance(msg, ResultMessage):
-                    stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
-                    result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
-                    self._record_stop_reason_event(
-                        tasks_dir=workspace.tasks_dir,
-                        db=db,
-                        tenant_id=tenant_id,
-                        context="send_interaction_message",
-                        stop_reason=stop_reason,
-                        result_subtype=result_subtype,
-                        session_id=session_id,
-                        run_id=run_id,
-                        message_id=message_id,
-                        project_name=workspace.project_name,
+                if reply_id or reply_text:
+                    prompt += (
+                        "If you send a message, use send_message with reply_to_message_id/reply_to_text "
+                        "from the reply context.\n"
+                        f"Reply context: id={reply_id or 'n/a'} "
+                        f"text={reply_text or 'n/a'}\n"
                     )
-                    total_cost_usd = msg.total_cost_usd
-                    usage = msg.usage
-                    break
-        finally:
-            await client.disconnect()
-        return AgentResult(
-            session_id=None,
-            summary=None,
-            total_cost_usd=total_cost_usd,
-            usage=usage,
-            stop_reason=stop_reason,
-            result_subtype=result_subtype,
-        )
+                prompt += f"\nUPDATE:\n{text}"
+                await client.query(
+                    self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
+                    session_id=resume_session_id or "interaction",
+                )
+                async for msg in client.receive_messages():
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        new_session_id = msg.data.get("session_id", new_session_id)
+                    if isinstance(msg, ResultMessage):
+                        new_session_id = msg.session_id or new_session_id
+                        stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
+                        result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
+                        self._record_stop_reason_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="send_interaction_message",
+                            stop_reason=stop_reason,
+                            result_subtype=result_subtype,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
+                        total_cost_usd = msg.total_cost_usd
+                        usage = msg.usage
+                        break
+            finally:
+                await client.disconnect()
+            return AgentResult(
+                session_id=new_session_id,
+                summary=None,
+                total_cost_usd=total_cost_usd,
+                usage=usage,
+                stop_reason=stop_reason,
+                result_subtype=result_subtype,
+            )
+
+        try:
+            return await _run_once(session_id)
+        except Exception as exc:
+            if session_id and self._is_resume_error(exc):
+                self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
+                return await _run_once(None)
+            raise
 
     async def route_interaction(
         self,
@@ -586,6 +664,7 @@ class ClaudeAgent:
     ) -> InteractionRouteResult:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_router_prompt_path)
+        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
         stream_close_event = asyncio.Event() if inflight_stream is not None else None
 
         def _on_interaction_message_sent() -> None:
@@ -610,41 +689,13 @@ class ClaudeAgent:
                 on_interaction_message_sent=_on_interaction_message_sent,
             )
         )
-        options = ClaudeAgentOptions(
-            allowed_tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "Grep",
-                "Glob",
-                f"mcp__{CHAT_SERVER_NAME}__decide_project",
-                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                SEND_MESSAGE_TOOL,
-                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
-            ],
-            permission_mode=self.permission_mode,
-            system_prompt=interaction_prompt,
-            setting_sources=self.setting_sources,
-            model=settings.interaction_model,
-            max_thinking_tokens=settings.interaction_max_thinking_tokens,
-            cwd=workspace.root,
-            add_dirs=[Path.cwd()],
-            plugins=self.plugins,
-            agents=None,
-            mcp_servers={CHAT_SERVER_NAME: chat_server},
-            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_router"),
-        )
         total_cost_usd = None
         usage: dict[str, Any] | None = None
         decision: dict[str, Any] = {}
         raw_output: str | None = None
         stop_reason: str | None = None
         result_subtype: str | None = None
+        new_session_id: str | None = session_id
 
         def _decision_valid(payload: dict[str, Any]) -> bool:
             if not isinstance(payload, dict):
@@ -653,8 +704,47 @@ class ClaudeAgent:
                 return False
             return isinstance(payload.get("should_run"), bool)
 
-        async def _query_router(retry_note: str | None = None) -> None:
-            nonlocal total_cost_usd, usage, decision, raw_output, stop_reason, result_subtype
+        def _build_options(resume_session_id: str | None) -> ClaudeAgentOptions:
+            return ClaudeAgentOptions(
+                allowed_tools=[
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Grep",
+                    "Glob",
+                    f"mcp__{CHAT_SERVER_NAME}__decide_project",
+                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                    SEND_MESSAGE_TOOL,
+                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                    f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+                ],
+                permission_mode=self.permission_mode,
+                system_prompt=interaction_prompt,
+                setting_sources=self.setting_sources,
+                model=settings.interaction_model,
+                max_thinking_tokens=settings.interaction_max_thinking_tokens,
+                # Resume only from the tenant-scoped interaction session state.
+                resume=resume_session_id or None,
+                cwd=workspace.root,
+                add_dirs=self._interaction_add_dirs(workspace),
+                env=interaction_env,
+                plugins=self.plugins,
+                agents=None,
+                mcp_servers={CHAT_SERVER_NAME: chat_server},
+                stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_router"),
+            )
+
+        async def _query_router(
+            *,
+            resume_session_id: str | None,
+            retry_note: str | None = None,
+        ) -> None:
+            nonlocal total_cost_usd, usage, decision, raw_output, stop_reason, result_subtype, new_session_id
+            options = _build_options(resume_session_id)
             client = ClaudeSDKClient(options=options)
             await client.connect()
             stop_event = asyncio.Event() if inflight_stream is not None else None
@@ -678,11 +768,14 @@ class ClaudeAgent:
                             stop_event=stop_event,
                             close_event=stream_close_event,
                         ),
-                        session_id=session_id or "interaction",
+                        session_id=resume_session_id or "interaction",
                     )
                 )
                 async for msg in client.receive_messages():
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
+                        new_session_id = msg.session_id or new_session_id
                         stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
                         result_subtype = self._normalize_result_subtype(
                             getattr(msg, "subtype", None)
@@ -694,7 +787,7 @@ class ClaudeAgent:
                             context="route_interaction",
                             stop_reason=stop_reason,
                             result_subtype=result_subtype,
-                            session_id=(getattr(msg, "session_id", None) or session_id),
+                            session_id=new_session_id,
                             message_id=message_id,
                             project_name=workspace.project_name,
                         )
@@ -719,7 +812,15 @@ class ClaudeAgent:
                         pass
                 await client.disconnect()
 
-        await _query_router()
+        try:
+            await _query_router(resume_session_id=session_id)
+        except Exception as exc:
+            if session_id and self._is_resume_error(exc):
+                self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
+                new_session_id = None
+                await _query_router(resume_session_id=None)
+            else:
+                raise
         if not _decision_valid(decision):
             retry_note = (
                 "Your previous output was invalid. "
@@ -727,11 +828,15 @@ class ClaudeAgent:
                 "and do not include any prose or formatting.\n"
                 f"Previous output:\n{raw_output}"
             )
-            await _query_router(retry_note=retry_note)
+            await _query_router(
+                resume_session_id=new_session_id,
+                retry_note=retry_note,
+            )
             if not _decision_valid(decision):
                 raise RuntimeError("interaction_router_invalid_output")
         return InteractionRouteResult(
             decision=decision,
+            session_id=new_session_id,
             total_cost_usd=total_cost_usd,
             usage=usage,
             stop_reason=stop_reason,
@@ -756,6 +861,7 @@ class ClaudeAgent:
     ) -> AgentResult | None:
         settings = Settings()
         interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
+        interaction_env = self._interaction_runtime_env(settings=settings, tenant_id=tenant_id)
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -774,79 +880,96 @@ class ClaudeAgent:
                 message_id=message_id,
             )
         )
-        options = ClaudeAgentOptions(
-            allowed_tools=[
-                "Read",
-                "Write",
-                "Edit",
-                "Grep",
-                "Glob",
-                f"mcp__{CHAT_SERVER_NAME}__check_for_status",
-                f"mcp__{CHAT_SERVER_NAME}__should_send_message",
-                f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
-                f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
-                SEND_MESSAGE_TOOL,
-                f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
-                f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
-            ],
-            permission_mode=self.permission_mode,
-            system_prompt=interaction_prompt,
-            setting_sources=self.setting_sources,
-            model=settings.interaction_model,
-            max_thinking_tokens=settings.interaction_max_thinking_tokens,
-            cwd=workspace.root,
-            add_dirs=[Path.cwd()],
-            plugins=self.plugins,
-            agents=None,
-            mcp_servers={CHAT_SERVER_NAME: chat_server},
-            stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_instruction"),
-        )
-        client = ClaudeSDKClient(options=options)
-        await client.connect()
-        total_cost_usd = None
-        usage: dict[str, Any] | None = None
-        stop_reason: str | None = None
-        result_subtype: str | None = None
+
+        async def _run_once(resume_session_id: str | None) -> AgentResult:
+            # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
+            options = ClaudeAgentOptions(
+                allowed_tools=[
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Grep",
+                    "Glob",
+                    f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                    f"mcp__{CHAT_SERVER_NAME}__should_send_message",
+                    f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
+                    f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
+                    SEND_MESSAGE_TOOL,
+                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                    f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+                ],
+                permission_mode=self.permission_mode,
+                system_prompt=interaction_prompt,
+                setting_sources=self.setting_sources,
+                model=settings.interaction_model,
+                max_thinking_tokens=settings.interaction_max_thinking_tokens,
+                resume=resume_session_id or None,
+                cwd=workspace.root,
+                add_dirs=self._interaction_add_dirs(workspace),
+                env=interaction_env,
+                plugins=self.plugins,
+                agents=None,
+                mcp_servers={CHAT_SERVER_NAME: chat_server},
+                stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_instruction"),
+            )
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+            total_cost_usd = None
+            usage: dict[str, Any] | None = None
+            stop_reason: str | None = None
+            result_subtype: str | None = None
+            new_session_id = resume_session_id
+            try:
+                prompt = (
+                    "Follow the instruction below. If sending a message would be redundant, "
+                    "do not send anything.\n\n"
+                    f"INSTRUCTION:\n{instruction}"
+                )
+                await client.query(
+                    self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
+                    session_id=resume_session_id or "interaction",
+                )
+                async for msg in client.receive_messages():
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        new_session_id = msg.data.get("session_id", new_session_id)
+                    if isinstance(msg, ResultMessage):
+                        new_session_id = msg.session_id or new_session_id
+                        stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
+                        result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
+                        self._record_stop_reason_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="send_interaction_instruction",
+                            stop_reason=stop_reason,
+                            result_subtype=result_subtype,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            message_id=message_id,
+                            project_name=workspace.project_name,
+                        )
+                        total_cost_usd = msg.total_cost_usd
+                        usage = msg.usage
+                        break
+            finally:
+                await client.disconnect()
+            return AgentResult(
+                session_id=new_session_id,
+                summary=None,
+                total_cost_usd=total_cost_usd,
+                usage=usage,
+                stop_reason=stop_reason,
+                result_subtype=result_subtype,
+            )
+
         try:
-            prompt = (
-                "Follow the instruction below. If sending a message would be redundant, "
-                "do not send anything.\n\n"
-                f"INSTRUCTION:\n{instruction}"
-            )
-            await client.query(
-                self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
-                session_id=session_id or "interaction",
-            )
-            async for msg in client.receive_messages():
-                if isinstance(msg, ResultMessage):
-                    stop_reason = self._normalize_stop_reason(getattr(msg, "stop_reason", None))
-                    result_subtype = self._normalize_result_subtype(getattr(msg, "subtype", None))
-                    self._record_stop_reason_event(
-                        tasks_dir=workspace.tasks_dir,
-                        db=db,
-                        tenant_id=tenant_id,
-                        context="send_interaction_instruction",
-                        stop_reason=stop_reason,
-                        result_subtype=result_subtype,
-                        session_id=session_id,
-                        run_id=run_id,
-                        message_id=message_id,
-                        project_name=workspace.project_name,
-                    )
-                    total_cost_usd = msg.total_cost_usd
-                    usage = msg.usage
-                    break
-        finally:
-            await client.disconnect()
-        return AgentResult(
-            session_id=None,
-            summary=None,
-            total_cost_usd=total_cost_usd,
-            usage=usage,
-            stop_reason=stop_reason,
-            result_subtype=result_subtype,
-        )
+            return await _run_once(session_id)
+        except Exception as exc:
+            if session_id and self._is_resume_error(exc):
+                self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
+                return await _run_once(None)
+            raise
 
     @staticmethod
     def _parse_router_json(raw: str | None) -> dict[str, Any]:

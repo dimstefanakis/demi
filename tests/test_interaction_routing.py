@@ -38,6 +38,7 @@ class FakeAgent:
                 "workspace": workspace,
                 "message": message,
                 "tenant_id": tenant_id,
+                "session_id": session_id,
             }
         )
         return self.decision
@@ -104,6 +105,7 @@ class BlockingRouteAgent(FakeAgent):
                 "workspace": workspace,
                 "message": message,
                 "tenant_id": tenant_id,
+                "session_id": session_id,
             }
         )
         await self._release.wait()
@@ -133,6 +135,7 @@ class BlockingFailRouteAgent(BlockingRouteAgent):
                 "workspace": workspace,
                 "message": message,
                 "tenant_id": tenant_id,
+                "session_id": session_id,
             }
         )
         await self._release.wait()
@@ -158,6 +161,48 @@ class RouteErrorAgent(FakeAgent):
         execution_bridge=None,
     ):
         raise RuntimeError("routing_failed")
+
+
+class SessionResultRouteAgent(FakeAgent):
+    def __init__(self, decision, returned_session_id: str):
+        super().__init__(decision)
+        self.returned_session_id = returned_session_id
+
+    async def route_interaction(
+        self,
+        *,
+        workspace,
+        message,
+        messenger=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        message_id=None,
+        billing_checked=False,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        self.route_calls.append(
+            {
+                "workspace": workspace,
+                "message": message,
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+            }
+        )
+        return type(
+            "InteractionRouteResult",
+            (),
+            {
+                "decision": self.decision,
+                "session_id": self.returned_session_id,
+                "total_cost_usd": None,
+                "usage": None,
+            },
+        )()
 
 
 class MergeFreezeOrchestrator(Orchestrator):
@@ -277,6 +322,93 @@ async def test_interaction_decision_creates_run(tmp_path):
     assert run["result_summary"] == "ok"
     decision_payload = run["interaction_decision_json"]
     assert decision_payload["purpose"] == "build"
+
+
+@pytest.mark.asyncio
+async def test_interaction_routing_uses_interaction_session_state(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    decision = {
+        "ok": True,
+        "project_name": "main",
+        "should_run": False,
+        "queue_run": False,
+        "dedupe": True,
+        "ask_questions": [],
+    }
+    agent = FakeAgent(decision)
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    tenant = db.get_or_create_tenant("telegram", tenant_external_id)
+    db.update_tenant_session(tenant.id, "execution-session-should-not-be-used")
+    db.set_tenant_kv(
+        tenant.id,
+        "interaction",
+        "claude_session",
+        {"session_id": "interaction-session-1"},
+    )
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="i-route-session-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="quick question",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    assert agent.route_calls
+    assert agent.route_calls[-1]["session_id"] == "interaction-session-1"
+
+
+@pytest.mark.asyncio
+async def test_interaction_routing_persists_returned_session_id(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    decision = {
+        "ok": True,
+        "project_name": "main",
+        "should_run": False,
+        "queue_run": False,
+        "dedupe": True,
+        "ask_questions": [],
+    }
+    agent = SessionResultRouteAgent(decision, returned_session_id="interaction-session-2")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="i-route-session-2",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="another question",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
+    assert payload.get("session_id") == "interaction-session-2"
 
 
 @pytest.mark.asyncio

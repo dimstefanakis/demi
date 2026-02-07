@@ -55,6 +55,29 @@ class UsageInteractionAgent:
         return SimpleNamespace(total_cost_usd=0.5, usage={"input_tokens": 5})
 
 
+class SessionInteractionAgent:
+    def __init__(self, returned_session_id: str):
+        self.received_session_ids: list[str | None] = []
+        self.returned_session_id = returned_session_id
+
+    async def send_interaction_instruction(
+        self,
+        workspace,
+        instruction,
+        messenger,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        run_id=None,
+        message_id=None,
+    ):
+        self.received_session_ids.append(session_id)
+        return SimpleNamespace(session_id=self.returned_session_id)
+
+
 class FakeMessenger:
     def __init__(self):
         self.sent = []
@@ -142,3 +165,47 @@ async def test_outbox_worker_records_interaction_usage(tmp_path):
     assert row["total_cost_usd"] == pytest.approx(0.5)
     usage = row["usage_json"]
     assert usage["interaction"][0]["input_tokens"] == 5
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_uses_and_updates_interaction_session_state(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    db.set_tenant_kv(
+        tenant.id,
+        "interaction",
+        "claude_session",
+        {"session_id": "interaction-session-prev"},
+    )
+
+    db.enqueue_outbox(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name="main",
+        correlation_id="update-session",
+        payload={
+            "type": "interaction_update",
+            "text": "Session update ping",
+            "final": False,
+            "tenant_external_id": tenant.external_id,
+            "provider": "telegram",
+            "project_name": "main",
+        },
+    )
+
+    agent = SessionInteractionAgent(returned_session_id="interaction-session-next")
+    worker = OutboxWorker(
+        db=db,
+        messenger=FakeMessenger(),
+        config=OutboxWorkerConfig(poll_interval=0.01, batch_size=5),
+        interaction_agent=agent,
+        workspace_manager=workspace_manager,
+    )
+
+    await worker.process_once()
+
+    assert agent.received_session_ids == ["interaction-session-prev"]
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
+    assert payload.get("session_id") == "interaction-session-next"

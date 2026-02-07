@@ -166,6 +166,8 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
   `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
   `INTERACTION_MAX_THINKING_TOKENS`
+- `INTERACTION_SESSION_CACHE_DIR` stores tenant-scoped Claude interaction session/cache files
+  for SDK `resume` continuity (default `data/interaction_sessions`)
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
 
@@ -278,12 +280,18 @@ data/<tenant_key>/
 
 ## Session Management
 
-Claude Agent SDK session IDs are stored per tenant in the main DB (`tenants.session_id`).
+Execution and interaction sessions are tracked separately:
+- Execution session IDs: `tenants.session_id` (used by `prepare_context` runs).
+- Interaction session IDs: `tenant_state(namespace='interaction', key='claude_session')`.
+- Interaction session cache files are written under `INTERACTION_SESSION_CACHE_DIR/tenant-<id>/`.
+  This path is not mounted into execution containers.
 
 Flow:
-1. The orchestrator passes the stored `session_id` into `ClaudeAgent.prepare_context`.
-2. The agent returns an updated `session_id` after each run.
-3. The orchestrator persists it for continuity across messages.
+1. The orchestrator passes execution `session_id` into `ClaudeAgent.prepare_context`.
+2. Interaction routing/message delivery uses the interaction session ID and SDK `resume`.
+3. Both execution and interaction agents return updated session IDs.
+4. The orchestrator/workers persist each session ID in its own scope.
+5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
 
 ---
 
