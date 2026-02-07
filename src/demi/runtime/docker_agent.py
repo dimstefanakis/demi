@@ -339,6 +339,9 @@ class DockerAgent:
             "CLAUDE_PLUGINS",
             "ANTHROPIC_API_KEY",
             "CLAUDE_API_KEY",
+            "EXECUTION_MODEL",
+            "INTERACTION_MODEL",
+            "INTERACTION_MAX_THINKING_TOKENS",
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
         ]
@@ -400,6 +403,9 @@ class DockerAgent:
             "GITHUB_API_BASE_URL": self.settings.github_api_base_url,
             "ANTHROPIC_API_KEY": self.settings.anthropic_api_key,
             "CLAUDE_API_KEY": self.settings.claude_api_key,
+            "EXECUTION_MODEL": self.settings.execution_model,
+            "INTERACTION_MODEL": self.settings.interaction_model,
+            "INTERACTION_MAX_THINKING_TOKENS": self.settings.interaction_max_thinking_tokens,
             "GEMINI_API_KEY": self.settings.gemini_api_key,
             "GOOGLE_API_KEY": self.settings.google_api_key,
         }

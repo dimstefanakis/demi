@@ -112,9 +112,10 @@ class WorkspaceManager:
             if not target.exists():
                 shutil.copy2(claude_md, target)
 
+        # Canonical design template is docs/DESIGN.md; keep root DESIGN.md as fallback.
         design_candidates = [
-            self.template_root / "DESIGN.md",
             self.template_root / "docs" / "DESIGN.md",
+            self.template_root / "DESIGN.md",
         ]
         for design_md in design_candidates:
             if design_md.exists():

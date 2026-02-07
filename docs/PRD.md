@@ -192,21 +192,21 @@ We can replace the “CC service” with Claude Agent SDK.
 
 ---
 
-## Design Generation Strategy (Gemini CLI + DESIGN.md)
+## Design Generation Strategy (Gemini CLI + docs/DESIGN.md)
 We will use Gemini CLI for the actual site design implementation.
 
 Approach:
-- The design prompt is always `DESIGN.md`.
+- The design prompt template is always `docs/DESIGN.md` (runtime path: `/app/docs/DESIGN.md`).
 - Claude does not craft a separate prompt; it provides context via workspace files (task brief, `memory.md`, assets).
-- Claude invokes Gemini CLI headlessly with `-p "$(cat DESIGN.md)"`.
+- Claude invokes Gemini CLI headlessly with `-p "$(cat /app/docs/DESIGN.md)"`.
 - Gemini decides where to write files (no fixed output path).
 - Claude validates with `bun run build`, then deploys via Vercel CLI.
 
 Goal:
 - Produce a “magic moment” with truly unique, high‑quality visual designs.
 
-### DESIGN.md Prompt Contract
-`DESIGN.md` should define:
+### docs/DESIGN.md Prompt Contract
+`docs/DESIGN.md` should define:
 - Required context sources (task brief, `memory.md`, assets)
 - Output expectations (mobile-first, unique layout, include CSS variables)
 - Do/avoid constraints (e.g. “no templates”, “minimal copy”)
