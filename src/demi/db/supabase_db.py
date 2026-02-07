@@ -331,6 +331,35 @@ class SupabaseDatabase:
         }
         self._execute(self._table("message_events").insert(payload))
 
+    def record_webhook_update(
+        self,
+        *,
+        provider: str,
+        update_id: int | None,
+        payload: dict[str, Any],
+        parse_status: str,
+        parse_error: str | None = None,
+        tenant_external_id: str | None = None,
+        provider_message_id: str | None = None,
+        message_text: str | None = None,
+    ) -> None:
+        row = {
+            "provider": provider,
+            "update_id": int(update_id) if update_id is not None else None,
+            "tenant_external_id": tenant_external_id,
+            "provider_message_id": provider_message_id,
+            "message_text": message_text,
+            "parse_status": parse_status,
+            "parse_error": parse_error,
+            "payload_json": payload,
+            "created_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        try:
+            self._execute(self._table("webhook_updates").insert(row))
+        except Exception:
+            # Best-effort diagnostics path.
+            return
+
     def list_message_events(
         self,
         tenant_id: int | None = None,
@@ -379,6 +408,18 @@ class SupabaseDatabase:
             query = query.limit(limit)
         data = self._execute(query)
         return list(data or [])
+
+    def has_outbound_message_event_since(self, tenant_id: int, since: str) -> bool:
+        query = (
+            self._table("message_events")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("direction", "outbound")
+            .gte("created_at", since)
+            .limit(1)
+        )
+        data = self._execute(query)
+        return bool(data)
 
     def get_latest_message_received_at(self, tenant_id: int) -> str | None:
         query = (
@@ -1048,8 +1089,19 @@ class SupabaseDatabase:
             return str(row["id"])
         return str(data[0]["id"])
 
-    def claim_outbox(self, limit: int = 25) -> list[dict[str, Any]]:
-        data = self._execute(self.client.rpc("claim_outbox", {"p_limit": limit}))
+    def claim_outbox(
+        self,
+        limit: int = 25,
+        stale_sending_seconds: int | None = None,
+    ) -> list[dict[str, Any]]:
+        args: dict[str, Any] = {"p_limit": limit}
+        if stale_sending_seconds is not None:
+            args["p_stale_sending_seconds"] = int(stale_sending_seconds)
+        try:
+            data = self._execute(self.client.rpc("claim_outbox", args))
+        except Exception:
+            # Backward compatibility while the DB function rollout catches up.
+            data = self._execute(self.client.rpc("claim_outbox", {"p_limit": limit}))
         return list(data or [])
 
     def list_outbox(
@@ -1075,6 +1127,45 @@ class SupabaseDatabase:
         if status == "sent":
             payload["sent_at"] = datetime.now(tz=timezone.utc).isoformat()
         self._execute(self._table("outbox").update(payload).in_("id", ids))
+
+    def update_outbox_status(
+        self,
+        outbox_id: str,
+        status: str,
+        error: str | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        now = datetime.now(tz=timezone.utc)
+        payload: dict[str, Any] = {
+            "status": status,
+            "updated_at": now.isoformat(),
+        }
+        if status == "sent":
+            payload["sent_at"] = now.isoformat()
+            payload["last_error"] = None
+            payload["next_retry_at"] = None
+        else:
+            payload["last_error"] = error
+            if retry_after_seconds is not None:
+                payload["next_retry_at"] = (
+                    now + timedelta(seconds=float(retry_after_seconds))
+                ).isoformat()
+            elif status in {"failed", "sending"}:
+                payload["next_retry_at"] = None
+        if status in {"queued", "failed"}:
+            row = self._select_one("outbox", id=outbox_id) or {}
+            current_attempts = int(row.get("attempt_count") or 0)
+            payload["attempt_count"] = (
+                current_attempts + 1 if status == "queued" else current_attempts
+            )
+        try:
+            self._execute(self._table("outbox").update(payload).eq("id", outbox_id))
+        except Exception:
+            # Backward compatibility for older schemas without retry metadata.
+            minimal: dict[str, Any] = {"status": status}
+            if status == "sent":
+                minimal["sent_at"] = now.isoformat()
+            self._execute(self._table("outbox").update(minimal).eq("id", outbox_id))
 
     def set_active_run(
         self,

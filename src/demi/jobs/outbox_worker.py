@@ -5,6 +5,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
+import time
 
 from demi.db.core import Database
 
@@ -18,6 +19,12 @@ INTERACTION_SESSION_KEY = "claude_instruction_session"
 class OutboxWorkerConfig:
     poll_interval: float = 1.0
     batch_size: int = 50
+    interaction_send_timeout_seconds: float = 20.0
+    max_attempts: int = 6
+    retry_base_seconds: float = 2.0
+    retry_max_seconds: float = 120.0
+    fallback_scan_interval_seconds: float = 60.0
+    stale_sending_seconds: int = 120
 
 
 @dataclass
@@ -28,6 +35,7 @@ class OutboxWorker:
     interaction_agent: Any | None = None
     workspace_manager: Any | None = None
     _running: bool = False
+    _next_fallback_scan_monotonic: float = 0.0
 
     async def _db_call(self, fn, *args, **kwargs):
         return await asyncio.to_thread(fn, *args, **kwargs)
@@ -60,24 +68,39 @@ class OutboxWorker:
 
     async def run_forever(self) -> None:
         self._running = True
+        idle_streak = 0
         try:
             while self._running:
                 processed = await self.process_once()
                 if not processed:
-                    await asyncio.sleep(self.config.poll_interval)
+                    idle_streak = min(idle_streak + 1, 6)
+                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
+                else:
+                    idle_streak = 0
         except asyncio.CancelledError:
             pass
         finally:
             self._running = False
 
     async def process_once(self) -> bool:
-        fallback_processed = await self._drain_interaction_fallbacks()
-        rows = await self._db_call(self.db.claim_outbox, self.config.batch_size)
+        fallback_processed = False
+        now_monotonic = time.monotonic()
+        if now_monotonic >= self._next_fallback_scan_monotonic:
+            fallback_processed = await self._drain_interaction_fallbacks()
+            interval = max(1.0, float(self.config.fallback_scan_interval_seconds))
+            self._next_fallback_scan_monotonic = now_monotonic + interval
+
+        rows = await self._db_call(
+            self.db.claim_outbox,
+            self.config.batch_size,
+            self.config.stale_sending_seconds,
+        )
         if not rows:
             return fallback_processed
-        sent_ids: list[str] = []
-        failed_ids: list[str] = []
         for row in rows:
+            row_id = str(row.get("id") or "")
+            if not row_id:
+                continue
             payload = row.get("payload_json") if isinstance(row, dict) else None
             if isinstance(payload, str):
                 try:
@@ -91,7 +114,13 @@ class OutboxWorker:
                 text = str(payload.get("text") or "").strip()
                 tenant_external_id = str(payload.get("tenant_external_id") or "").strip()
                 if not text or not tenant_external_id:
-                    failed_ids.append(str(row.get("id")))
+                    await self._db_call(
+                        self.db.update_outbox_status,
+                        row_id,
+                        "failed",
+                        "invalid_payload_missing_text_or_tenant",
+                        None,
+                    )
                     continue
                 payload = {
                     **payload,
@@ -101,15 +130,34 @@ class OutboxWorker:
                     "tenant_external_id": tenant_external_id,
                 }
                 payload_type = "interaction_update"
-            ok = await self._handle_interaction_update(row, payload)
+            ok, error = await self._handle_interaction_update(row, payload)
             if ok:
-                sent_ids.append(str(row.get("id")))
+                await self._db_call(self.db.update_outbox_status, row_id, "sent", None, None)
             else:
-                failed_ids.append(str(row.get("id")))
-        if sent_ids:
-            await self._db_call(self.db.update_outbox_statuses, sent_ids, "sent")
-        if failed_ids:
-            await self._db_call(self.db.update_outbox_statuses, failed_ids, "failed")
+                attempts = 1
+                try:
+                    attempts = int(row.get("attempt_count") or 1)
+                except (TypeError, ValueError):
+                    attempts = 1
+                max_attempts = max(1, int(self.config.max_attempts))
+                if attempts >= max_attempts:
+                    await self._db_call(
+                        self.db.update_outbox_status,
+                        row_id,
+                        "failed",
+                        error,
+                        None,
+                    )
+                    continue
+
+                retry_seconds = self._compute_retry_seconds(attempts)
+                await self._db_call(
+                    self.db.update_outbox_status,
+                    row_id,
+                    "queued",
+                    error,
+                    retry_seconds,
+                )
         return True
 
     async def _drain_interaction_fallbacks(self) -> bool:
@@ -172,12 +220,13 @@ class OutboxWorker:
             remaining: list[dict[str, Any]] = []
             for payload in payloads:
                 payload.setdefault("project_name", workspace.project_name)
-                if await self._send_interaction_update(
+                sent, _error = await self._send_interaction_update(
                     tenant,
                     workspace,
                     payload,
                     self._coerce_run_id(payload.get("run_id")),
-                ):
+                )
+                if sent:
                     processed = True
                 else:
                     remaining.append(payload)
@@ -189,7 +238,7 @@ class OutboxWorker:
             sent = False
             if isinstance(payload, dict):
                 payload.setdefault("project_name", workspace.project_name)
-                sent = await self._send_interaction_update(
+                sent, _error = await self._send_interaction_update(
                     tenant,
                     workspace,
                     payload,
@@ -289,15 +338,17 @@ class OutboxWorker:
         except OSError:
             pass
 
-    async def _handle_interaction_update(self, row: dict[str, Any], payload: dict[str, Any]) -> bool:
+    async def _handle_interaction_update(
+        self, row: dict[str, Any], payload: dict[str, Any]
+    ) -> tuple[bool, str | None]:
         if self.interaction_agent is None or self.workspace_manager is None:
-            return False
+            return False, "interaction_agent_unavailable"
         tenant_id = row.get("tenant_id")
         if tenant_id is None:
-            return False
+            return False, "missing_tenant_id"
         tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
         if tenant is None:
-            return False
+            return False, "tenant_not_found"
         project_name = payload.get("project_name") or row.get("project_name")
         if getattr(tenant, "workspace_path", None):
             tenant_root = self.workspace_manager.infer_tenant_root(Path(tenant.workspace_path))
@@ -350,15 +401,24 @@ class OutboxWorker:
         except Exception:
             return
 
+    def _compute_retry_seconds(self, attempts: int) -> float:
+        # Exponential backoff with a bounded cap to keep retries responsive
+        # while preventing hot-loop retries on repeated failures.
+        base = max(0.25, float(self.config.retry_base_seconds))
+        max_wait = max(base, float(self.config.retry_max_seconds))
+        exponent = max(0, int(attempts) - 1)
+        delay = base * (2**exponent)
+        return min(delay, max_wait)
+
     async def _send_interaction_update(
         self,
         tenant: Any,
         workspace: Any,
         payload: dict[str, Any],
         run_id: int | None = None,
-    ) -> bool:
+    ) -> tuple[bool, str | None]:
         if self.interaction_agent is None:
-            return False
+            return False, "interaction_agent_unavailable"
         action = str(payload.get("action") or payload.get("type") or "send_message").strip()
         action = action.lower()
         if action == "interaction_update":
@@ -399,25 +459,33 @@ class OutboxWorker:
             lines.append(f"UPDATE:\n{payload.get('text')}")
             instruction = "\n".join(lines)
         try:
-            result = await self.interaction_agent.send_interaction_instruction(
-                workspace=workspace,
-                instruction=instruction,
-                messenger=self.messenger,
-                tenant_id=tenant.id,
-                db=self.db,
-                payments=None,
-                session_id=self._get_interaction_session_id(int(tenant.id)),
-                provider=payload.get("provider") or tenant.provider,
-                tenant_external_id=payload.get("tenant_external_id") or tenant.external_id,
-                run_id=run_id,
+            # Keep this configurable for fast-fail retries and deterministic
+            # tests while still guarding against invalid/zero values.
+            timeout_seconds = max(0.01, float(self.config.interaction_send_timeout_seconds))
+            result = await asyncio.wait_for(
+                self.interaction_agent.send_interaction_instruction(
+                    workspace=workspace,
+                    instruction=instruction,
+                    messenger=self.messenger,
+                    tenant_id=tenant.id,
+                    db=self.db,
+                    payments=None,
+                    session_id=self._get_interaction_session_id(int(tenant.id)),
+                    provider=payload.get("provider") or tenant.provider,
+                    tenant_external_id=payload.get("tenant_external_id") or tenant.external_id,
+                    run_id=run_id,
+                ),
+                timeout=timeout_seconds,
             )
             self._record_interaction_usage(run_id, result)
             session_from_result = str(getattr(result, "session_id", "") or "").strip()
             if session_from_result:
                 self._set_interaction_session_id(int(tenant.id), session_from_result)
-            return True
-        except Exception:
-            return False
+            return True, None
+        except asyncio.TimeoutError:
+            return False, "interaction_update_timeout"
+        except Exception as exc:  # noqa: BLE001
+            return False, f"interaction_update_failed:{type(exc).__name__}"
 
     def stop(self) -> None:
         self._running = False

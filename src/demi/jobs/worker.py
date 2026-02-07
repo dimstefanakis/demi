@@ -26,6 +26,7 @@ class EventWorker:
 
     async def run_forever(self) -> None:
         self._running = True
+        idle_streak = 0
         try:
             while self._running:
                 jobs = await self._db_call(
@@ -33,12 +34,16 @@ class EventWorker:
                     self.config.batch_size,
                 )
                 if not jobs:
-                    await asyncio.sleep(self.config.poll_interval)
+                    idle_streak = min(idle_streak + 1, 6)
+                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
                     continue
+                idle_streak = 0
                 for job in jobs:
                     try:
                         await self._handle_job(job)
                     except Exception:
+                        # Keep failure backoff bounded and recover quickly on success.
+                        idle_streak = min(idle_streak + 1, 3)
                         await asyncio.sleep(self.config.poll_interval)
                         break
         except asyncio.CancelledError:

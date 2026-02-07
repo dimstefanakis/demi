@@ -81,7 +81,8 @@ def create_app() -> FastAPI:
         payments=stripe_client,
         workspace_allocator=workspace_allocator,
     )
-    if settings.events_worker_enabled:
+    embedded_workers_enabled = bool(settings.api_embedded_workers_enabled)
+    if embedded_workers_enabled and settings.events_worker_enabled:
         worker = EventWorker(
             db=db,
             orchestrator=orchestrator,
@@ -90,22 +91,29 @@ def create_app() -> FastAPI:
                 batch_size=settings.events_worker_batch_size,
             ),
         )
-    if settings.pending_worker_enabled:
+    if embedded_workers_enabled and settings.pending_worker_enabled:
         pending_worker = PendingWorker(
             db=db,
             orchestrator=orchestrator,
             config=PendingWorkerConfig(
                 poll_interval=settings.pending_worker_poll_interval,
                 batch_size=settings.pending_worker_batch_size,
+                active_check_interval_seconds=settings.pending_worker_active_check_interval,
             ),
         )
-    if settings.outbox_worker_enabled:
+    if embedded_workers_enabled and settings.outbox_worker_enabled:
         outbox_worker = OutboxWorker(
             db=db,
             messenger=messenger,
             config=OutboxWorkerConfig(
                 poll_interval=settings.outbox_worker_poll_interval,
                 batch_size=settings.outbox_worker_batch_size,
+                interaction_send_timeout_seconds=settings.outbox_send_timeout_seconds,
+                max_attempts=settings.outbox_max_attempts,
+                retry_base_seconds=settings.outbox_retry_base_seconds,
+                retry_max_seconds=settings.outbox_retry_max_seconds,
+                fallback_scan_interval_seconds=settings.outbox_fallback_scan_interval,
+                stale_sending_seconds=settings.outbox_stale_sending_seconds,
             ),
             interaction_agent=orchestrator.agent,
             workspace_manager=workspace_manager,
@@ -228,6 +236,22 @@ def create_app() -> FastAPI:
     async def telegram_webhook(request: Request):
         payload = await request.json()
         msg = TelegramUpdateParser.parse(payload)
+        try:
+            update_id = payload.get("update_id") if isinstance(payload, dict) else None
+            parse_status = "parsed" if msg is not None else "ignored"
+            parse_error = None if msg is not None else "not_message_update_or_missing_fields"
+            db.record_webhook_update(
+                provider="telegram",
+                update_id=update_id,
+                payload=payload if isinstance(payload, dict) else {"raw": payload},
+                parse_status=parse_status,
+                parse_error=parse_error,
+                tenant_external_id=(msg.tenant_external_id if msg else None),
+                provider_message_id=(msg.provider_message_id if msg else None),
+                message_text=(msg.text if msg else None),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("Failed to record telegram webhook audit row")
         if not msg:
             return {"status": "ignored"}
         task = asyncio.create_task(orchestrator.handle_message(msg))

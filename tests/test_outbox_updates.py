@@ -78,6 +78,25 @@ class SessionInteractionAgent:
         return SimpleNamespace(session_id=self.returned_session_id)
 
 
+class TimeoutInteractionAgent:
+    async def send_interaction_instruction(
+        self,
+        workspace,
+        instruction,
+        messenger,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        run_id=None,
+        message_id=None,
+    ):
+        await asyncio.sleep(0.2)
+        return None
+
+
 class FakeMessenger:
     def __init__(self):
         self.sent = []
@@ -209,3 +228,48 @@ async def test_outbox_worker_uses_and_updates_interaction_session_state(tmp_path
     assert agent.received_session_ids == ["interaction-session-prev"]
     payload = db.get_tenant_kv(tenant.id, "interaction", "claude_instruction_session") or {}
     assert payload.get("session_id") == "interaction-session-next"
+
+
+@pytest.mark.asyncio
+async def test_outbox_worker_requeues_timed_out_interaction_update(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace_manager.ensure_workspace(tenant.key, project_name="main")
+
+    outbox_id = db.enqueue_outbox(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name="main",
+        correlation_id="update-timeout",
+        payload={
+            "type": "interaction_update",
+            "text": "Still working...",
+            "final": False,
+            "tenant_external_id": tenant.external_id,
+            "provider": "telegram",
+            "project_name": "main",
+        },
+    )
+
+    worker = OutboxWorker(
+        db=db,
+        messenger=FakeMessenger(),
+        config=OutboxWorkerConfig(
+            poll_interval=0.01,
+            batch_size=5,
+            interaction_send_timeout_seconds=0.05,
+            retry_base_seconds=0.01,
+            retry_max_seconds=0.05,
+        ),
+        interaction_agent=TimeoutInteractionAgent(),
+        workspace_manager=workspace_manager,
+    )
+
+    await worker.process_once()
+
+    rows = db.list_outbox(tenant.id, limit=10)
+    row = next((item for item in rows if str(item.get("id")) == str(outbox_id)), None)
+    assert row is not None
+    # Timed-out sends should be retried, not permanently dropped.
+    assert row["status"] in {"queued", "failed"}

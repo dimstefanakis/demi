@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,7 @@ class PendingWorkerConfig:
     batch_size: int = 20
     processing_grace_seconds: float = 60.0
     run_stale_seconds: float = 900.0
+    active_check_interval_seconds: float = 10.0
 
 
 @dataclass
@@ -47,6 +49,8 @@ class PendingWorker:
 
     async def run_forever(self) -> None:
         self._running = True
+        idle_streak = 0
+        next_active_check = 0.0
         try:
             while self._running:
                 groups = await self._db_call(
@@ -54,9 +58,17 @@ class PendingWorker:
                     self.config.batch_size,
                 )
                 if not groups:
-                    await self._check_active_runs()
-                    await asyncio.sleep(self.config.poll_interval)
+                    now = time.monotonic()
+                    if now >= next_active_check:
+                        await self._check_active_runs()
+                        next_active_check = now + max(
+                            self.config.poll_interval,
+                            self.config.active_check_interval_seconds,
+                        )
+                    idle_streak = min(idle_streak + 1, 6)
+                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
                     continue
+                idle_streak = 0
                 for group in groups:
                     try:
                         await self._handle_group(group)

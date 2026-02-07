@@ -87,7 +87,7 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
 Background workers (poll main DB):
 - EventWorker -> orchestrator (event_jobs)
 - PendingWorker -> drains run_inputs into next run
-- OutboxWorker -> sends deferred Telegram messages
+- OutboxWorker -> sends deferred Telegram messages with retry/backoff and stale-send reclaim
 ```
 
 ### Technology Stack
@@ -98,7 +98,7 @@ Background workers (poll main DB):
 - Design: Gemini CLI driven by `docs/DESIGN.md` template (runtime path `/app/docs/DESIGN.md`), editing app files directly (auto-edit mode)
 - Deploy: Vercel CLI
 - Messaging: Telegram Bot API
-- Storage: SQLite by default, Supabase optional for main DB
+- Storage: Supabase main DB, plus per-tenant local SQLite scratchpads in workspaces
 
 ---
 
@@ -163,6 +163,9 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - `AGENT_RUNTIME=docker` runs Claude inside `demi-agent` containers
 - `DOCKER_POOL_SIZE` controls pre-warmed idle pool containers (default `0`, disabled)
 - `DOCKER_ENV_ALLOWLIST` controls which env vars can be forwarded to containers
+- `API_EMBEDDED_WORKERS_ENABLED` controls whether API processes run background workers
+  in-process; production blue/green deploys should disable this on API and enable workers
+  only in the dedicated worker container
 - Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
   `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
   `INTERACTION_MAX_THINKING_TOKENS`
@@ -170,6 +173,13 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   for SDK `resume` continuity (default `data/interaction_sessions`)
 - `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
 - `CLAUDE_ENABLE_MEMORY_TOOL=true` enables Claude Code memory tool (persisted to project `memory.md`)
+- Outbox retry controls:
+  - `OUTBOX_SEND_TIMEOUT_SECONDS`
+  - `OUTBOX_MAX_ATTEMPTS`
+  - `OUTBOX_RETRY_BASE_SECONDS`
+  - `OUTBOX_RETRY_MAX_SECONDS`
+  - `OUTBOX_FALLBACK_SCAN_INTERVAL`
+  - `OUTBOX_STALE_SENDING_SECONDS`
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
 
@@ -413,6 +423,14 @@ Background workers poll the main DB and run in the API process or the worker con
 - PendingWorker: Drains queued `run_inputs` once a project is idle and reclaims stale runs after lease expiry.
 - OutboxWorker: Sends deferred messages from the `outbox` table for busy acknowledgments and fallback notifications.
   Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
+  Uses bounded retries, stale `sending` reclaim, and throttled fallback file scans to prevent
+  head-of-line stalls and excessive polling.
+
+## Webhook Diagnostics
+
+Inbound Telegram webhook payloads are persisted to `webhook_updates` with parse metadata
+(`parsed`/`ignored`, parse error, tenant/message ids when available). This makes dropped or
+ignored message investigations concrete instead of relying on container logs.
 
 ---
 

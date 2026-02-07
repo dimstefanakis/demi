@@ -67,7 +67,7 @@ class Settings(BaseSettings):
     # NOTE: all secrets are considered safe for agents to consume in this runtime.
     docker_env_allowlist: str | None = "*"
     docker_forward_messages: bool = False
-    docker_command_timeout_seconds: float = 1800.0
+    docker_command_timeout_seconds: float = 900.0
     docker_pool_warm_timeout_seconds: float = 45.0
 
     anthropic_api_key: str | None = None
@@ -81,16 +81,26 @@ class Settings(BaseSettings):
     events_worker_poll_interval: float = 1.5
     events_worker_batch_size: int = 20
     event_url: str | None = None
+    # In production blue/green deployments, disable embedded workers on API
+    # containers and run them only in the dedicated worker process.
+    api_embedded_workers_enabled: bool = True
 
     pending_worker_enabled: bool = True
     pending_worker_poll_interval: float = 2.5
     pending_worker_batch_size: int = 20
+    pending_worker_active_check_interval: float = 10.0
 
     outbox_worker_enabled: bool = True
     outbox_worker_poll_interval: float = 1.0
     outbox_worker_batch_size: int = 50
+    outbox_send_timeout_seconds: float = 20.0
+    outbox_max_attempts: int = 6
+    outbox_retry_base_seconds: float = 2.0
+    outbox_retry_max_seconds: float = 120.0
+    outbox_fallback_scan_interval: float = 60.0
+    outbox_stale_sending_seconds: int = 120
 
-    run_lease_seconds: int = 600
+    run_lease_seconds: int = 300
     run_activity_poll_interval: float = 2.5
 
     unsplash_app_id: str | None = None

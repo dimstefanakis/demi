@@ -717,7 +717,19 @@ class Orchestrator:
                             status="queued",
                             routing_decision=decision,
                         )
-                    if not decision.get("reply_sent"):
+                    should_send_busy_ack = True
+                    if decision.get("reply_sent"):
+                        # Treat "reply_sent" as advisory. Only suppress the fallback
+                        # ack if we can prove an outbound message was persisted.
+                        since = combined_msg.received_at.isoformat()
+                        try:
+                            has_outbound = self.db.has_outbound_message_event_since(
+                                tenant.id, since
+                            )
+                        except Exception:
+                            has_outbound = False
+                        should_send_busy_ack = not has_outbound
+                    if should_send_busy_ack:
                         await self._send_busy_ack(
                             workspace=workspace,
                             tenant=tenant,
@@ -760,7 +772,17 @@ class Orchestrator:
                     self.db.update_message_statuses(message_ids, "processing")
                 except Exception:
                     pass
-                if not decision.get("reply_sent"):
+                should_send_starting_ack = True
+                if decision.get("reply_sent"):
+                    since = combined_msg.received_at.isoformat()
+                    try:
+                        has_outbound = self.db.has_outbound_message_event_since(
+                            tenant.id, since
+                        )
+                    except Exception:
+                        has_outbound = False
+                    should_send_starting_ack = not has_outbound
+                if should_send_starting_ack:
                     await self._send_interaction_instruction(
                         workspace=workspace,
                         tenant=tenant,

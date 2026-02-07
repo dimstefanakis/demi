@@ -21,8 +21,10 @@ services:
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - API_EMBEDDED_WORKERS_ENABLED=false
       - EVENTS_WORKER_ENABLED=false
       - PENDING_WORKER_ENABLED=false
+      - OUTBOX_WORKER_ENABLED=false
     volumes:
       - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -39,8 +41,10 @@ services:
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - API_EMBEDDED_WORKERS_ENABLED=false
       - EVENTS_WORKER_ENABLED=false
       - PENDING_WORKER_ENABLED=false
+      - OUTBOX_WORKER_ENABLED=false
     volumes:
       - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}
       - /var/run/docker.sock:/var/run/docker.sock
@@ -57,8 +61,10 @@ services:
       - MAIN_DB_SUPABASE_URL=${MAIN_DB_SUPABASE_URL:-}
       - MAIN_DB_SUPABASE_SERVICE_KEY=${MAIN_DB_SUPABASE_SERVICE_KEY:-}
       - AGENT_RUNTIME=${AGENT_RUNTIME:-docker}
+      - API_EMBEDDED_WORKERS_ENABLED=true
       - EVENTS_WORKER_ENABLED=true
       - PENDING_WORKER_ENABLED=true
+      - OUTBOX_WORKER_ENABLED=true
     command: ["python", "-m", "demi.worker_entrypoint"]
     volumes:
       - ${HOST_DATA_PATH:-./data}:${CONTAINER_DATA_PATH:-/app/data}

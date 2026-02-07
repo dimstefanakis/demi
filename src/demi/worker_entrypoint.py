@@ -92,6 +92,7 @@ async def _run_workers() -> None:
             config=PendingWorkerConfig(
                 poll_interval=settings.pending_worker_poll_interval,
                 batch_size=settings.pending_worker_batch_size,
+                active_check_interval_seconds=settings.pending_worker_active_check_interval,
             ),
         )
         workers.append(pending_worker)
@@ -106,6 +107,12 @@ async def _run_workers() -> None:
             config=OutboxWorkerConfig(
                 poll_interval=settings.outbox_worker_poll_interval,
                 batch_size=settings.outbox_worker_batch_size,
+                interaction_send_timeout_seconds=settings.outbox_send_timeout_seconds,
+                max_attempts=settings.outbox_max_attempts,
+                retry_base_seconds=settings.outbox_retry_base_seconds,
+                retry_max_seconds=settings.outbox_retry_max_seconds,
+                fallback_scan_interval_seconds=settings.outbox_fallback_scan_interval,
+                stale_sending_seconds=settings.outbox_stale_sending_seconds,
             ),
             interaction_agent=orchestrator.agent,
             workspace_manager=workspace_manager,
