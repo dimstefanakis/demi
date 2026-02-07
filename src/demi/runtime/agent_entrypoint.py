@@ -203,11 +203,12 @@ async def _pump_inflight_updates(
     path = tasks_dir / "inflight_updates.jsonl"
     poll_interval_seconds = max(0.05, float(poll_interval_seconds))
     db_stream_enabled = db is not None and run_id is not None
+    realtime_active = bool(realtime_enabled and db_stream_enabled)
     wake_event = asyncio.Event()
-    if db_stream_enabled:
+    if db_stream_enabled and not realtime_active:
         wake_event.set()
     watcher: _ExecutionStreamRealtimeWatcher | None = None
-    if realtime_enabled and db_stream_enabled:
+    if realtime_active:
         url = str(supabase_url or getattr(db, "url", "") or "").strip()
         key = str(supabase_service_key or getattr(db, "service_key", "") or "").strip()
         if url and key:
@@ -219,12 +220,19 @@ async def _pump_inflight_updates(
             )
             if not await watcher.start():
                 watcher = None
+        if watcher is None:
+            logger.error(
+                "execution_stream_realtime_required_but_unavailable run_id=%s",
+                int(run_id),
+            )
     try:
         while not stop_event.is_set():
             should_claim_db = False
-            if db_stream_enabled and wake_event.is_set():
+            if db_stream_enabled and not realtime_active and wake_event.is_set():
                 should_claim_db = True
-            if db_stream_enabled and watcher is None:
+            if db_stream_enabled and not realtime_active and watcher is None:
+                should_claim_db = True
+            if db_stream_enabled and realtime_active and watcher is not None and wake_event.is_set():
                 should_claim_db = True
             if should_claim_db:
                 if wake_event.is_set():
@@ -296,16 +304,12 @@ async def _pump_inflight_updates(
                     inflight_stream.queue.put_nowait(text)
                 except Exception:
                     pass
-            if watcher is not None:
+            if realtime_active and watcher is not None:
                 await _wait_for_stop_or_wake(
                     stop_event=stop_event,
                     wake_event=wake_event,
                     timeout_seconds=poll_interval_seconds,
                 )
-                # Keep a periodic safety poll in case realtime notifications are delayed
-                # or dropped; realtime still wakes immediately for normal updates.
-                if not stop_event.is_set() and not wake_event.is_set():
-                    wake_event.set()
             else:
                 with contextlib.suppress(asyncio.TimeoutError):
                     await asyncio.wait_for(stop_event.wait(), timeout=poll_interval_seconds)

@@ -479,6 +479,65 @@ async def test_orchestrator_reconciles_run_result(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_reconciles_run_result_before_expiring_stale_run(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stale-reconcile-old",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="hello",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id, message_id=message_id, project_name=workspace.project_name
+    )
+    past = datetime.now(tz=timezone.utc) - timedelta(seconds=5)
+    db.update_run_lease(
+        run_id, lease_expires_at=past.isoformat(), last_heartbeat_at=past.isoformat()
+    )
+
+    result_payload = {
+        "session_id": "session-stale-reconcile",
+        "summary": "ok",
+        "total_cost_usd": 0.42,
+        "usage": {"input_tokens": 4},
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(result_payload))
+
+    new_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stale-reconcile-new",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="continue",
+        images=[],
+        raw={},
+    )
+    result = await orchestrator.handle_message(new_msg)
+
+    assert result.status == "accepted"
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "completed"
+    assert run_row["error"] is None
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_reconciles_run_result_stop_sequence_completed(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")

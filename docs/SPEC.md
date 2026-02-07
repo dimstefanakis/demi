@@ -176,7 +176,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Execution stream wake controls:
   - `EXECUTION_STREAM_REALTIME_ENABLED` (default `true`) subscribes runtime containers to Supabase
     realtime `INSERT` events on `execution_stream_inputs` scoped by `run_id`
-  - `EXECUTION_STREAM_POLL_INTERVAL` fallback interval used when realtime is unavailable
+  - `EXECUTION_STREAM_POLL_INTERVAL` interval for explicit polling mode (`EXECUTION_STREAM_REALTIME_ENABLED=false`)
 - Outbox retry controls:
   - `OUTBOX_SEND_TIMEOUT_SECONDS`
   - `OUTBOX_MAX_ATTEMPTS`
@@ -360,7 +360,9 @@ Execution runtime consumption:
 - Agent runtime claims `execution_stream_inputs.status='pending'` for its `run_id`,
   pushes payloads into the in-memory inflight stream, then marks rows `streamed`.
 - Runtime uses Supabase realtime `INSERT` notifications (single channel per run process) to wake
-  claim loops without constant polling; periodic polling remains as a safety fallback.
+  claim loops without constant polling.
+- When realtime mode is enabled, runtime does not silently fall back to DB polling if realtime
+  subscription setup fails; this is intentional so failures are visible.
 - `inflight_updates.jsonl` is only written for true file-stream fallback cases to avoid duplicate runtime ingestion
   when DB-backed streaming is available.
 - File-fallback entries include `run_id`; runtime only accepts matching `run_id` entries and drains the file via

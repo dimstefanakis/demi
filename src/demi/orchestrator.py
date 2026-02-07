@@ -466,11 +466,14 @@ class Orchestrator:
                 self.db.update_message_statuses(message_ids, "processed")
                 return OrchestratorResult(status="blocked", detail="system_blocked")
 
-            self.db.expire_stale_runs(tenant.id, project_name, self._now())
             inflight_run = self.db.get_inflight_run(tenant.id, project_name)
             if inflight_run:
                 if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                     inflight_run = None
+            # Reconciliation must run before stale-expiration so completed runs
+            # with persisted run_result.json are not mislabeled as lease_expired.
+            self.db.expire_stale_runs(tenant.id, project_name, self._now())
+            inflight_run = self.db.get_inflight_run(tenant.id, project_name)
             if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
                 await self._finalize_stale_run(tenant, inflight_run, notify=False)
                 inflight_run = None
@@ -842,11 +845,14 @@ class Orchestrator:
         else:
             if await self._handle_blocked(workspace.tasks_dir, tenant, notify=False):
                 return OrchestratorResult(status="blocked", detail="system_blocked")
-        self.db.expire_stale_runs(tenant.id, project_name, self._now())
         inflight_run = self.db.get_inflight_run(tenant.id, project_name)
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
+        # Reconcile first, then expire stale rows so completed runs are not
+        # incorrectly transitioned to lease_expired.
+        self.db.expire_stale_runs(tenant.id, project_name, self._now())
+        inflight_run = self.db.get_inflight_run(tenant.id, project_name)
         if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
             await self._finalize_stale_run(tenant, inflight_run, notify=False)
             inflight_run = None
