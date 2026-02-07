@@ -298,6 +298,15 @@ async def _run(run_id: int) -> int:
     settings = Settings()
     tasks_dir: Path | None = None
     try:
+        design_prompt_path = settings.resolved_design_prompt_path()
+        if not design_prompt_path.exists():
+            raise RuntimeError(f"design_prompt_template_missing:{design_prompt_path}")
+        try:
+            if design_prompt_path.stat().st_size <= 0:
+                raise RuntimeError(f"design_prompt_template_empty:{design_prompt_path}")
+        except OSError as exc:
+            raise RuntimeError(f"design_prompt_template_unreadable:{design_prompt_path}") from exc
+
         db = build_database(settings)
         db.init()
 

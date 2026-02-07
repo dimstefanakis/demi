@@ -64,7 +64,7 @@ Claude is the primary coordinator for task execution.
 Responsibilities:
 - Read `memory.md` and task brief
 - Decide changes and file edits
-- Invoke Gemini CLI with `DESIGN.md` (headless) to implement design
+- Invoke Gemini CLI with `docs/DESIGN.md` template (runtime path: `/app/docs/DESIGN.md`) to implement design
 - Update `memory.md` when stable facts change
 - Produce a short result summary for the user
 - Deploy using Vercel CLI
@@ -89,7 +89,7 @@ Runtime choices:
 ### 5) Design + Deploy (Claude-driven)
 Gemini and Vercel are invoked directly by Claude:
 
-- Gemini CLI runs headlessly with `-p "$(cat DESIGN.md)"`.
+- Gemini CLI runs headlessly with `-p "$(cat /app/docs/DESIGN.md)"`.
 - Context is provided via stdin (task, `memory.md`, `design_context.md`, current page).
 - Gemini decides where to write files (no fixed output path).
 - Claude runs `bun run build` to validate.
@@ -122,7 +122,7 @@ Stores:
 2. Orchestrator creates tenant workspace + container
 3. Orchestrator writes task brief
 4. Claude creates/boots the Next.js app (bun + shadcn)
-5. Claude runs Gemini CLI headlessly with `DESIGN.md`
+5. Claude runs Gemini CLI headlessly with `/app/docs/DESIGN.md`
 6. Claude validates with `bun run build`
 7. Claude deploys via Vercel CLI and writes `tasks/deploy_url.txt`
 8. User receives link + suggested next steps
@@ -130,7 +130,7 @@ Stores:
 ### Flow 2: Edit Existing Website
 1. Message arrives
 2. Orchestrator loads memory + context
-3. Claude runs Gemini CLI headlessly with `DESIGN.md`
+3. Claude runs Gemini CLI headlessly with `/app/docs/DESIGN.md`
 4. Claude validates with `bun run build`
 5. Claude redeploys via Vercel CLI, records the URL via `record_deploy`, and sends the link
 6. User receives confirmation + link

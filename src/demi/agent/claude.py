@@ -7,7 +7,7 @@ import mimetypes
 from pathlib import Path
 import os
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 from contextlib import asynccontextmanager, suppress
 import asyncio
 
@@ -323,6 +323,7 @@ class ClaudeAgent:
             permission_mode=self.permission_mode,
             system_prompt=self.system_prompt,
             setting_sources=self.setting_sources,
+            model=settings.execution_model,
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
             plugins=self.plugins,
@@ -463,7 +464,8 @@ class ClaudeAgent:
         asset_paths: list[str] | None = None,
         execution_bridge: Any | None = None,
     ) -> AgentResult | None:
-        interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
+        settings = Settings()
+        interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -500,6 +502,8 @@ class ClaudeAgent:
             permission_mode=self.permission_mode,
             system_prompt=interaction_prompt,
             setting_sources=self.setting_sources,
+            model=settings.interaction_model,
+            max_thinking_tokens=settings.interaction_max_thinking_tokens,
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
             plugins=self.plugins,
@@ -626,6 +630,8 @@ class ClaudeAgent:
             permission_mode=self.permission_mode,
             system_prompt=interaction_prompt,
             setting_sources=self.setting_sources,
+            model=settings.interaction_model,
+            max_thinking_tokens=settings.interaction_max_thinking_tokens,
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
             plugins=self.plugins,
@@ -748,7 +754,8 @@ class ClaudeAgent:
         asset_paths: list[str] | None = None,
         execution_bridge: Any | None = None,
     ) -> AgentResult | None:
-        interaction_prompt = self._load_prompt_file(Settings().interaction_prompt_path)
+        settings = Settings()
+        interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -786,6 +793,8 @@ class ClaudeAgent:
             permission_mode=self.permission_mode,
             system_prompt=interaction_prompt,
             setting_sources=self.setting_sources,
+            model=settings.interaction_model,
+            max_thinking_tokens=settings.interaction_max_thinking_tokens,
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
             plugins=self.plugins,
@@ -1108,6 +1117,9 @@ class ClaudeAgent:
     def _default_agents() -> dict[str, AgentDefinition]:
         settings = Settings()
         interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
+        interaction_subagent_model = ClaudeAgent._agent_definition_model(
+            settings.interaction_model
+        )
         return {
             "interaction-agent": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
@@ -1126,8 +1138,24 @@ class ClaudeAgent:
                     SEND_MESSAGE_TOOL,
                     f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 ],
+                model=interaction_subagent_model,
             )
         }
+
+    @staticmethod
+    def _agent_definition_model(
+        model_name: str | None,
+    ) -> Literal["sonnet", "opus", "haiku"] | None:
+        value = str(model_name or "").strip().lower()
+        if not value:
+            return None
+        if "opus" in value:
+            return "opus"
+        if "sonnet" in value:
+            return "sonnet"
+        if "haiku" in value:
+            return "haiku"
+        return None
 
     @staticmethod
     def _load_prompt_file(path: Path) -> str:

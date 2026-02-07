@@ -95,7 +95,7 @@ Background workers (poll main DB):
 - API: FastAPI (`src/demi/app.py`)
 - Orchestration: Python (`src/demi/orchestrator.py`)
 - Agent runtime: Claude Agent SDK (`claude_agent_sdk`) with optional Docker isolation
-- Design: Gemini CLI driven by `DESIGN.md`, editing app files directly (auto-edit mode)
+- Design: Gemini CLI driven by `docs/DESIGN.md` template (runtime path `/app/docs/DESIGN.md`), editing app files directly (auto-edit mode)
 - Deploy: Vercel CLI
 - Messaging: Telegram Bot API
 - Storage: SQLite by default, Supabase optional for main DB
@@ -107,7 +107,7 @@ Background workers (poll main DB):
 ```
 demi/
 ├── AGENTS.md
-├── PRODUCT.md / PRD.md / IMPLEMENTATION.md / DESIGN.md
+├── PRODUCT.md / PRD.md / IMPLEMENTATION.md
 ├── docs/
 │   └── SPEC.md
 ├── prompts/
@@ -163,6 +163,9 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - `AGENT_RUNTIME=docker` runs Claude inside `demi-agent` containers
 - `DOCKER_POOL_SIZE` controls pre-warmed idle pool containers (default `0`, disabled)
 - `DOCKER_ENV_ALLOWLIST` controls which env vars can be forwarded to containers
+- Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
+  `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
+  `INTERACTION_MAX_THINKING_TOKENS`
 
 **Billing status endpoint (when `BILLING_STATUS_URL` is set)**
 
@@ -223,6 +226,8 @@ Workspace roots by runtime:
 - Optional idle pool slots: `data/pool/idle-<n>/` (only when `DOCKER_POOL_SIZE > 0`)
 - On each execution run, the agent entrypoint syncs template artifacts
   (`.claude/`, `CLAUDE.md`, `DESIGN.md`, `.env.example`) into the project workspace if missing.
+  The canonical Gemini prompt template remains `/app/docs/DESIGN.md`; project `DESIGN.md`
+  is a workspace copy and not the source of truth.
 
 ```
 data/<tenant_key>/

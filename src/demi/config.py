@@ -16,10 +16,13 @@ class Settings(BaseSettings):
     telegram_bot_token: str | None = None
 
     gemini_cmd: str = "gemini"
-    design_prompt_path: Path = Path("DESIGN.md")
+    design_prompt_path: Path = Path("docs/DESIGN.md")
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
     interaction_router_prompt_path: Path = Path("prompts/interaction_agent.md")
+    execution_model: str = "claude-sonnet-4-5-20250929"
+    interaction_model: str = "claude-opus-4-6"
+    interaction_max_thinking_tokens: int | None = 4096
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")
@@ -113,6 +116,12 @@ class Settings(BaseSettings):
     def resolved_gemini_cmd(self) -> str:
         local_cmd = (self.root_dir / "node_modules" / ".bin" / "gemini").resolve()
         return str(local_cmd) if local_cmd.exists() else self.gemini_cmd
+
+    def resolved_design_prompt_path(self) -> Path:
+        path = self.design_prompt_path
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
 
     def resolved_vercel_cmd(self) -> str:
         local_cmd = (self.root_dir / "node_modules" / ".bin" / "vercel").resolve()
