@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+import configparser
 import base64
 import json
 import re
@@ -248,6 +249,7 @@ class GitHubRepoManager:
         project_root: Path,
         repo_name: str | None = None,
     ) -> GitHubRepo:
+        project_root = Path(project_root)
         existing = self.load_repo(project_root)
         if existing:
             remote = await self.client.get_repo(existing.full_name)
@@ -261,6 +263,12 @@ class GitHubRepoManager:
             except OSError:
                 pass
             existing = None
+        inferred_full_name = self._infer_repo_full_name_from_local_git(project_root)
+        if inferred_full_name:
+            remote = await self.client.get_repo(inferred_full_name)
+            if remote:
+                self.write_repo(project_root, remote)
+                return remote
         repo_name = _slug(repo_name or "")
         if not repo_name:
             if not self.config.auto_create_repo:
@@ -271,10 +279,10 @@ class GitHubRepoManager:
         full_name = f"{self.config.org}/{repo_name}"
         remote = await self.client.get_repo(full_name)
         if remote:
-            if existing and existing.full_name == full_name:
-                self.write_repo(project_root, remote)
-                return remote
-            raise RuntimeError("github_repo_name_conflict")
+            # If metadata is missing, recover by attaching the existing remote
+            # instead of creating a new randomly suffixed repository.
+            self.write_repo(project_root, remote)
+            return remote
         if not self.config.auto_create_repo:
             raise RuntimeError("github_repo_missing")
         repo = await self.client.create_repo(repo_name, private=self.config.repo_is_private())
@@ -283,6 +291,40 @@ class GitHubRepoManager:
 
     async def create_repo_token(self, repo: GitHubRepo) -> str:
         return await self.client.create_installation_token(repositories=[repo.name])
+
+    def _infer_repo_full_name_from_local_git(self, project_root: Path) -> str | None:
+        # Recover repo linkage when github_repo.json is missing but a local git
+        # remote already exists for the project site.
+        candidates = [
+            Path(project_root) / "site" / ".git" / "config",
+            Path(project_root) / ".git" / "config",
+        ]
+        for path in candidates:
+            full_name = self._read_full_name_from_git_config(path)
+            if not full_name:
+                continue
+            org = full_name.split("/", 1)[0]
+            if org.lower() != self.config.org.lower():
+                continue
+            return full_name
+        return None
+
+    @staticmethod
+    def _read_full_name_from_git_config(path: Path) -> str | None:
+        if not path.exists():
+            return None
+        parser = configparser.RawConfigParser()
+        try:
+            parser.read(path, encoding="utf-8")
+        except (configparser.Error, OSError):
+            return None
+        section = 'remote "origin"'
+        if not parser.has_section(section):
+            return None
+        url = parser.get(section, "url", fallback="").strip()
+        if not url:
+            return None
+        return _extract_github_full_name(url)
 
 
 class GitHubNotFound(RuntimeError):
@@ -326,3 +368,20 @@ def _string_or_none(value: Any) -> str | None:
         return None
     value = str(value).strip()
     return value if value else None
+
+
+def _extract_github_full_name(url: str) -> str | None:
+    raw = str(url or "").strip()
+    if not raw:
+        return None
+    patterns = [
+        r"^git@[^:]+:([^/]+/[^/]+?)(?:\.git)?$",
+        r"^(?:https?|ssh)://[^/]+/([^/]+/[^/]+?)(?:\.git)?$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, raw, flags=re.IGNORECASE)
+        if not match:
+            continue
+        value = match.group(1).strip().strip("/")
+        return value or None
+    return None

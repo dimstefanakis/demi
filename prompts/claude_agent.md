@@ -158,6 +158,10 @@ Rules:
 
 - Each project has a dedicated GitHub repo; metadata lives at `github_repo.json`.
 - Use `mcp__demi-github__prepare_repo` before pushing.
+- Git scope is strict: version only deployable app files for the current project.
+  - Choose the app root autonomously (commonly `site/` or `site/<app_name>`, but use whatever folder actually serves the site).
+  - Never stage orchestration/control-plane files: `tasks/`, `assets/`, `memory.md`, `DESCRIPTION.md`, `.claude/`, `github_repo.json`, or tenant-level metadata.
+  - If operating from the project root, use explicit pathspecs for app files; never sweep the whole project with broad staging.
 - When creating a repo, invent a short, human-readable name (not “main”). Retry if taken.
 - Avoid tenant-specific prefixes or IDs in repo names.
 - When you modify files, always commit and push the changes. Initialize git if needed.

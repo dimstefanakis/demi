@@ -393,6 +393,8 @@ Run selection when streaming to execution:
    `tasks/interaction_context.json`, and calls the interaction agent in routing mode.
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
    - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
+   - GitHub repo linkage is recovered from `github_repo.json` and, if missing, from local `site/.git` origin
+     before creating a new repo name.
 9. If no run is needed, the messages included in the turn are marked processed. The interaction agent already replied.
 10. If a run is in flight for the same project, messages included in the turn are queued in `run_inputs`. The interaction agent handles the queued ack (orchestrator only falls back if no reply was sent).
    When streaming is supported, the interaction agent can optionally stream the new input to the
@@ -400,6 +402,8 @@ Run selection when streaming to execution:
 11. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
 12. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
+    - Git versioning is scoped to deployable app files within the project (for example `site/` or another app root);
+      orchestration metadata files are excluded from website commits.
     - The agent can create an assistant subscription order by calling `request_assistant_subscription`
       after delivering value, then sends the payment link via the interaction agent.
 13. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).

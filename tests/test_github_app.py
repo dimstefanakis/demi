@@ -76,17 +76,40 @@ def test_ensure_repo_reuses_existing_remote_repo_from_metadata(tmp_path):
     assert manager.load_repo(tmp_path) == existing_remote
 
 
-def test_ensure_repo_rejects_existing_remote_repo_without_metadata(tmp_path):
+def test_ensure_repo_reuses_existing_remote_repo_without_metadata(tmp_path):
     manager = GitHubRepoManager(_config(auto_create_repo=True))
     existing_remote = _repo("fresh-repo", "acme/fresh-repo", repo_id=2)
     manager.client = FakeGitHubAppClient(remote_repo=existing_remote, created_repo=None)
 
-    with pytest.raises(RuntimeError, match="github_repo_name_conflict"):
-        asyncio.run(manager.ensure_repo(tmp_path, repo_name="fresh-repo"))
+    repo = asyncio.run(manager.ensure_repo(tmp_path, repo_name="fresh-repo"))
 
+    assert repo == existing_remote
     assert manager.client.get_calls == ["acme/fresh-repo"]
     assert manager.client.create_calls == []
-    assert manager.load_repo(tmp_path) is None
+    assert manager.load_repo(tmp_path) == existing_remote
+
+
+def test_ensure_repo_recovers_from_site_git_origin_when_metadata_missing(tmp_path):
+    manager = GitHubRepoManager(_config(auto_create_repo=True))
+    existing_remote = _repo("shop-site", "acme/shop-site", repo_id=3)
+    manager.client = FakeGitHubAppClient(remote_repo=existing_remote, created_repo=None)
+    git_config = tmp_path / "site" / ".git" / "config"
+    git_config.parent.mkdir(parents=True, exist_ok=True)
+    git_config.write_text(
+        "[core]\n"
+        "\trepositoryformatversion = 0\n"
+        '[remote "origin"]\n'
+        "\turl = https://github.com/acme/shop-site.git\n"
+        "\tfetch = +refs/heads/*:refs/remotes/origin/*\n",
+        encoding="utf-8",
+    )
+
+    repo = asyncio.run(manager.ensure_repo(tmp_path))
+
+    assert repo == existing_remote
+    assert manager.client.get_calls == ["acme/shop-site"]
+    assert manager.client.create_calls == []
+    assert manager.load_repo(tmp_path) == existing_remote
 
 
 def test_ensure_repo_clears_stale_metadata_when_creation_is_disabled(tmp_path):
