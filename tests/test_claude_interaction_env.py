@@ -14,6 +14,12 @@ class DummyMessenger:
         return None
 
 
+def test_execution_thinking_max_tokens_sanitized():
+    assert Settings(execution_max_thinking_tokens=2048).execution_thinking_max_tokens() == 2048
+    assert Settings(execution_max_thinking_tokens=512).execution_thinking_max_tokens() == 1024
+    assert Settings(execution_max_thinking_tokens=0).execution_thinking_max_tokens() is None
+
+
 def test_base_agent_env_includes_env_file_values(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
@@ -74,6 +80,10 @@ async def test_interaction_env_includes_tool_search_memory_and_tenant_home(tmp_p
             yield FakeSystemMessage("init", {"session_id": "interaction-session-123"})
             yield FakeResultMessage()
 
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
         async def disconnect(self):
             return None
 
@@ -104,6 +114,92 @@ async def test_interaction_env_includes_tool_search_memory_and_tenant_home(tmp_p
     assert options.env.get("CLAUDE_CODE_ENABLE_MEMORY_TOOL") == "true"
     assert options.env.get("CLAUDE_CODE_MEMORY_FILE_PATH") == str(workspace.memory_path)
     assert str(options.env.get("HOME") or "").endswith(f"/tenant-{tenant.id}")
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_sets_execution_max_thinking_tokens(
+    tmp_path, monkeypatch
+):
+    capture: dict = {}
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "ok"
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "execution-session-123"
+
+    class FakeClient:
+        def __init__(self, options):
+            capture["options"] = options
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for _ in prompt_stream:
+                break
+            return None
+
+        async def receive_messages(self):
+            yield FakeSystemMessage("init", {"session_id": "execution-session-123"})
+            yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
+        async def disconnect(self):
+            return None
+
+    def _fake_tooling_bootstrap(*, tenant_root, settings):
+        del tenant_root, settings
+        return type("ToolingResult", (), {"bin_path": None})()
+
+    monkeypatch.setenv("EXECUTION_MAX_THINKING_TOKENS", "3072")
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+    monkeypatch.setattr(claude_module, "bootstrap_tenant_tooling", _fake_tooling_bootstrap)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.tasks_dir / "task.md"
+    task_path.write_text("# task\n", encoding="utf-8")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="exec-thinking-1",
+        tenant_external_id=tenant.external_id,
+        received_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+        text="implement feature x",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    await agent.prepare_context(
+        workspace=workspace,
+        task_path=task_path,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+    )
+
+    options = capture.get("options")
+    assert options is not None
+    assert options.max_thinking_tokens == 3072
 
 
 @pytest.mark.asyncio
@@ -153,6 +249,10 @@ async def test_route_interaction_retries_until_valid_output(tmp_path, monkeypatc
         async def receive_messages(self):
             yield FakeSystemMessage("init", {"session_id": "interaction-session-456"})
             yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
 
         async def disconnect(self):
             return None
@@ -234,6 +334,10 @@ async def test_route_interaction_raises_after_retry_exhaustion(
         async def receive_messages(self):
             yield FakeSystemMessage("init", {"session_id": "interaction-session-789"})
             yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
 
         async def disconnect(self):
             return None

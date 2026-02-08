@@ -533,6 +533,7 @@ class ClaudeAgent:
             system_prompt=self.system_prompt,
             setting_sources=self.setting_sources,
             model=settings.execution_model,
+            max_thinking_tokens=settings.execution_thinking_max_tokens(),
             cwd=workspace.root,
             add_dirs=[Path.cwd()],
             env=execution_env,
@@ -584,7 +585,7 @@ class ClaudeAgent:
                     session_id=session_id or "default",
                 )
             )
-            async for msg in client.receive_messages():
+            async for msg in client.receive_response():
                 log_agent_event(
                     workspace.tasks_dir,
                     "sdk_message",
@@ -630,7 +631,6 @@ class ClaudeAgent:
                         raise RuntimeError(stop_reason_error)
                     if stop_event is not None:
                         stop_event.set()
-                    break
         finally:
             if stop_event is not None:
                 stop_event.set()
@@ -771,7 +771,7 @@ class ClaudeAgent:
                     self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
                     session_id=resume_session_id or "interaction",
                 )
-                async for msg in client.receive_messages():
+                async for msg in client.receive_response():
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -804,7 +804,6 @@ class ClaudeAgent:
                             message_id=message_id,
                             project_name=workspace.project_name,
                         )
-                        break
             finally:
                 await client.disconnect()
             return AgentResult(
@@ -962,7 +961,7 @@ class ClaudeAgent:
                         session_id=resume_session_id or "interaction",
                     )
                 )
-                async for msg in client.receive_messages():
+                async for msg in client.receive_response():
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -1003,7 +1002,6 @@ class ClaudeAgent:
                             decision = self._parse_interaction_agent_json(msg.result)
                         if stop_event is not None:
                             stop_event.set()
-                        break
             finally:
                 if stop_event is not None:
                     stop_event.set()
@@ -1214,7 +1212,7 @@ class ClaudeAgent:
                     self._interaction_prompt_stream(prompt, asset_paths=asset_paths),
                     session_id=resume_session_id or "interaction",
                 )
-                async for msg in client.receive_messages():
+                async for msg in client.receive_response():
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -1247,7 +1245,6 @@ class ClaudeAgent:
                             message_id=message_id,
                             project_name=workspace.project_name,
                         )
-                        break
             finally:
                 await client.disconnect()
             return AgentResult(

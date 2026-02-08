@@ -243,60 +243,20 @@ wheels = [
 
 [[package]]
 name = "claude-agent-sdk"
-version = "0.1.22"
+version = "0.1.33"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "anyio" },
     { name = "mcp" },
     { name = "typing-extensions", marker = "python_full_version < '3.11'" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/eb/e1/8f1eea736d83aff7b6924f59461410fe7a4b2fcfa5232d5dbab61c877d86/claude_agent_sdk-0.1.22.tar.gz", hash = "sha256:99edd1a82098bdf0514553e5726186810e1331c9467cb5c88891928ce1c8589b", size = 56854 }
+sdist = { url = "https://files.pythonhosted.org/packages/57/aa/5c417ef464d3fa712d830cd56a9a79aef8dfb5bc3414aae4bae136cf4e73/claude_agent_sdk-0.1.33.tar.gz", hash = "sha256:134bf403bb7553d829dadec42c30ecef340f5d4ad1595c1bdef933a9ca3129cf", size = 61196 }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/6c/e5/3ae471bdd8efa51ea8bb0bba77b3276bf6b1412106a8aabd405e0edb3715/claude_agent_sdk-0.1.22-py3-none-macosx_11_0_arm64.whl", hash = "sha256:1728cc26d8403adad98f048b002a6ea9e7db4b0b56affcc8cdfe91c2b66e4306", size = 54348090 },
-    { url = "https://files.pythonhosted.org/packages/dc/ed/3c26e4a77043c723add75e25aeb6cbc0a573bd177f2f2e0f7cc71af052ed/claude_agent_sdk-0.1.22-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:8fb3567d5fbdbd455cfa6e123e0e6249888dac43ab7b89152fde87c2f6b08880", size = 68543942 },
-    { url = "https://files.pythonhosted.org/packages/19/5f/e02cfb9fcc22a270002a27001ffd34f259ea3a7546129bbf72ec381fcabd/claude_agent_sdk-0.1.22-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:2e25ce12e0366672b575ae900bc6422ebe9fa53627e043b299e681fce07be134", size = 70252610 },
-    { url = "https://files.pythonhosted.org/packages/fc/eb/4ac597368f41d7daf6896babcf68f2d96b74e7b2a32c61deb4acb0509812/claude_agent_sdk-0.1.22-py3-none-win_amd64.whl", hash = "sha256:59b755feb7fb67a1131cc022fa1b33b6b40661b63c6abaea02cc45d8e1a73c3b", size = 72444297 },
+    { url = "https://files.pythonhosted.org/packages/72/31/1ac5d536013b1e38b37d71928a0db214cbd47e7bb815c21141dbc6dd93b6/claude_agent_sdk-0.1.33-py3-none-macosx_11_0_arm64.whl", hash = "sha256:57886a2dd124e5b3c9e12ec3e4841742ab3444d1e428b45ceaec8841c96698fa", size = 54323456 },
+    { url = "https://files.pythonhosted.org/packages/54/36/79c3feb3f2c95591b80de39a1d3097d30bc3a9a84fcff6422f5434f1187a/claude_agent_sdk-0.1.33-py3-none-manylinux_2_17_aarch64.whl", hash = "sha256:ea0f1e4fadeec766000122723c406a6f47c6210ea11bb5cc0c88af11ef7c940c", size = 69106772 },
+    { url = "https://files.pythonhosted.org/packages/03/a8/64d22ae767154da4629004a80e9f59f71b5070d55fcfade4efdfb06b1f7a/claude_agent_sdk-0.1.33-py3-none-manylinux_2_17_x86_64.whl", hash = "sha256:0ecd822c577b4ea2a52e51146a24dcea73eb69ff366bdb875785dadb116d593b", size = 69688592 },
+    { url = "https://files.pythonhosted.org/packages/b8/aa/83677a3d42b047bcacf4dbe730bf5189a106b5b6746ee83f6920e5d9729a/claude_agent_sdk-0.1.33-py3-none-win_amd64.whl", hash = "sha256:a9fbd09d8f947005e087340ecd0706ed35639c946b4bd49429d3132db4cb3751", size = 72211078 },
 ]
-
-[[package]]
-name = "demi"
-version = "0.1.0"
-source = { virtual = "." }
-dependencies = [
-    { name = "claude-agent-sdk" },
-    { name = "fastapi" },
-    { name = "httpx" },
-    { name = "pydantic" },
-    { name = "pydantic-settings" },
-    { name = "pyjwt", extra = ["crypto"] },
-    { name = "supabase" },
-    { name = "uvicorn" },
-]
-
-[package.optional-dependencies]
-db = [
-    { name = "psycopg", extra = ["binary"] },
-]
-dev = [
-    { name = "pytest" },
-    { name = "pytest-asyncio" },
-]
-
-[package.metadata]
-requires-dist = [
-    { name = "claude-agent-sdk", specifier = ">=0.1.0" },
-    { name = "fastapi", specifier = ">=0.115" },
-    { name = "httpx", specifier = ">=0.27" },
-    { name = "psycopg", extras = ["binary"], marker = "extra == 'db'", specifier = ">=3.1" },
-    { name = "pydantic", specifier = ">=2.7" },
-    { name = "pydantic-settings", specifier = ">=2.2" },
-    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8" },
-    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
-    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
-    { name = "supabase", specifier = ">=2.6" },
-    { name = "uvicorn", specifier = ">=0.30" },
-]
-provides-extras = ["dev", "db"]
 
 [[package]]
 name = "click"
@@ -383,6 +343,46 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/ba/af/72cd6ef29f9c5f731251acadaeb821559fe25f10852f44a63374c9ca08c1/cryptography-46.0.3-pp311-pypy311_pp73-manylinux_2_34_x86_64.whl", hash = "sha256:94cd0549accc38d1494e1f8de71eca837d0509d0d44bf11d158524b0e12cebf9", size = 4409447 },
     { url = "https://files.pythonhosted.org/packages/0d/c3/e90f4a4feae6410f914f8ebac129b9ae7a8c92eb60a638012dde42030a9d/cryptography-46.0.3-pp311-pypy311_pp73-win_amd64.whl", hash = "sha256:6b5063083824e5509fdba180721d55909ffacccc8adbec85268b48439423d78c", size = 3438528 },
 ]
+
+[[package]]
+name = "demi"
+version = "0.1.0"
+source = { virtual = "." }
+dependencies = [
+    { name = "claude-agent-sdk" },
+    { name = "fastapi" },
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-settings" },
+    { name = "pyjwt", extra = ["crypto"] },
+    { name = "supabase" },
+    { name = "uvicorn" },
+]
+
+[package.optional-dependencies]
+db = [
+    { name = "psycopg", extra = ["binary"] },
+]
+dev = [
+    { name = "pytest" },
+    { name = "pytest-asyncio" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "claude-agent-sdk", specifier = ">=0.1.0" },
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "httpx", specifier = ">=0.27" },
+    { name = "psycopg", extras = ["binary"], marker = "extra == 'db'", specifier = ">=3.1" },
+    { name = "pydantic", specifier = ">=2.7" },
+    { name = "pydantic-settings", specifier = ">=2.2" },
+    { name = "pyjwt", extras = ["crypto"], specifier = ">=2.8" },
+    { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
+    { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23" },
+    { name = "supabase", specifier = ">=2.6" },
+    { name = "uvicorn", specifier = ">=0.30" },
+]
+provides-extras = ["dev", "db"]
 
 [[package]]
 name = "deprecation"

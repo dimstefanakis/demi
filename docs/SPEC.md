@@ -172,6 +172,8 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
   `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
   `INTERACTION_MAX_THINKING_TOKENS`
+- Execution calls can use adaptive thinking via `EXECUTION_MAX_THINKING_TOKENS`
+  (default `2048`; values <=0 disable it, values between 1-1023 are clamped to 1024)
 - Interaction-agent routing controls:
   - `INTERACTION_AGENT_ROUTING_MAX_RETRIES` (legacy `INTERACTION_ROUTER_MAX_RETRIES` still accepted)
   - `INTERACTION_AGENT_ROUTING_PROMPT_PATH` (legacy `INTERACTION_ROUTER_PROMPT_PATH` still accepted)

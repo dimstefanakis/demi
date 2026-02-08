@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     # Legacy alias kept for backward compatibility.
     interaction_router_prompt_path: Path | None = None
     execution_model: str = "claude-sonnet-4-5-20250929"
+    execution_max_thinking_tokens: int | None = 2048
     interaction_model: str = "claude-opus-4-6"
     interaction_max_thinking_tokens: int | None = 4096
     interaction_agent_routing_max_retries: int | None = None
@@ -176,6 +177,19 @@ class Settings(BaseSettings):
             return max(0, int(value))
         except (TypeError, ValueError):
             return 8
+
+    def execution_thinking_max_tokens(self) -> int | None:
+        value = self.execution_max_thinking_tokens
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        # Anthropic extended-thinking budgets must be >= 1024 when enabled.
+        return max(1024, parsed)
 
     def resolved_interaction_session_cache_dir(self) -> Path:
         path = self.interaction_session_cache_dir

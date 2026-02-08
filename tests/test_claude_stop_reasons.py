@@ -56,6 +56,10 @@ def _patch_sdk(
             yield FakeSystemMessage("init", {"session_id": "session-123"})
             yield FakeResultMessage()
 
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
         async def disconnect(self):
             return None
 
