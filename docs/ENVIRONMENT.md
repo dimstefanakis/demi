@@ -27,6 +27,8 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - Use bun/uv (not npm/pip) and prefer local `node_modules/.bin` when present.
 - You can install additional tools inside the container if needed (e.g., via `apt-get`, `uv`, or `bunx`),
   but those installs are ephemeral unless you place artifacts under `/workspace`.
+- Tenant-scoped CLI tooling should live in `/workspace/tooling` and be pinned via `/workspace/tooling.lock`.
+  Bootstrapping should load from that lock on each run.
 
 ## Agent Tooling
 - WebSearch and WebFetch are available to the agent runtime.
@@ -35,6 +37,7 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - Do NOT rely on cron, systemd, or background daemons inside the container.
 - For scheduled jobs tied to the deployed site, use Vercel Cron.
 - For backend/data jobs, use managed backend scheduling (Supabase Cron) via the paid flow.
+- For other scheduler/trigger providers, route callbacks/events to `PUBLIC_BASE_URL/events` (or `EVENT_URL`) when possible.
 - If neither fits, propose an external scheduler and ask which option the user wants.
 
 ## Networking & Services

@@ -22,6 +22,7 @@ from demi.events import normalize_event_type, verify_signature
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
+from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
 from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
 from demi.workspace.core import WorkspaceManager
@@ -73,6 +74,7 @@ def create_app() -> FastAPI:
     worker: EventWorker | None = None
     pending_worker: PendingWorker | None = None
     outbox_worker: OutboxWorker | None = None
+    scheduler_worker: SchedulerWorker | None = None
     orchestrator = Orchestrator(
         db=db,
         workspace_manager=workspace_manager,
@@ -117,6 +119,14 @@ def create_app() -> FastAPI:
             ),
             interaction_agent=orchestrator.agent,
             workspace_manager=workspace_manager,
+        )
+    if embedded_workers_enabled and settings.scheduler_worker_enabled:
+        scheduler_worker = SchedulerWorker(
+            db=db,
+            config=SchedulerWorkerConfig(
+                poll_interval=settings.scheduler_worker_poll_interval,
+                batch_size=settings.scheduler_worker_batch_size,
+            ),
         )
 
     app = FastAPI()
@@ -232,6 +242,23 @@ def create_app() -> FastAPI:
                 with suppress(asyncio.CancelledError):
                     await task
 
+    if scheduler_worker is not None:
+        @app.on_event("startup")
+        async def _start_scheduler_worker() -> None:
+            app.state.scheduler_worker_task = asyncio.create_task(
+                scheduler_worker.run_forever(),
+                name="scheduler-worker",
+            )
+
+        @app.on_event("shutdown")
+        async def _stop_scheduler_worker() -> None:
+            scheduler_worker.stop()
+            task = getattr(app.state, "scheduler_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
     @app.post("/telegram/webhook")
     async def telegram_webhook(request: Request):
         payload = await request.json()
@@ -295,6 +322,9 @@ def create_app() -> FastAPI:
         tenant = _resolve_tenant_for_event(db, payload)
         if tenant is None:
             return {"status": "unknown", "payment_required": False, "message": "tenant_not_found"}
+        if _tenant_testing_mode_enabled(db, int(tenant.id)):
+            purpose = _normalize_billing_purpose(payload.get("purpose") or payload.get("purpose_label"))
+            return _testing_mode_billing_payload(purpose=purpose)
         purpose = payload.get("purpose")
         purpose_label = payload.get("purpose_label")
         create_if_missing = bool(payload.get("create_if_missing", False))
@@ -775,6 +805,30 @@ def _emit_billing_event(db: Database, order_row: Any, event_type: str, intent: s
 
 def _assistant_allow_first_build(tenant: Any) -> bool:
     return not getattr(tenant, "last_deploy_url", None)
+
+
+def _tenant_testing_mode_enabled(db: Any, tenant_id: int) -> bool:
+    try:
+        payload = db.get_tenant_kv(tenant_id, "system", "testing_mode")
+    except Exception:
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return bool(payload.get("enabled"))
+
+
+def _testing_mode_billing_payload(purpose: str | None = None) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "status": "testing_mode",
+        "payment_required": False,
+        "allow_first_build": True,
+        "plan": "testing",
+        "testing_mode": True,
+        "message": "testing mode active",
+    }
+    if purpose:
+        payload["purpose"] = purpose
+    return payload
 
 
 def _assistant_paid_statuses() -> set[str]:

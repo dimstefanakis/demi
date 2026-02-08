@@ -717,3 +717,146 @@ def test_stop_execution_agent_rejects_cross_tenant_run(tmp_path):
     assert payload["ok"] is False
     assert payload["status"] == "not_found"
     assert bridge.stop_calls == []
+
+
+def test_send_payment_link_bypasses_when_testing_mode_enabled(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    db.set_tenant_kv(
+        tenant.id,
+        "system",
+        "testing_mode",
+        {"enabled": True},
+    )
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    messenger = FakeMessenger()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger,
+            tenant_external_id=tenant.external_id,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+            provider=tenant.provider,
+        )
+    )
+    send_tool = next(tool for tool in tools if tool.name == "send_payment_link")
+
+    result = asyncio.run(send_tool.handler({"text": "please pay"}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload["status"] == "testing_mode_bypass"
+    assert messenger.sent == []
+
+
+def test_request_assistant_subscription_bypasses_when_testing_mode_enabled(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    db.set_tenant_kv(
+        tenant.id,
+        "system",
+        "testing_mode",
+        {"enabled": True},
+    )
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant.external_id,
+            tasks_dir=tmp_path / "tasks",
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+            provider=tenant.provider,
+        )
+    )
+    request_tool = next(tool for tool in tools if tool.name == "request_assistant_subscription")
+
+    result = asyncio.run(request_tool.handler({}))
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload["status"] == "testing_mode_authorized"
+    assert db.get_latest_billing_order(tenant.id, "assistant_subscription") is None
+
+
+def test_register_scheduler_trigger_and_list(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant.external_id,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+            provider=tenant.provider,
+        )
+    )
+    register_tool = next(tool for tool in tools if tool.name == "register_scheduler_trigger")
+    list_tool = next(tool for tool in tools if tool.name == "list_scheduler_triggers")
+
+    register_result = asyncio.run(
+        register_tool.handler(
+            {
+                "trigger_id": "hourly-healthcheck",
+                "trigger_type": "cron",
+                "cron": "0 * * * *",
+                "payload": {"summary": "hourly check"},
+            }
+        )
+    )
+    register_payload = json.loads(register_result["content"][0]["text"])
+    list_result = asyncio.run(list_tool.handler({}))
+    list_payload = json.loads(list_result["content"][0]["text"])
+
+    assert register_payload["ok"] is True
+    assert register_payload["trigger_type"] == "cron"
+    assert list_payload["ok"] is True
+    assert list_payload["count"] >= 1
+    assert any(item.get("id") == "hourly-healthcheck" for item in list_payload["triggers"])
+
+
+def test_unregister_scheduler_trigger(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant.external_id,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+            provider=tenant.provider,
+        )
+    )
+    register_tool = next(tool for tool in tools if tool.name == "register_scheduler_trigger")
+    unregister_tool = next(tool for tool in tools if tool.name == "unregister_scheduler_trigger")
+    list_tool = next(tool for tool in tools if tool.name == "list_scheduler_triggers")
+
+    asyncio.run(
+        register_tool.handler(
+            {
+                "trigger_id": "remove-me",
+                "trigger_type": "cron",
+                "cron": "*/5 * * * *",
+            }
+        )
+    )
+    unregister_result = asyncio.run(unregister_tool.handler({"trigger_id": "remove-me"}))
+    unregister_payload = json.loads(unregister_result["content"][0]["text"])
+    list_result = asyncio.run(list_tool.handler({}))
+    list_payload = json.loads(list_result["content"][0]["text"])
+
+    assert unregister_payload["ok"] is True
+    assert unregister_payload["removed"] is True
+    assert list_payload["ok"] is True
+    assert not any(item.get("id") == "remove-me" for item in list_payload["triggers"])

@@ -11,6 +11,7 @@ from demi.config import Settings
 from demi.db.factory import build_database
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
+from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.messaging.telegram import TelegramClient, TelegramConfig
 from demi.orchestrator import Orchestrator
@@ -122,10 +123,23 @@ async def _run_workers() -> None:
             asyncio.create_task(outbox_worker.run_forever(), name="outbox-worker")
         )
 
+    if settings.scheduler_worker_enabled:
+        scheduler_worker = SchedulerWorker(
+            db=db,
+            config=SchedulerWorkerConfig(
+                poll_interval=settings.scheduler_worker_poll_interval,
+                batch_size=settings.scheduler_worker_batch_size,
+            ),
+        )
+        workers.append(scheduler_worker)
+        tasks.append(
+            asyncio.create_task(scheduler_worker.run_forever(), name="scheduler-worker")
+        )
+
     if not tasks:
         raise RuntimeError(
             "No workers enabled. Set EVENTS_WORKER_ENABLED, PENDING_WORKER_ENABLED, "
-            "or OUTBOX_WORKER_ENABLED"
+            "OUTBOX_WORKER_ENABLED, or SCHEDULER_WORKER_ENABLED"
         )
 
     stop_event = asyncio.Event()

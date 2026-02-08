@@ -258,8 +258,8 @@ async def test_route_interaction_raises_after_retry_exhaustion(
     )
     agent = ClaudeAgent()
 
-    monkeypatch.setenv("INTERACTION_ROUTER_MAX_RETRIES", "2")
-    with pytest.raises(RuntimeError, match="interaction_router_invalid_output"):
+    monkeypatch.setenv("INTERACTION_AGENT_ROUTING_MAX_RETRIES", "2")
+    with pytest.raises(RuntimeError, match="interaction_agent_invalid_output"):
         await agent.route_interaction(
             workspace=workspace,
             message=message,

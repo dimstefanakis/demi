@@ -749,6 +749,26 @@ class SupabaseDatabase:
         payload = data[0].get("value_json")
         return payload if isinstance(payload, dict) else None
 
+    def list_tenant_kv_namespace(
+        self,
+        tenant_id: int,
+        namespace: str,
+        key_prefix: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("tenant_state")
+            .select("key,value_json,updated_at")
+            .eq("tenant_id", tenant_id)
+            .eq("namespace", namespace)
+            .order("key", desc=False)
+            .limit(limit)
+        )
+        if key_prefix:
+            query = query.like("key", f"{key_prefix}%")
+        data = self._execute(query)
+        return list(data or [])
+
     def record_tenant_event(self, tenant_id: int, event_type: str, payload: dict[str, Any]) -> int:
         row = {
             "tenant_id": tenant_id,
@@ -760,6 +780,27 @@ class SupabaseDatabase:
         if not data:
             raise RuntimeError("tenant_event_create_failed")
         return int(data[0]["id"])
+
+    def list_tenant_events(
+        self,
+        tenant_id: int,
+        event_type: str | None = None,
+        after_id: int | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        query = (
+            self._table("tenant_events")
+            .select("id,event_type,payload_json,received_at")
+            .eq("tenant_id", tenant_id)
+            .order("id", desc=False)
+            .limit(limit)
+        )
+        if event_type:
+            query = query.eq("event_type", event_type)
+        if after_id is not None and int(after_id) > 0:
+            query = query.gt("id", int(after_id))
+        data = self._execute(query)
+        return list(data or [])
 
     def create_interaction_session(
         self,

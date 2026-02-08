@@ -46,7 +46,9 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
 │ outbox, billing, message_events, │ │                                      │
 │ interaction_sessions,        │   │                                         │
 │ interaction_session_inputs,  │   │                                         │
-│ execution_stream_inputs      │   │                                         │
+│ execution_stream_inputs,     │   │                                         │
+│ tenant_state, tenant_events, │   │                                         │
+│ event_jobs                   │   │                                         │
 └───────────────┬──────────────┘   └────────────────────────────────────────┘
                 │
         ┌───────▼────────────────────────────────────────────────────────────┐
@@ -88,6 +90,7 @@ Background workers (poll main DB):
 - EventWorker -> orchestrator (event_jobs)
 - PendingWorker -> drains run_inputs into next run
 - OutboxWorker -> sends deferred Telegram messages with retry/backoff and stale-send reclaim
+- SchedulerWorker -> evaluates trigger mesh and enqueues event_jobs
 ```
 
 ### Technology Stack
@@ -169,14 +172,26 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
   `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
   `INTERACTION_MAX_THINKING_TOKENS`
+- Interaction-agent routing controls:
+  - `INTERACTION_AGENT_ROUTING_MAX_RETRIES` (legacy `INTERACTION_ROUTER_MAX_RETRIES` still accepted)
+  - `INTERACTION_AGENT_ROUTING_PROMPT_PATH` (legacy `INTERACTION_ROUTER_PROMPT_PATH` still accepted)
 - `INTERACTION_SESSION_CACHE_DIR` stores tenant-scoped Claude interaction session/cache files
   for SDK `resume` continuity (default `data/interaction_sessions`)
 - `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
 - `CLAUDE_ENABLE_MEMORY_TOOL=true` enables Claude Code memory tool (persisted to project `memory.md`)
+- Tenant tooling bootstrap controls:
+  - `TENANT_TOOLING_ENABLED`
+  - `TENANT_TOOLING_PACKAGES`
+  - `TENANT_TOOLING_DIRNAME` (default `tooling`)
+  - `TENANT_TOOLING_LOCK_FILE` (default `tooling.lock`)
 - Execution stream wake controls:
   - `EXECUTION_STREAM_REALTIME_ENABLED` (default `true`) subscribes runtime containers to Supabase
     realtime `INSERT` events on `execution_stream_inputs` scoped by `run_id`
   - `EXECUTION_STREAM_POLL_INTERVAL` interval for explicit polling mode (`EXECUTION_STREAM_REALTIME_ENABLED=false`)
+- Scheduler worker controls:
+  - `SCHEDULER_WORKER_ENABLED`
+  - `SCHEDULER_WORKER_POLL_INTERVAL`
+  - `SCHEDULER_WORKER_BATCH_SIZE`
 - Outbox retry controls:
   - `OUTBOX_SEND_TIMEOUT_SECONDS`
   - `OUTBOX_MAX_ATTEMPTS`
@@ -193,6 +208,8 @@ Purpose scoping:
 - The orchestrator attaches `purpose` and `purpose_label` to each billing check.
 - The billing system stores distinct assistant subscription orders per purpose.
 - Responses return the same purpose fields so the agent can explain what the hire covers.
+- If tenant testing mode is enabled (`tenant_state(system, testing_mode).enabled=true`),
+  billing checks short-circuit to an authorized payload (`payment_required=false`, `plan=testing`).
 - Usage threshold: if aggregate run cost exceeds `ASSISTANT_USAGE_THRESHOLD_USD` and there is
   no active assistant subscription, the billing status will set `payment_required=true`
   and include `usage_total_usd` + `usage_threshold_usd`. The agent should then request
@@ -249,6 +266,11 @@ Workspace roots by runtime:
 
 ```
 data/<tenant_key>/
+├── tooling/
+│   ├── package.json
+│   ├── bun.lock
+│   └── node_modules/.bin/*
+├── tooling.lock
 └── projects/
     ├── active.txt
     └── <project_name>/
@@ -285,6 +307,8 @@ data/<tenant_key>/
 - Compaction is handled by Claude session compaction + workspace continuity files; the orchestrator
   no longer generates `summary_prompt.md` / `memory_prompt.md`.
 - `tenant.sqlite` is an execution-agent scratchpad database. It is not used for orchestration or queues.
+- Execution runs bootstrap tenant CLI tooling from `tooling.lock` into `tooling/` and prepend
+  `tooling/node_modules/.bin` to PATH. This keeps tenant CLI dependencies deterministic across runs.
 
 **Project routing**
 - Each tenant can have multiple projects.
@@ -315,10 +339,10 @@ Flow:
 
 ## Run Cost Tracking
 
-- `runs.total_cost_usd` represents the cumulative cost per request, including interaction-agent calls.
+- `runs.total_cost_usd` represents the cumulative cost per request, including interaction agent calls.
 - `runs.usage_json` stores structured usage data:
 - `primary`: the main agent usage payload.
-- `interaction`: a list of interaction-agent usage payloads.
+- `interaction`: a list of interaction agent usage payloads.
 - `tenant_events` also records `event_type='agent_usage'` for per-turn usage/cost observability,
   including interaction turns that are not attached to a run.
 
@@ -349,7 +373,7 @@ happened in Supabase dashboards.
 
 - `tenant_events` (`event_type='agent_stop_reason'`)
 - Claude Agent SDK result stop telemetry persisted to Supabase for observability.
-- Payload fields include `context` (`prepare_context|route_interaction|send_interaction_message|send_interaction_instruction`),
+- Payload fields include `context` (`prepare_context|run_interaction_agent|send_interaction_message|send_interaction_instruction`),
   `stop_reason`, `result_subtype`, derived `status`, and run/message metadata when available.
 
 - `tenant_events` (`event_type='agent_usage'`)
@@ -389,6 +413,7 @@ Run selection when streaming to execution:
    It writes `tasks/billing_status.json` when no other run is active; if a run is already in flight it writes
    `tasks/billing_status_<run_id>.json` for the new run to avoid clobbering the in-flight payload. Billing
    status no longer creates assistant orders by default; the agent explicitly requests payment links.
+   If tenant testing mode is enabled, this status is treated as authorized and payment prompts are bypassed.
 7. The orchestrator merges any attachments for the current interaction turn, saves them under `assets/`, writes
    `tasks/interaction_context.json`, and calls the interaction agent in routing mode.
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
@@ -423,6 +448,7 @@ Supported user-level commands in Telegram messages:
 
 - `/reset` clears stuck runs and queued inputs for the active project.
 - `project: <name>` or `/project <name>` sets the active project for the tenant.
+- `/testing on|off` (or `testing: enabled|disabled`) toggles tenant testing mode.
 
 ---
 
@@ -436,6 +462,14 @@ Background workers poll the main DB and run in the API process or the worker con
   Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
   Uses bounded retries, stale `sending` reclaim, and throttled fallback file scans to prevent
   head-of-line stalls and excessive polling.
+- SchedulerWorker: Evaluates tenant trigger definitions stored in
+  `tenant_state(namespace='scheduler', key='trigger:*')` and enqueues `event_jobs`.
+  Trigger mesh supports:
+  - `cron` schedules
+  - `webhook_condition` matches against `tenant_events` payloads
+  - `state_change` watches tenant state values (`namespace/key/path`)
+  - optional time windows (`start/end/timezone`)
+  - optional retry windows/backoff metadata attached to event payloads
 
 ## Webhook Diagnostics
 
@@ -452,7 +486,9 @@ MCP servers are registered per agent run.
 - `demi-chat`: `send_message`, `should_send_message`, `check_for_status`, `find_execution_agent`,
   `stream_to_execution_agent`, `stop_execution_agent`, `ack_inflight_updates`, `record_deploy`,
   `record_domain_quote`, `record_billing_status`, `send_payment_link`,
-  `request_backend_subscription`, `request_assistant_subscription`, `decide_project`
+  `request_backend_subscription`, `request_assistant_subscription`, `decide_project`,
+  `set_testing_mode`, `register_scheduler_trigger`, `list_scheduler_triggers`,
+  `unregister_scheduler_trigger`
 - `demi-unsplash`: `search_photos` (Unsplash sourcing)
 - `demi-supabase`: `provision_managed_backend`, `upgrade_managed_backend`
 - `demi-github`: `prepare_repo` (GitHub App provisioning)

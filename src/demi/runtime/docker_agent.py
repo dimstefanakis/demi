@@ -210,7 +210,7 @@ class DockerAgent:
             execution_bridge=execution_bridge,
         )
 
-    async def route_interaction(
+    async def run_interaction_agent(
         self,
         *,
         workspace,
@@ -229,7 +229,46 @@ class DockerAgent:
         inflight_stream=None,
     ):
         interaction_agent = ClaudeAgent()
-        return await interaction_agent.route_interaction(
+        runner = getattr(interaction_agent, "run_interaction_agent", None)
+        if runner is None:
+            runner = interaction_agent.route_interaction
+        return await runner(
+            workspace=workspace,
+            message=message,
+            messenger=messenger,
+            tenant_id=tenant_id,
+            db=db,
+            payments=payments,
+            session_id=session_id,
+            provider=provider,
+            tenant_external_id=tenant_external_id,
+            message_id=message_id,
+            billing_checked=billing_checked,
+            asset_paths=asset_paths,
+            execution_bridge=execution_bridge,
+            inflight_stream=inflight_stream,
+        )
+
+    async def route_interaction(
+        self,
+        *,
+        workspace,
+        message,
+        messenger,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+        message_id: int | None = None,
+        billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
+        inflight_stream=None,
+    ):
+        # Backward-compatible alias for older callers.
+        return await self.run_interaction_agent(
             workspace=workspace,
             message=message,
             messenger=messenger,

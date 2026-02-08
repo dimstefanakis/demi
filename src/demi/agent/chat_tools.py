@@ -21,6 +21,8 @@ from demi.payments.stripe import StripeClient, StripeConfig, build_stripe_config
 
 CHAT_SERVER_NAME = "demi-chat"
 SEND_MESSAGE_TOOL = f"mcp__{CHAT_SERVER_NAME}__send_message"
+SCHEDULER_NAMESPACE = "scheduler"
+SCHEDULER_TRIGGER_PREFIX = "trigger:"
 
 
 @dataclass(frozen=True)
@@ -84,6 +86,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         )
 
     def _payment_required() -> bool:
+        if _testing_mode_enabled():
+            return False
         path = context.tasks_dir / "billing_status.json"
         if not path.exists():
             return False
@@ -107,6 +111,55 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         if tenant is None:
             return None
         return int(getattr(tenant, "id", None) or tenant["id"])
+
+    def _testing_mode_payload() -> dict[str, Any]:
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None or context.db is None:
+            return {}
+        try:
+            payload = context.db.get_tenant_kv(tenant_id, "system", "testing_mode")
+        except Exception:
+            payload = None
+        return payload if isinstance(payload, dict) else {}
+
+    def _testing_mode_enabled() -> bool:
+        payload = _testing_mode_payload()
+        return bool(payload.get("enabled"))
+
+    def _scheduler_trigger_key(trigger_id: str) -> str:
+        value = re.sub(r"[^a-z0-9_-]+", "-", str(trigger_id).strip().lower()).strip("-_")
+        if not value:
+            value = uuid.uuid4().hex[:12]
+        return f"{SCHEDULER_TRIGGER_PREFIX}{value[:64]}"
+
+    def _scheduler_trigger_id(key: str) -> str:
+        if key.startswith(SCHEDULER_TRIGGER_PREFIX):
+            return key[len(SCHEDULER_TRIGGER_PREFIX) :]
+        return key
+
+    def _list_scheduler_triggers() -> list[dict[str, Any]]:
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None or context.db is None:
+            return []
+        try:
+            rows = context.db.list_tenant_kv_namespace(
+                tenant_id,
+                SCHEDULER_NAMESPACE,
+                key_prefix=SCHEDULER_TRIGGER_PREFIX,
+                limit=200,
+            )
+        except Exception:
+            return []
+        triggers: list[dict[str, Any]] = []
+        for row in rows:
+            key = str(row.get("key") or "")
+            payload = row.get("value_json")
+            if not key.startswith(SCHEDULER_TRIGGER_PREFIX) or not isinstance(payload, dict):
+                continue
+            trigger = dict(payload)
+            trigger.setdefault("id", _scheduler_trigger_id(key))
+            triggers.append(trigger)
+        return triggers
 
     def _record_outbound_event(
         *,
@@ -883,6 +936,13 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     )
     async def send_payment_link(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
+        if _testing_mode_enabled():
+            payload = {"ok": True, "status": "testing_mode_bypass", "sent": False}
+            _log("send_payment_link", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         if str(context.role or "primary") != "interaction":
             update_payload = {
                 "type": "interaction_update",
@@ -1076,6 +1136,21 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             return {
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
+            }
+
+        if _testing_mode_enabled():
+            payload = {
+                "ok": True,
+                "status": "testing_mode_authorized",
+                "domain": domain,
+                "available": available,
+                "payment_required": False,
+            }
+            _persist_quote(context, "domain_quote", payload)
+            _log("record_domain_quote", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
             }
 
         price_usd = None
@@ -1303,6 +1378,295 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         }
 
     @tool(
+        "set_testing_mode",
+        "Enable or disable tenant testing mode. Testing mode bypasses payment gates.",
+        {"type": "object", "properties": {"enabled": {"type": "boolean"}}, "required": ["enabled"]},
+    )
+    async def set_testing_mode(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        tenant_id = _resolve_tenant_id()
+        if context.db is None or tenant_id is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("set_testing_mode", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        enabled = bool(args.get("enabled"))
+        now = datetime.now(tz=timezone.utc).isoformat()
+        state_payload = {"enabled": enabled, "updated_at": now}
+        context.db.set_tenant_kv(tenant_id, "system", "testing_mode", state_payload)
+        if enabled:
+            billing_payload = {
+                "status": "testing_mode",
+                "payment_required": False,
+                "allow_first_build": True,
+                "plan": "testing",
+                "testing_mode": True,
+            }
+            try:
+                (context.tasks_dir / "billing_status.json").write_text(
+                    json.dumps(billing_payload, indent=2, ensure_ascii=True)
+                )
+            except OSError:
+                pass
+        payload = {"ok": True, "enabled": enabled}
+        _log("set_testing_mode", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "register_scheduler_trigger",
+        "Register or update a tenant scheduler trigger (cron, webhook_condition, state_change).",
+        {
+            "type": "object",
+            "properties": {
+                "trigger_id": {"type": "string"},
+                "name": {"type": "string"},
+                "enabled": {"type": "boolean"},
+                "trigger_type": {"type": "string"},
+                "project_name": {"type": "string"},
+                "cron": {"type": "string"},
+                "event_type": {"type": "string"},
+                "condition": {"type": "object"},
+                "watch_namespace": {"type": "string"},
+                "watch_key": {"type": "string"},
+                "watch_path": {"type": "string"},
+                "intent": {"type": "string"},
+                "output_event_type": {"type": "string"},
+                "payload": {"type": "object"},
+                "window_start": {"type": "string"},
+                "window_end": {"type": "string"},
+                "timezone": {"type": "string"},
+                "retry_window_seconds": {"type": "number"},
+                "retry_backoff_seconds": {"type": "number"},
+                "allow_multiple": {"type": "boolean"},
+            },
+            "required": ["trigger_type"],
+        },
+    )
+    async def register_scheduler_trigger(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        tenant_id = _resolve_tenant_id()
+        if context.db is None or tenant_id is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("register_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        trigger_type = str(args.get("trigger_type") or "").strip().lower()
+        if trigger_type not in {"cron", "webhook_condition", "state_change"}:
+            payload = {"ok": False, "status": "invalid_trigger_type"}
+            _log("register_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        trigger_id = str(args.get("trigger_id") or uuid.uuid4().hex[:12]).strip()
+        trigger_key = _scheduler_trigger_key(trigger_id)
+        existing = context.db.get_tenant_kv(tenant_id, SCHEDULER_NAMESPACE, trigger_key) or {}
+        if not isinstance(existing, dict):
+            existing = {}
+
+        cron_expr = str(args.get("cron") or existing.get("cron") or "").strip()
+        if trigger_type == "cron" and not cron_expr:
+            payload = {"ok": False, "status": "missing_cron"}
+            _log("register_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+
+        watch_namespace = str(
+            args.get("watch_namespace")
+            or (existing.get("watch") or {}).get("namespace")
+            or ""
+        ).strip()
+        watch_key = str(
+            args.get("watch_key")
+            or (existing.get("watch") or {}).get("key")
+            or ""
+        ).strip()
+        if trigger_type == "state_change" and (not watch_namespace or not watch_key):
+            payload = {"ok": False, "status": "missing_watch_target"}
+            _log("register_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+
+        event_type = str(args.get("event_type") or existing.get("event_type") or "").strip()
+        if trigger_type == "webhook_condition" and not event_type:
+            payload = {"ok": False, "status": "missing_event_type"}
+            _log("register_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+
+        payload_raw = args.get("payload")
+        trigger_payload = payload_raw if isinstance(payload_raw, dict) else existing.get("payload")
+        if not isinstance(trigger_payload, dict):
+            trigger_payload = {}
+
+        condition = args.get("condition")
+        if condition is None:
+            condition = existing.get("condition")
+
+        time_window = {
+            "start": str(
+                args.get("window_start")
+                or (existing.get("time_window") or {}).get("start")
+                or ""
+            ).strip(),
+            "end": str(
+                args.get("window_end")
+                or (existing.get("time_window") or {}).get("end")
+                or ""
+            ).strip(),
+            "timezone": str(
+                args.get("timezone")
+                or (existing.get("time_window") or {}).get("timezone")
+                or "UTC"
+            ).strip()
+            or "UTC",
+        }
+        if not time_window["start"] or not time_window["end"]:
+            time_window = {}
+
+        now = datetime.now(tz=timezone.utc).isoformat()
+        trigger = {
+            "id": _scheduler_trigger_id(trigger_key),
+            "name": str(args.get("name") or existing.get("name") or "trigger").strip(),
+            "enabled": bool(args.get("enabled", existing.get("enabled", True))),
+            "trigger_type": trigger_type,
+            "project_name": str(
+                args.get("project_name")
+                or existing.get("project_name")
+                or _project_name_from_tasks_dir(context.tasks_dir)
+            ).strip(),
+            "cron": cron_expr or None,
+            "event_type": event_type or None,
+            "condition": condition if isinstance(condition, (dict, list)) else None,
+            "watch": {
+                "namespace": watch_namespace or None,
+                "key": watch_key or None,
+                "path": str(args.get("watch_path") or (existing.get("watch") or {}).get("path") or "")
+                .strip()
+                or None,
+            },
+            "intent": str(
+                args.get("intent") or existing.get("intent") or "scheduled_trigger"
+            ).strip(),
+            "output_event_type": str(
+                args.get("output_event_type")
+                or existing.get("output_event_type")
+                or "scheduled_trigger"
+            ).strip(),
+            "payload": trigger_payload,
+            "time_window": time_window or None,
+            "retry_window_seconds": max(
+                0,
+                int(args.get("retry_window_seconds") or existing.get("retry_window_seconds") or 600),
+            ),
+            "retry_backoff_seconds": max(
+                1,
+                int(args.get("retry_backoff_seconds") or existing.get("retry_backoff_seconds") or 15),
+            ),
+            "allow_multiple": bool(args.get("allow_multiple", existing.get("allow_multiple", False))),
+            "state": dict(existing.get("state") or {}),
+            "created_at": str(existing.get("created_at") or now),
+            "updated_at": now,
+        }
+        context.db.set_tenant_kv(tenant_id, SCHEDULER_NAMESPACE, trigger_key, trigger)
+        response = {
+            "ok": True,
+            "trigger_id": trigger["id"],
+            "trigger_type": trigger_type,
+            "enabled": bool(trigger["enabled"]),
+            "project_name": trigger.get("project_name"),
+        }
+        _log("register_scheduler_trigger", args, result=response, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(response)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "list_scheduler_triggers",
+        "List scheduler triggers registered for this tenant.",
+        {"type": "object", "properties": {"include_disabled": {"type": "boolean"}}, "required": []},
+    )
+    async def list_scheduler_triggers(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        include_disabled = bool(args.get("include_disabled", True))
+        triggers = _list_scheduler_triggers()
+        if not include_disabled:
+            triggers = [trigger for trigger in triggers if bool(trigger.get("enabled", True))]
+        payload = {"ok": True, "count": len(triggers), "triggers": triggers}
+        _log("list_scheduler_triggers", args, result={"ok": True, "count": len(triggers)}, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "unregister_scheduler_trigger",
+        "Remove a tenant scheduler trigger by id.",
+        {
+            "type": "object",
+            "properties": {"trigger_id": {"type": "string"}},
+            "required": ["trigger_id"],
+        },
+    )
+    async def unregister_scheduler_trigger(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        tenant_id = _resolve_tenant_id()
+        if context.db is None or tenant_id is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("unregister_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        trigger_id = str(args.get("trigger_id") or "").strip()
+        if not trigger_id:
+            payload = {"ok": False, "status": "missing_trigger_id"}
+            _log("unregister_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        trigger_key = _scheduler_trigger_key(trigger_id)
+        existing = context.db.get_tenant_kv(tenant_id, SCHEDULER_NAMESPACE, trigger_key)
+        if not isinstance(existing, dict):
+            payload = {
+                "ok": True,
+                "trigger_id": _scheduler_trigger_id(trigger_key),
+                "removed": False,
+                "status": "not_found",
+            }
+            _log("unregister_scheduler_trigger", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
+        context.db.set_tenant_kv(tenant_id, SCHEDULER_NAMESPACE, trigger_key, None)
+        payload = {
+            "ok": True,
+            "trigger_id": _scheduler_trigger_id(trigger_key),
+            "removed": True,
+        }
+        _log("unregister_scheduler_trigger", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
         "request_backend_subscription",
         "Create a recurring payment link for managed backend features. Does not send messages.",
         {
@@ -1319,6 +1683,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     )
     async def request_backend_subscription(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
+        if _testing_mode_enabled():
+            payload = {
+                "ok": True,
+                "status": "testing_mode_authorized",
+                "payment_required": False,
+            }
+            _log("request_backend_subscription", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         price_usd = float(args.get("price_usd") or 0)
         currency = str(args.get("currency") or "").strip().upper()
         interval = str(args.get("interval") or "").strip().lower()
@@ -1456,6 +1831,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     )
     async def request_assistant_subscription(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
+        if _testing_mode_enabled():
+            payload = {
+                "ok": True,
+                "status": "testing_mode_authorized",
+                "payment_required": False,
+            }
+            _log("request_assistant_subscription", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         if context.db is None or context.tenant_id is None:
             payload = {"ok": False, "status": "missing_db"}
             _log("request_assistant_subscription", args, result=payload, start=start)
@@ -1637,6 +2023,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         record_deploy,
         record_domain_quote,
         record_billing_status,
+        set_testing_mode,
+        register_scheduler_trigger,
+        list_scheduler_triggers,
+        unregister_scheduler_trigger,
         request_backend_subscription,
         request_assistant_subscription,
     ]

@@ -40,6 +40,7 @@ from demi.agent.tool_logging import log_agent_event
 from demi.config import Settings
 from demi.agent.inflight import InflightTextStream
 from demi.models import NormalizedMessage
+from demi.runtime.tenant_tooling import bootstrap_tenant_tooling
 from demi.workspace.core import Workspace
 
 
@@ -121,6 +122,10 @@ class ClaudeAgent:
         f"mcp__{CHAT_SERVER_NAME}__record_deploy",
         f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
         f"mcp__{CHAT_SERVER_NAME}__record_billing_status",
+        f"mcp__{CHAT_SERVER_NAME}__set_testing_mode",
+        f"mcp__{CHAT_SERVER_NAME}__register_scheduler_trigger",
+        f"mcp__{CHAT_SERVER_NAME}__list_scheduler_triggers",
+        f"mcp__{CHAT_SERVER_NAME}__unregister_scheduler_trigger",
         f"mcp__{CHAT_SERVER_NAME}__request_backend_subscription",
         f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
         f"mcp__{GITHUB_SERVER_NAME}__prepare_repo",
@@ -394,11 +399,20 @@ class ClaudeAgent:
         settings: Settings,
         workspace: Workspace,
         runtime_env: dict[str, str] | None,
+        tooling_bin_path: Path | None = None,
     ) -> dict[str, str]:
         env = cls._base_agent_env(settings=settings, workspace=workspace)
+        if tooling_bin_path:
+            env["PATH"] = cls._prepend_path(os.environ.get("PATH"), tooling_bin_path)
         if runtime_env:
             env.update({key: str(value) for key, value in runtime_env.items() if value is not None})
         return env
+
+    @staticmethod
+    def _prepend_path(existing: str | None, entry: Path) -> str:
+        entry_text = str(entry)
+        parts = [part for part in (entry_text, str(existing or "")) if part]
+        return ":".join(parts)
 
     @classmethod
     def _interaction_runtime_env(
@@ -411,7 +425,7 @@ class ClaudeAgent:
         env = cls._base_agent_env(settings=settings, workspace=workspace)
         if tenant_id is None:
             return env
-        # Keep interaction-agent session/cache data tenant-scoped to prevent cross-tenant
+        # Keep interaction session/cache data tenant-scoped to prevent cross-tenant
         # leakage while still persisting across API/worker container restarts.
         home_dir = settings.resolved_interaction_session_cache_dir() / f"tenant-{int(tenant_id)}"
         try:
@@ -456,6 +470,19 @@ class ClaudeAgent:
             )
         )
         settings = Settings()
+        tooling_result = None
+        try:
+            tooling_result = await asyncio.to_thread(
+                bootstrap_tenant_tooling,
+                tenant_root=getattr(workspace, "tenant_root", workspace.root),
+                settings=settings,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log_agent_event(
+                workspace.tasks_dir,
+                "tooling_bootstrap_failed",
+                {"error": str(exc)},
+            )
         unsplash_server = build_unsplash_server(
             UnsplashToolContext(
                 access_key=settings.unsplash_access_key,
@@ -498,6 +525,7 @@ class ClaudeAgent:
             settings=settings,
             workspace=workspace,
             runtime_env=runtime_env,
+            tooling_bin_path=tooling_result.bin_path if tooling_result is not None else None,
         )
         options = ClaudeAgentOptions(
             allowed_tools=self.allowed_tools,
@@ -697,6 +725,7 @@ class ClaudeAgent:
                 f"mcp__{CHAT_SERVER_NAME}__stop_execution_agent",
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                f"mcp__{CHAT_SERVER_NAME}__set_testing_mode",
             ]
             if settings.claude_enable_memory_tool:
                 allowed_tools.append("Memory")
@@ -795,7 +824,7 @@ class ClaudeAgent:
                 return await _run_once(None)
             raise
 
-    async def route_interaction(
+    async def run_interaction_agent(
         self,
         *,
         workspace: Workspace,
@@ -814,7 +843,9 @@ class ClaudeAgent:
         inflight_stream: InflightTextStream | None = None,
     ) -> InteractionRouteResult:
         settings = Settings()
-        interaction_prompt = self._load_prompt_file(settings.interaction_router_prompt_path)
+        interaction_prompt = self._load_prompt_file(
+            settings.resolved_interaction_routing_prompt_path()
+        )
         interaction_env = self._interaction_runtime_env(
             settings=settings,
             workspace=workspace,
@@ -875,6 +906,7 @@ class ClaudeAgent:
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+                f"mcp__{CHAT_SERVER_NAME}__set_testing_mode",
             ]
             if settings.claude_enable_memory_tool:
                 allowed_tools.append("Memory")
@@ -885,7 +917,7 @@ class ClaudeAgent:
                 setting_sources=self.setting_sources,
                 model=settings.interaction_model,
                 max_thinking_tokens=settings.interaction_max_thinking_tokens,
-                output_format=self._router_output_schema(),
+                output_format=self._interaction_agent_output_schema(),
                 # Resume only from the tenant-scoped interaction session state.
                 resume=resume_session_id or None,
                 cwd=workspace.root,
@@ -894,7 +926,7 @@ class ClaudeAgent:
                 plugins=self.plugins,
                 agents=None,
                 mcp_servers={CHAT_SERVER_NAME: chat_server},
-                stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_router"),
+                stderr=_cli_stderr_logger(workspace.tasks_dir, "interaction_agent_routing"),
             )
 
         async def _query_router(
@@ -943,7 +975,7 @@ class ClaudeAgent:
                             tasks_dir=workspace.tasks_dir,
                             db=db,
                             tenant_id=tenant_id,
-                            context="route_interaction",
+                            context="run_interaction_agent",
                             stop_reason=stop_reason,
                             result_subtype=result_subtype,
                             session_id=new_session_id,
@@ -956,7 +988,7 @@ class ClaudeAgent:
                             tasks_dir=workspace.tasks_dir,
                             db=db,
                             tenant_id=tenant_id,
-                            context="route_interaction",
+                            context="run_interaction_agent",
                             total_cost_usd=total_cost_usd,
                             usage=usage,
                             session_id=new_session_id,
@@ -968,7 +1000,7 @@ class ClaudeAgent:
                         if isinstance(structured_output, dict):
                             decision = dict(structured_output)
                         else:
-                            decision = self._parse_router_json(msg.result)
+                            decision = self._parse_interaction_agent_json(msg.result)
                         if stop_event is not None:
                             stop_event.set()
                         break
@@ -1008,7 +1040,7 @@ class ClaudeAgent:
                 else:
                     raise
 
-        max_attempts = max(1, int(settings.interaction_router_max_retries) + 1)
+        max_attempts = max(1, int(settings.interaction_routing_max_retries()) + 1)
         attempt = 1
         retry_note: str | None = None
         resume_session_id = session_id
@@ -1020,7 +1052,7 @@ class ClaudeAgent:
             if _decision_valid(decision):
                 break
             if attempt >= max_attempts:
-                raise RuntimeError("interaction_router_invalid_output")
+                raise RuntimeError("interaction_agent_invalid_output")
             attempt += 1
             resume_session_id = new_session_id
             retry_note = (
@@ -1033,7 +1065,7 @@ class ClaudeAgent:
             try:
                 log_agent_event(
                     workspace.tasks_dir,
-                    "interaction_router_retry",
+                    "interaction_agent_retry",
                     {
                         "attempt": attempt,
                         "max_attempts": max_attempts,
@@ -1049,6 +1081,42 @@ class ClaudeAgent:
             usage=usage,
             stop_reason=stop_reason,
             result_subtype=result_subtype,
+        )
+
+    async def route_interaction(
+        self,
+        *,
+        workspace: Workspace,
+        message: NormalizedMessage,
+        messenger: Any,
+        tenant_id: int | None = None,
+        db: Any | None = None,
+        payments: Any | None = None,
+        session_id: str | None = None,
+        provider: str | None = None,
+        tenant_external_id: str | None = None,
+        message_id: int | None = None,
+        billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        execution_bridge: Any | None = None,
+        inflight_stream: InflightTextStream | None = None,
+    ) -> InteractionRouteResult:
+        # Backward-compatible alias for older callers.
+        return await self.run_interaction_agent(
+            workspace=workspace,
+            message=message,
+            messenger=messenger,
+            tenant_id=tenant_id,
+            db=db,
+            payments=payments,
+            session_id=session_id,
+            provider=provider,
+            tenant_external_id=tenant_external_id,
+            message_id=message_id,
+            billing_checked=billing_checked,
+            asset_paths=asset_paths,
+            execution_bridge=execution_bridge,
+            inflight_stream=inflight_stream,
         )
 
     async def send_interaction_instruction(
@@ -1109,6 +1177,7 @@ class ClaudeAgent:
                 SEND_MESSAGE_TOOL,
                 f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
                 f"mcp__{CHAT_SERVER_NAME}__request_assistant_subscription",
+                f"mcp__{CHAT_SERVER_NAME}__set_testing_mode",
             ]
             if settings.claude_enable_memory_tool:
                 allowed_tools.append("Memory")
@@ -1199,7 +1268,7 @@ class ClaudeAgent:
             raise
 
     @staticmethod
-    def _parse_router_json(raw: str | None) -> dict[str, Any]:
+    def _parse_interaction_agent_json(raw: str | None) -> dict[str, Any]:
         if not raw:
             return {}
         raw = raw.strip()
@@ -1217,12 +1286,12 @@ class ClaudeAgent:
         return {}
 
     @staticmethod
-    def _router_output_schema() -> dict[str, Any]:
-        # Enforce structured router output so invalid free-form prose does not break
-        # orchestration when the interaction router is compacted or tool-heavy.
+    def _interaction_agent_output_schema() -> dict[str, Any]:
+        # Enforce structured interaction-agent output so invalid free-form prose
+        # does not break orchestration during routing decisions.
         return {
             "type": "json_schema",
-            "name": "interaction_router_decision",
+            "name": "interaction_agent_decision",
             "schema": {
                 "type": "object",
                 "properties": {
@@ -1248,6 +1317,16 @@ class ClaudeAgent:
                 "additionalProperties": True,
             },
         }
+
+    @staticmethod
+    def _parse_router_json(raw: str | None) -> dict[str, Any]:
+        # Backward-compatible alias for older call sites/tests.
+        return ClaudeAgent._parse_interaction_agent_json(raw)
+
+    @staticmethod
+    def _router_output_schema() -> dict[str, Any]:
+        # Backward-compatible alias for older call sites/tests.
+        return ClaudeAgent._interaction_agent_output_schema()
 
     def _build_supabase_mcp_config(
         self,
@@ -1488,7 +1567,7 @@ class ClaudeAgent:
                     "role": "user",
                     "content": (
                         "IN-FLIGHT UPDATE (new user request while you're working; "
-                        "acknowledge via interaction-agent, then continue current task): "
+                        "acknowledge via interaction agent, then continue current task): "
                         f"{text}"
                     ),
                 },
@@ -1520,7 +1599,7 @@ class ClaudeAgent:
         if settings.claude_enable_memory_tool:
             interaction_tools.append("Memory")
         return {
-            "interaction-agent": AgentDefinition(
+            "interaction-helper": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
                 prompt=interaction_prompt,
                 tools=interaction_tools,

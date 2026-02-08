@@ -457,6 +457,43 @@ class Orchestrator:
                 )
                 return OrchestratorResult(status="accepted", detail="reset")
 
+            testing_mode = self._extract_testing_mode_command(
+                [str((m.text or "").strip()) for _mid, m in batched_messages]
+            )
+            if testing_mode is not None:
+                now_iso = self._now().isoformat()
+                self.db.set_tenant_kv(
+                    int(tenant.id),
+                    "system",
+                    "testing_mode",
+                    {"enabled": testing_mode, "updated_at": now_iso},
+                )
+                if testing_mode:
+                    self._write_billing_status(
+                        workspace.tasks_dir,
+                        {
+                            "status": "testing_mode",
+                            "payment_required": False,
+                            "allow_first_build": True,
+                            "plan": "testing",
+                            "testing_mode": True,
+                            "message": "testing mode active",
+                        },
+                    )
+                self.db.update_message_statuses(message_ids, "processed")
+                await self._send_interaction_instruction(
+                    workspace=workspace,
+                    tenant=tenant,
+                    msg=combined_msg,
+                    instruction=(
+                        "Confirm testing mode is now "
+                        + ("enabled." if testing_mode else "disabled.")
+                    ),
+                    run_id=None,
+                    message_id=latest_message_id,
+                )
+                return OrchestratorResult(status="accepted", detail="testing_mode_updated")
+
             if await self._handle_blocked(
                 workspace.tasks_dir, tenant, user_payload=combined_user_payload
             ):
@@ -517,7 +554,7 @@ class Orchestrator:
             )
             interaction_session_status = "failed"
             try:
-                decision_result = await self._route_interaction(
+                decision_result = await self._run_interaction_agent(
                     workspace=workspace,
                     tenant=tenant,
                     msg=combined_msg,
@@ -526,12 +563,12 @@ class Orchestrator:
                     inflight_stream=interaction_session.stream,
                 )
                 if not self._interaction_decision_valid(decision_result):
-                    append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+                    append_log(workspace.tasks_dir, "system", "interaction_agent_invalid_decision")
                     try:
                         self.db.update_message_statuses(message_ids, "failed")
                     except Exception:
                         pass
-                    raise RuntimeError("interaction_route_invalid_decision")
+                    raise RuntimeError("interaction_agent_invalid_decision")
                 decision, interaction_usage = self._normalize_interaction_decision(
                     decision_result, project_name=project_name, billing_checked=False
                 )
@@ -559,7 +596,7 @@ class Orchestrator:
                         billing_checked_at=billing_checked_at,
                         asset_paths=asset_paths,
                     )
-                    decision_result = await self._route_interaction(
+                    decision_result = await self._run_interaction_agent(
                         workspace=workspace,
                         tenant=tenant,
                         msg=combined_msg,
@@ -569,12 +606,14 @@ class Orchestrator:
                         inflight_stream=interaction_session.stream,
                     )
                     if not self._interaction_decision_valid(decision_result):
-                        append_log(workspace.tasks_dir, "system", "interaction_route_invalid_decision")
+                        append_log(
+                            workspace.tasks_dir, "system", "interaction_agent_invalid_decision"
+                        )
                         try:
                             self.db.update_message_statuses(message_ids, "failed")
                         except Exception:
                             pass
-                        raise RuntimeError("interaction_route_invalid_decision")
+                        raise RuntimeError("interaction_agent_invalid_decision")
                     decision, interaction_usage = self._normalize_interaction_decision(
                         decision_result, project_name=project_name, billing_checked=True
                     )
@@ -1321,7 +1360,7 @@ class Orchestrator:
             lines.append("Full payload: tasks/billing_status.json")
         return "\n".join(lines) + "\n"
 
-    async def _route_interaction(
+    async def _run_interaction_agent(
         self,
         *,
         workspace: Workspace,
@@ -1332,16 +1371,18 @@ class Orchestrator:
         asset_paths: list[str] | None = None,
         inflight_stream: InflightTextStream | None = None,
     ) -> Any:
-        router = getattr(self.agent, "route_interaction", None)
-        if router is None:
-            append_log(workspace.tasks_dir, "system", "interaction_router_missing")
+        interaction_runner = getattr(self.agent, "run_interaction_agent", None)
+        if interaction_runner is None:
+            interaction_runner = getattr(self.agent, "route_interaction", None)
+        if interaction_runner is None:
+            append_log(workspace.tasks_dir, "system", "interaction_agent_missing")
             try:
                 self.db.update_message_status(message_id, "failed")
             except Exception:
                 pass
-            raise RuntimeError("interaction_router_missing")
+            raise RuntimeError("interaction_agent_missing")
         try:
-            router_args = dict(
+            runner_args = dict(
                 workspace=workspace,
                 message=msg,
                 messenger=self.messenger,
@@ -1357,11 +1398,11 @@ class Orchestrator:
                 execution_bridge=self,
             )
             try:
-                if "inflight_stream" in inspect.signature(router).parameters:
-                    router_args["inflight_stream"] = inflight_stream
+                if "inflight_stream" in inspect.signature(interaction_runner).parameters:
+                    runner_args["inflight_stream"] = inflight_stream
             except (TypeError, ValueError):
                 pass
-            result = await router(**router_args)
+            result = await interaction_runner(**runner_args)
             session_from_result = ""
             if isinstance(result, dict):
                 session_from_result = str(result.get("session_id") or "").strip()
@@ -1379,7 +1420,7 @@ class Orchestrator:
                 append_log(
                     workspace.tasks_dir,
                     "system",
-                    f"interaction_route_failed: {type(exc).__name__}: {exc}",
+                    f"interaction_agent_failed: {type(exc).__name__}: {exc}",
                 )
             except Exception:
                 pass
@@ -1388,6 +1429,28 @@ class Orchestrator:
             except Exception:
                 pass
             raise
+
+    async def _route_interaction(
+        self,
+        *,
+        workspace: Workspace,
+        tenant: Any,
+        msg: NormalizedMessage,
+        message_id: int,
+        billing_checked: bool = False,
+        asset_paths: list[str] | None = None,
+        inflight_stream: InflightTextStream | None = None,
+    ) -> Any:
+        # Backward-compatible alias for older call sites.
+        return await self._run_interaction_agent(
+            workspace=workspace,
+            tenant=tenant,
+            msg=msg,
+            message_id=message_id,
+            billing_checked=billing_checked,
+            asset_paths=asset_paths,
+            inflight_stream=inflight_stream,
+        )
 
     def _normalize_interaction_decision(
         self,
@@ -1556,6 +1619,25 @@ class Orchestrator:
         if not text:
             return False
         return bool(re.match(r"^/reset(?:@\w+)?(?:\s|$)", text.strip(), flags=re.IGNORECASE))
+
+    @staticmethod
+    def _extract_testing_mode_command(lines: list[str]) -> bool | None:
+        for raw in lines:
+            text = str(raw or "").strip()
+            if not text:
+                continue
+            match = re.match(r"^/testing(?:@\w+)?(?:\s+(.+))?$", text, flags=re.IGNORECASE)
+            if match is None:
+                match = re.match(r"^testing\s*[:=]\s*(.+)$", text, flags=re.IGNORECASE)
+            if not match:
+                continue
+            value = str(match.group(1) or "").strip().lower()
+            if value in {"on", "true", "1", "enable", "enabled"}:
+                return True
+            if value in {"off", "false", "0", "disable", "disabled"}:
+                return False
+            return True
+        return None
 
     @staticmethod
     def _resolve_project_from_payload(payload: dict[str, Any]) -> str | None:
@@ -3011,6 +3093,19 @@ class Orchestrator:
         tasks_dir: Path,
     ) -> dict[str, Any] | None:
         settings = Settings()
+        if self._tenant_testing_mode_enabled(int(getattr(tenant, "id", 0) or 0)):
+            purpose_payload = self._derive_billing_purpose(msg)
+            payload: dict[str, Any] = {
+                "status": "testing_mode",
+                "payment_required": False,
+                "allow_first_build": True,
+                "plan": "testing",
+                "testing_mode": True,
+                "message": "testing mode active",
+            }
+            if purpose_payload:
+                payload.update(purpose_payload)
+            return payload
         url = settings.billing_status_url
         if not url and settings.public_base_url:
             base = settings.public_base_url.rstrip("/")
@@ -3056,6 +3151,17 @@ class Orchestrator:
                 f"billing_status_failed: {type(exc).__name__}: {exc}",
             )
             return None
+
+    def _tenant_testing_mode_enabled(self, tenant_id: int) -> bool:
+        if tenant_id <= 0:
+            return False
+        try:
+            payload = self.db.get_tenant_kv(tenant_id, "system", "testing_mode")
+        except Exception:
+            return False
+        if not isinstance(payload, dict):
+            return False
+        return bool(payload.get("enabled"))
 
     @staticmethod
     def _billing_status_path(tasks_dir: Path, run_id: int | None = None) -> Path:

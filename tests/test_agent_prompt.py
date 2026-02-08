@@ -16,6 +16,6 @@ def test_prompt_includes_core_instructions(tmp_path):
     assert "record_deploy" in prompt
     assert "record_domain_quote" in prompt
     assert "Domain Search & Purchase (Vercel CLI Only)" in prompt
-    assert "interaction-agent" in prompt
+    assert "interaction agent" in prompt
     assert "unsplash-backfill" in prompt
     assert "Memory contents for snapshot" in prompt

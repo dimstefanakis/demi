@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -86,20 +87,55 @@ class EventWorker:
             payload=payload,
             job_id=int(job["id"]),
         )
+        retry_after, max_attempts = self._event_retry_policy(payload, default_retry_after=5)
         if result.status == "busy":
             await self._db_call(
                 self.db.mark_event_job_failed,
                 int(job["id"]),
                 error="tenant_busy",
-                retry_after_seconds=5,
+                retry_after_seconds=retry_after,
+                max_attempts=max_attempts,
             )
             return False
         if result.status not in ("accepted", "duplicate"):
+            retry_after, max_attempts = self._event_retry_policy(payload, default_retry_after=10)
             await self._db_call(
                 self.db.mark_event_job_failed,
                 int(job["id"]),
                 error=result.detail or result.status,
-                retry_after_seconds=10,
+                retry_after_seconds=retry_after,
+                max_attempts=max_attempts,
             )
             return False
         return True
+
+    @staticmethod
+    def _event_retry_policy(payload: dict[str, Any], *, default_retry_after: int) -> tuple[int, int]:
+        scheduler = EventWorker._scheduler_payload(payload)
+        retry_after = int(scheduler.get("retry_backoff_seconds") or default_retry_after)
+        retry_until = EventWorker._parse_retry_until(scheduler.get("retry_until"))
+        if retry_until is not None and datetime.now(tz=timezone.utc) >= retry_until:
+            return retry_after, 1
+        if retry_until is not None:
+            return retry_after, 1000000
+        return retry_after, 5
+
+    @staticmethod
+    def _scheduler_payload(payload: dict[str, Any]) -> dict[str, Any]:
+        event_payload = payload.get("payload")
+        if not isinstance(event_payload, dict):
+            return {}
+        scheduler = event_payload.get("_scheduler")
+        return scheduler if isinstance(scheduler, dict) else {}
+
+    @staticmethod
+    def _parse_retry_until(value: Any) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc)

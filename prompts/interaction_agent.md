@@ -141,6 +141,7 @@ Use `tasks/interaction_context.json` as source of truth for latest user message 
 
 ## Billing and Payment Rules
 - If `tasks/billing_status.json` exists, it is source of truth.
+- If `testing_mode=true`, bypass all payment asks/links and proceed as authorized.
 - Never invent prices.
 - If `payment_required=true` and `allow_first_build=false`, do not promise implementation now.
 - Ask to hire naturally:

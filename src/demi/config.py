@@ -19,11 +19,15 @@ class Settings(BaseSettings):
     design_prompt_path: Path = Path("docs/DESIGN.md")
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
-    interaction_router_prompt_path: Path = Path("prompts/interaction_agent.md")
+    interaction_agent_routing_prompt_path: Path | None = None
+    # Legacy alias kept for backward compatibility.
+    interaction_router_prompt_path: Path | None = None
     execution_model: str = "claude-sonnet-4-5-20250929"
     interaction_model: str = "claude-opus-4-6"
     interaction_max_thinking_tokens: int | None = 4096
-    interaction_router_max_retries: int = 8
+    interaction_agent_routing_max_retries: int | None = None
+    # Legacy alias kept for backward compatibility.
+    interaction_router_max_retries: int | None = None
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
     claude_enable_tool_search: bool = True
     claude_enable_memory_tool: bool = True
@@ -69,6 +73,10 @@ class Settings(BaseSettings):
     docker_forward_messages: bool = False
     docker_command_timeout_seconds: float = 900.0
     docker_pool_warm_timeout_seconds: float = 45.0
+    tenant_tooling_enabled: bool = True
+    tenant_tooling_packages: str | None = None
+    tenant_tooling_dirname: str = "tooling"
+    tenant_tooling_lock_file: str = "tooling.lock"
 
     anthropic_api_key: str | None = None
     claude_api_key: str | None = None
@@ -99,6 +107,9 @@ class Settings(BaseSettings):
     outbox_retry_max_seconds: float = 120.0
     outbox_fallback_scan_interval: float = 60.0
     outbox_stale_sending_seconds: int = 120
+    scheduler_worker_enabled: bool = True
+    scheduler_worker_poll_interval: float = 5.0
+    scheduler_worker_batch_size: int = 50
 
     run_lease_seconds: int = 300
     run_activity_poll_interval: float = 2.5
@@ -138,6 +149,33 @@ class Settings(BaseSettings):
         if path.is_absolute():
             return path
         return (self.root_dir / path).resolve()
+
+    def resolved_interaction_prompt_path(self) -> Path:
+        path = self.interaction_prompt_path
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
+
+    def resolved_interaction_routing_prompt_path(self) -> Path:
+        path = (
+            self.interaction_agent_routing_prompt_path
+            or self.interaction_router_prompt_path
+            or self.interaction_prompt_path
+        )
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
+
+    def interaction_routing_max_retries(self) -> int:
+        value = self.interaction_agent_routing_max_retries
+        if value is None:
+            value = self.interaction_router_max_retries
+        if value is None:
+            value = 8
+        try:
+            return max(0, int(value))
+        except (TypeError, ValueError):
+            return 8
 
     def resolved_interaction_session_cache_dir(self) -> Path:
         path = self.interaction_session_cache_dir
