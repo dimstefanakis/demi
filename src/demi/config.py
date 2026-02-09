@@ -102,10 +102,14 @@ class Settings(BaseSettings):
     outbox_worker_enabled: bool = True
     outbox_worker_poll_interval: float = 1.0
     outbox_worker_batch_size: int = 50
-    outbox_send_timeout_seconds: float = 20.0
-    outbox_max_attempts: int = 6
+    # How long to allow interaction-agent delivery (LLM turn + optional send) before
+    # considering the attempt timed out and retrying.
+    outbox_send_timeout_seconds: float = 600.0
+    # Number of outbox send attempts before marking an item permanently failed.
+    outbox_max_attempts: int = 12
     outbox_retry_base_seconds: float = 2.0
-    outbox_retry_max_seconds: float = 120.0
+    # Cap exponential backoff to keep retries responsive.
+    outbox_retry_max_seconds: float = 60.0
     outbox_fallback_scan_interval: float = 60.0
     outbox_stale_sending_seconds: int = 120
     scheduler_worker_enabled: bool = True

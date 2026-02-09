@@ -195,10 +195,10 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   - `SCHEDULER_WORKER_POLL_INTERVAL`
   - `SCHEDULER_WORKER_BATCH_SIZE`
 - Outbox retry controls:
-  - `OUTBOX_SEND_TIMEOUT_SECONDS`
-  - `OUTBOX_MAX_ATTEMPTS`
-  - `OUTBOX_RETRY_BASE_SECONDS`
-  - `OUTBOX_RETRY_MAX_SECONDS`
+  - `OUTBOX_SEND_TIMEOUT_SECONDS` (default `600`)
+  - `OUTBOX_MAX_ATTEMPTS` (default `12`)
+  - `OUTBOX_RETRY_BASE_SECONDS` (default `2`)
+  - `OUTBOX_RETRY_MAX_SECONDS` (default `60`)
   - `OUTBOX_FALLBACK_SCAN_INTERVAL`
   - `OUTBOX_STALE_SENDING_SECONDS`
 

@@ -19,10 +19,10 @@ INTERACTION_SESSION_KEY = "claude_instruction_session"
 class OutboxWorkerConfig:
     poll_interval: float = 1.0
     batch_size: int = 50
-    interaction_send_timeout_seconds: float = 20.0
-    max_attempts: int = 6
+    interaction_send_timeout_seconds: float = 600.0
+    max_attempts: int = 12
     retry_base_seconds: float = 2.0
-    retry_max_seconds: float = 120.0
+    retry_max_seconds: float = 60.0
     fallback_scan_interval_seconds: float = 60.0
     stale_sending_seconds: int = 120
 
