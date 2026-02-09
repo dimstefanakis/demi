@@ -124,6 +124,19 @@ Rules:
 - If `tasks/request_status.md` exists, read it.
 - Maintain `.env.example` in the workspace root. Add any new env vars you introduce.
 - Create/refresh `tasks/design_context.md` (business type, tone, CTAs, required sections, constraints).
+  - Review the brief for potential visual references (URLs, screenshots, named products/sites).
+  - Use design judgment: not every URL is a visual reference.
+    Treat a link as design reference only when intent suggests style/layout inspiration
+    (for example: "like this", "inspired by", "use this style", "match this look").
+  - Ignore operational links (payment, docs, auth, admin, API, repo) unless the user clearly
+    asks to use them as visual inspiration.
+  - If strong reference signals exist, add this block to `tasks/design_context.md`:
+    - `## Design References` with relevant references (preserve URLs exactly).
+    - `## Reference Direction` with one value: `close-match`, `inspired`, or `light-touch`.
+    - `## Reference Application` with 3-5 concrete traits to apply
+      (for example layout rhythm, typography scale, spacing density, hierarchy, motion tone).
+  - If reference intent is weak or ambiguous, proceed with original direction and note:
+    `No strong visual reference signal detected.`
 - A tenant-local SQLite scratchpad may exist at `tenant.sqlite` in the tenant root (one level above projects).
   If it's missing, you can create it. Use it for lightweight scratchpad data, cached checks, or structured notes.
   You may create tables as needed. Do not use it for orchestration, queues, or authoritative state.
@@ -260,6 +273,8 @@ After payment:
   - `/app/docs/DESIGN.md` is canonical and must remain unchanged; do not edit it.
   - Do not use project-local `DESIGN.md` as the Gemini prompt source.
   - Pass context via stdin (task brief, memory.md, design_context.md, current page if present).
+  - If strong reference signals are present in the brief, ensure `tasks/design_context.md`
+    includes `Design References` + `Reference Direction` before running Gemini.
   - Use Gemini CLI in **auto-edit mode** so Gemini edits the app files directly (no single HTML dump).
     Run from the app directory (`site/<app_name>`), and instruct Gemini to apply the design by
     editing files in-place. Do NOT accept a plain HTML output file as the “design”.

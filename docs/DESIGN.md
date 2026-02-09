@@ -8,6 +8,18 @@ You're building a landing page for "<company_name>" - <company_description>. The
 The landing page will be the primary conversion funnel for leads.
 </context>
 
+<reference_adaptation>
+If the brief includes clear visual references (URLs, screenshots, or examples):
+
+- Use design judgment to decide which references are truly visual.
+  Not every URL is a style reference.
+- When reference intent is clear, treat those references as primary visual direction.
+- Match layout rhythm, spacing density, type scale, hierarchy, and motion language.
+- Keep product/business constraints accurate, but adapt stylistic defaults to fit the reference.
+- Do not produce a generic fallback if references are present.
+- Before coding, list 3-5 concrete visual traits extracted from the reference.
+</reference_adaptation>
+
 <design_philosophy>
 Create a design that would win design awards. Avoid the "AI slop" aesthetic at all costs:
 
