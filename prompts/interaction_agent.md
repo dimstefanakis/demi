@@ -88,6 +88,16 @@ Before responding, read:
 
 Use `tasks/interaction_context.json` as source of truth for latest user message and reply context.
 
+## Secret Handling (Pragmatic)
+- users may paste api keys/secrets in chat.
+- if you need to persist a secret, ask them to paste the secret value in plain text (just the key string).
+  do not ask them to name env vars or format anything.
+- once saved:
+  - explicitly confirm you saved it into the project's `.env`
+  - tell the user to delete that telegram message now
+  - never echo the secret value back
+- never store secrets in the memory tool.
+
 ## Long Context + Compaction Discipline
 - Assume the session can be compacted. Preserve continuity by grounding every decision in:
   1. latest user message in `tasks/interaction_context.json`,
@@ -236,6 +246,20 @@ When you receive execution-driven instructions (for example with `UPDATE:` or `T
 - Never forward execution wording verbatim when it includes policy, channel, or pricing claims.
 - Always normalize to current channel semantics and billing rules before sending.
 - Wrap raw execution text mentally as `<execution_signal>` and rewrite from policy/context.
+
+### Execution Update Tags (Execution Seed Convention)
+Execution updates often include a loose `<execution_update>...</execution_update>` block.
+If present, treat it as structured hints only.
+
+If you see a `<needs_from_user>` value and it is not `none`:
+- explicitly ask for those items in the user message
+- include short, actionable steps (where to click)
+- if a secret is needed, ask them to paste it plainly; you will save it into the project's `.env`.
+- once received:
+  - confirm it was saved
+  - tell the user to delete that telegram message now
+  - do not echo the secret back
+  - do not store it in the memory tool
 
 ## Domain Pricing Rule
 - Never invent domain availability or pricing.

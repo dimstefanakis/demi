@@ -66,6 +66,12 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
     └──────────────┬───────────────┘
                    ▼
     ┌──────────────────────────────┐
+    │ Execution Subagents          │
+    │ - planner (writes tasks/prd) │
+    │ - reviewer (tests + gaps)    │
+    └──────────────┬───────────────┘
+                   ▼
+    ┌──────────────────────────────┐
     │ MCP + Tools                  │
     │ chat | unsplash | supabase   │
     │ github | chrome-devtools     │
@@ -115,7 +121,9 @@ demi/
 │   └── SPEC.md
 ├── prompts/
 │   ├── claude_agent.md
-│   └── interaction_agent.md
+│   ├── interaction_agent.md
+│   ├── planner_agent.md
+│   └── reviewer_agent.md
 ├── src/
 │   └── demi/
 │       ├── app.py                     # FastAPI entrypoint
@@ -174,6 +182,9 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   `INTERACTION_MAX_THINKING_TOKENS`
 - Execution calls can use adaptive thinking via `EXECUTION_MAX_THINKING_TOKENS`
   (default `2048`; values <=0 disable it, values between 1-1023 are clamped to 1024)
+- Execution subagents:
+  - `planner` runs before implementation to write `tasks/prd.md` and `tasks/test_plan.md`
+  - `reviewer` runs at the end to run tests (when possible) and write `tasks/review.md`
 - Interaction-agent routing controls:
   - `INTERACTION_AGENT_ROUTING_MAX_RETRIES` (legacy `INTERACTION_ROUTER_MAX_RETRIES` still accepted)
   - `INTERACTION_AGENT_ROUTING_PROMPT_PATH` (legacy `INTERACTION_ROUTER_PROMPT_PATH` still accepted)
@@ -507,6 +518,8 @@ Primary deployment target is a single VM with Docker Compose and optional blue/g
 - Worker: `python -m demi.worker_entrypoint`
 - Production: Docker Compose with `nginx`, `api_blue`, `api_green`, `worker`
 - Agent runtime uses Docker socket to run `demi-agent` images
+- Long-running agent container commands are not hard-timed-out by default (prevents aborting active runs).
+  Configure `DOCKER_CONTAINER_COMMAND_TIMEOUT_SECONDS` to enforce a hard limit if needed.
 
 See `DEPLOY.md` for the full GCE blue/green process and required secrets.
 

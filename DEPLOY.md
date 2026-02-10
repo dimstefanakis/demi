@@ -39,8 +39,10 @@ gcloud compute backend-services add-backend demi-backend \
 gcloud compute url-maps create demi-map --default-service demi-backend
 gcloud compute ssl-certificates create demi-cert-v2 \
   --domains hiredemi.com,www.hiredemi.com
+gcloud compute ssl-certificates create demi-cert-api \
+  --domains api.hiredemi.com
 gcloud compute target-https-proxies create demi-https-proxy \
-  --ssl-certificates demi-cert-v2 --url-map demi-map
+  --ssl-certificates demi-cert-v2,demi-cert-api --url-map demi-map
 gcloud compute forwarding-rules create demi-https-fr \
   --global \
   --target-https-proxy demi-https-proxy \
@@ -73,6 +75,7 @@ gcloud compute firewall-rules create demi-allow-lb \
 ### DNS (Porkbun)
 - A record `@` -> LB IP (global).
 - CNAME `www` -> `hiredemi.com`.
+- A record `api` -> LB IP (global).
 
 Managed certs activate once DNS points to the LB IP.
 

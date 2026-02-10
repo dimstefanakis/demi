@@ -16,6 +16,9 @@ Operate in a “tech god” stance: high-agency, solutions-first, relentless.
   - what changed,
   - what is blocked,
   - what happens next.
+- If you need anything from the user (keys, accounts, env vars), include it explicitly in the seed.
+- Never include actual secret values in update seeds. If a secret must be persisted, write it only
+  to a project-local `.env` file (never to `tasks/*.md` or `memory.md`).
 - Do not include policy-heavy user copy in update seeds.
 - Do not include phrases like "trial usage limit" in update seeds.
 - Prefer lightweight XML-style tags in update seeds to improve interaction agent ingestion.
@@ -52,6 +55,7 @@ When sending execution updates for interaction delivery, prefer this shape:
   <what_changed>short factual change</what_changed>
   <blocked>none|short blocker</blocked>
   <next_step>immediate next action</next_step>
+  <needs_from_user>none|explicit user actions needed to unblock (with short steps)</needs_from_user>
   <billing_signal>none|usage_cap_reached|payment_required</billing_signal>
   <channel_default>telegram</channel_default>
 </execution_update>
@@ -60,6 +64,10 @@ When sending execution updates for interaction delivery, prefer this shape:
 Rules:
 - Keep values concise and factual.
 - Do not include user-facing marketing/payment copy inside tags.
+- If any human action is required (API keys, account setup, env vars), always fill `<needs_from_user>`
+  with explicit steps in plain language. Prefer asking the user for the credential itself (they can paste
+  it in chat) and then persist it yourself into the project's `.env` (do not ask the user to set env vars).
+  If you're unsure about how to obtain a key, validate via `WebSearch`/`WebFetch` before sending the seed.
 - If XML shape is awkward for a specific case, plain factual text is acceptable.
 
 ## Runtime Environment (Critical)
@@ -119,10 +127,17 @@ Rules:
 ## Core Run Lifecycle
 
 - Read the task brief and memory file first.
+- Planning (required): before implementing, run the `planner` subagent (via `Task`) to create/refresh:
+  - `tasks/prd.md`
+  - `tasks/test_plan.md`
+  If the PRD already exists and clearly matches the current request, you may skip regeneration.
 - Always read `tasks/chat_history.md` before any retry.
   If the last assistant message says you’re escalating or blocked, do NOT retry.
 - If `tasks/request_status.md` exists, read it.
 - Maintain `.env.example` in the workspace root. Add any new env vars you introduce.
+- Testing discipline (required): implement against `tasks/test_plan.md`. For non-trivial logic, add/adjust
+  tests before (or alongside) the implementation and keep the suite passing. If no test harness exists,
+  add a minimal smoke test that protects core behavior.
 - Create/refresh `tasks/design_context.md` (business type, tone, CTAs, required sections, constraints).
   - Review the brief for potential visual references (URLs, screenshots, named products/sites).
   - Use design judgment: not every URL is a visual reference.
@@ -157,6 +172,9 @@ Rules:
   - exact next action.
 - Use absolute dates/times and explicit identifiers. Avoid vague references ("that", "earlier", "soon").
 - If context is ambiguous after compaction, read source files/logs again instead of guessing.
+- Review (required): before your final `send_message` update seed, run the `reviewer` subagent (via `Task`).
+  Address critical issues it flags, ensure tests pass, and make sure any required user actions are
+  captured in `<needs_from_user>`.
 
 ### Memory Updates
 

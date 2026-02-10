@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     design_prompt_path: Path = Path("docs/DESIGN.md")
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
+    planner_prompt_path: Path = Path("prompts/planner_agent.md")
+    reviewer_prompt_path: Path = Path("prompts/reviewer_agent.md")
     interaction_agent_routing_prompt_path: Path | None = None
     # Legacy alias kept for backward compatibility.
     interaction_router_prompt_path: Path | None = None
@@ -72,6 +74,10 @@ class Settings(BaseSettings):
     # NOTE: all secrets are considered safe for agents to consume in this runtime.
     docker_env_allowlist: str | None = "*"
     docker_forward_messages: bool = False
+    # Hard timeout for long-running container commands (agent execution via `docker run` and
+    # `docker exec`).
+    # Set to 0 to disable and rely on run leases/heartbeats instead.
+    docker_container_command_timeout_seconds: float = 0.0
     docker_command_timeout_seconds: float = 900.0
     docker_pool_warm_timeout_seconds: float = 45.0
     tenant_tooling_enabled: bool = True

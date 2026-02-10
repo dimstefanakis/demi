@@ -30,6 +30,8 @@ def test_default_setting_sources():
 def test_default_subagents_configured():
     agent = ClaudeAgent()
     assert "interaction-helper" in agent.agents
+    assert "planner" in agent.agents
+    assert "reviewer" in agent.agents
     tools = agent.agents["interaction-helper"].tools or []
     assert "mcp__demi-chat__send_payment_link" in tools
 

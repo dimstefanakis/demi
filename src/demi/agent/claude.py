@@ -1576,9 +1576,13 @@ class ClaudeAgent:
     def _default_agents() -> dict[str, AgentDefinition]:
         settings = Settings()
         interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
+        planner_prompt = ClaudeAgent._load_prompt_file(settings.planner_prompt_path)
+        reviewer_prompt = ClaudeAgent._load_prompt_file(settings.reviewer_prompt_path)
         interaction_subagent_model = ClaudeAgent._agent_definition_model(
             settings.interaction_model
         )
+        planner_subagent_model = interaction_subagent_model or "opus"
+        reviewer_subagent_model = ClaudeAgent._agent_definition_model(settings.execution_model) or "sonnet"
         interaction_tools = [
             "Read",
             "Write",
@@ -1596,12 +1600,42 @@ class ClaudeAgent:
         if settings.claude_enable_memory_tool:
             interaction_tools.append("Memory")
         return {
+            "planner": AgentDefinition(
+                description=(
+                    "Creates/updates a concrete PRD + acceptance criteria + test plan for the "
+                    "current user request. Writes artifacts to tasks/ (no build/deploy)."
+                ),
+                prompt=planner_prompt,
+                tools=[
+                    "Read",
+                    "Write",
+                    "Edit",
+                    "Grep",
+                    "Glob",
+                ],
+                model=planner_subagent_model,
+            ),
             "interaction-helper": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
                 prompt=interaction_prompt,
                 tools=interaction_tools,
                 model=interaction_subagent_model,
-            )
+            ),
+            "reviewer": AgentDefinition(
+                description=(
+                    "Reviews implementation vs PRD, runs tests, and writes a short review report "
+                    "to tasks/ (no code changes)."
+                ),
+                prompt=reviewer_prompt,
+                tools=[
+                    "Read",
+                    "Write",
+                    "Grep",
+                    "Glob",
+                    "Bash",
+                ],
+                model=reviewer_subagent_model,
+            ),
         }
 
     @staticmethod

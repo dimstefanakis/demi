@@ -80,10 +80,11 @@ class DockerPool:
         command: list[str],
         env: dict[str, str] | None = None,
     ) -> None:
+        settings = Settings()
         args = ["docker", "exec"]
         args.extend(self._env_args(env))
         args.extend([slot.container_id, *command])
-        await self._run_cmd(args)
+        await self._run_cmd(args, timeout_seconds=settings.docker_container_command_timeout_seconds)
 
     async def run_in_fresh_container(
         self,
@@ -91,6 +92,7 @@ class DockerPool:
         command: list[str],
         env: dict[str, str] | None = None,
     ) -> None:
+        settings = Settings()
         args = [
             "docker",
             "run",
@@ -101,7 +103,7 @@ class DockerPool:
         args.extend(self._env_args(self.config.extra_env))
         args.extend(self._env_args(env))
         args.extend([self.config.image, *command])
-        await self._run_cmd(args)
+        await self._run_cmd(args, timeout_seconds=settings.docker_container_command_timeout_seconds)
 
     async def cancel_workspace(self, workspace_path: Path) -> int:
         await self._scan_existing()
@@ -299,26 +301,28 @@ class DockerPool:
         return (base / name).resolve()
 
     @staticmethod
-    async def _run_cmd(args: list[str]) -> str:
-        settings = Settings()
+    async def _run_cmd(args: list[str], *, timeout_seconds: float | None = None) -> str:
+        effective_timeout = timeout_seconds
+        if effective_timeout is None:
+            effective_timeout = Settings().docker_command_timeout_seconds
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=os.environ.copy(),
         )
-        if settings.docker_command_timeout_seconds and settings.docker_command_timeout_seconds > 0:
+        if effective_timeout and effective_timeout > 0:
             try:
                 stdout, stderr = await asyncio.wait_for(
                     proc.communicate(),
-                    timeout=settings.docker_command_timeout_seconds,
+                    timeout=effective_timeout,
                 )
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.wait()
                 redacted = DockerPool._redact_args(args)
                 raise RuntimeError(
-                    f"command timed out after {settings.docker_command_timeout_seconds}s: "
+                    f"command timed out after {effective_timeout}s: "
                     f"{' '.join(redacted)}"
                 ) from None
         else:
@@ -326,7 +330,8 @@ class DockerPool:
         if proc.returncode != 0:
             redacted = DockerPool._redact_args(args)
             raise RuntimeError(
-                f"command failed ({proc.returncode}): {' '.join(redacted)}\n{stderr.decode().strip()}"
+                f"command failed ({proc.returncode}): {' '.join(redacted)}\n"
+                f"{stderr.decode().strip()}"
             )
         return stdout.decode().strip()
 

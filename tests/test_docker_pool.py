@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+import sys
 
 import pytest
 
@@ -88,3 +89,20 @@ async def test_ensure_pool_skips_when_pool_size_zero(tmp_path, monkeypatch):
     await pool.ensure_pool()
 
     assert called is False
+
+
+@pytest.mark.asyncio
+async def test_run_cmd_times_out_by_default(monkeypatch):
+    monkeypatch.setenv("DOCKER_COMMAND_TIMEOUT_SECONDS", "0.1")
+    with pytest.raises(RuntimeError, match=r"command timed out after 0\.1s:"):
+        await DockerPool._run_cmd([sys.executable, "-c", "import time; time.sleep(0.3)"])
+
+
+@pytest.mark.asyncio
+async def test_run_cmd_timeout_override_disables_timeout(monkeypatch):
+    monkeypatch.setenv("DOCKER_COMMAND_TIMEOUT_SECONDS", "0.1")
+    out = await DockerPool._run_cmd(
+        [sys.executable, "-c", "import time; time.sleep(0.2); print('ok')"],
+        timeout_seconds=0,
+    )
+    assert out == "ok"
