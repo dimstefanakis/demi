@@ -349,6 +349,8 @@ class DockerAgent:
             "UNSPLASH_ACCESS_KEY",
             "UNSPLASH_SECRET_KEY",
             "UNSPLASH_APP_ID",
+            "FIRECRAWL_API_KEY",
+            "FIRECRAWL_NO_TELEMETRY",
             "SUPABASE_API_BASE_URL",
             "CHROME_DEVTOOLS_MCP_ENABLED",
             "CHROME_DEVTOOLS_MCP_PROFILE_DIR",

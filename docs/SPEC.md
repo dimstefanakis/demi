@@ -85,7 +85,8 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
    └───────┬────────┘   └──────────────────────────────┘
            ▼
    ┌──────────────────────────────┐
-   │ Gemini CLI + Vercel CLI       │
+   │ Firecrawl CLI + Gemini CLI    │
+   │ + Vercel CLI                  │
    └──────────────┬───────────────┘
                   ▼
         ┌──────────────────────────┐
@@ -104,6 +105,7 @@ Background workers (poll main DB):
 - API: FastAPI (`src/demi/app.py`)
 - Orchestration: Python (`src/demi/orchestrator.py`)
 - Agent runtime: Claude Agent SDK (`claude_agent_sdk`) with optional Docker isolation
+- Web data: Firecrawl CLI (optional; scrape/search/crawl/map)
 - Design: Gemini CLI driven by `docs/DESIGN.md` template (runtime path `/app/docs/DESIGN.md`), editing app files directly (auto-edit mode)
 - Deploy: Vercel CLI
 - Messaging: Telegram Bot API

@@ -3,6 +3,7 @@
   "private": true,
   "devDependencies": {
     "@google/gemini-cli": "latest",
+    "firecrawl-cli": "latest",
     "vercel": "latest"
   }
 }

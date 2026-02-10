@@ -20,7 +20,7 @@
 ## Build, Test, and Development Commands
 - Install Python deps with uv:
   - `uv sync`
-- Install CLI tooling for Gemini/Vercel (local `node_modules/.bin`):
+- Install CLI tooling for Gemini/Vercel/Firecrawl (local `node_modules/.bin`):
   - `bun install`
 - Run the API locally (via uv):
   - `uv run uvicorn demi.app:app --reload`
@@ -46,5 +46,5 @@
 - If user-facing copy or chat responses change, include before/after snippets.
 
 ## Configuration & Secrets
-- Use `.env` for local settings. Common keys: `TELEGRAM_BOT_TOKEN`, optional Stripe keys, Vercel/Gemini CLI tokens.
+- Use `.env` for local settings. Common keys: `TELEGRAM_BOT_TOKEN`, optional Stripe keys, Vercel/Gemini/Firecrawl tokens.
 - Never commit secrets. Keep production values out of the repo.

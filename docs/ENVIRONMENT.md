@@ -24,6 +24,7 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - git, curl, unzip
 - Gemini CLI (wrapped via bunx)
 - Vercel CLI (wrapped via bunx)
+- Firecrawl CLI
 - Use bun/uv (not npm/pip) and prefer local `node_modules/.bin` when present.
 - You can install additional tools inside the container if needed (e.g., via `apt-get`, `uv`, or `bunx`),
   but those installs are ephemeral unless you place artifacts under `/workspace`.
@@ -49,6 +50,7 @@ Default env allowlist includes:
 - TELEGRAM_BOT_TOKEN
 - MAIN_DB_SUPABASE_URL / MAIN_DB_SUPABASE_SERVICE_KEY
 - UNSPLASH_ACCESS_KEY / UNSPLASH_SECRET_KEY / UNSPLASH_APP_ID
+- FIRECRAWL_API_KEY / FIRECRAWL_NO_TELEMETRY
 - VERCEL_TOKEN / VERCEL_SCOPE
 - EVENT_URL / PUBLIC_BASE_URL
 - STRIPE_SECRET_KEY / STRIPE_WEBHOOK_SECRET / STRIPE_SUCCESS_URL / STRIPE_CANCEL_URL

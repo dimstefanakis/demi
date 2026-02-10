@@ -46,6 +46,8 @@ class Settings(BaseSettings):
     vercel_token: str | None = None
     vercel_scope: str | None = None
 
+    firecrawl_cmd: str = "firecrawl"
+
     github_org: str | None = None
     github_app_id: str | None = None
     github_app_client_id: str | None = None
@@ -210,3 +212,7 @@ class Settings(BaseSettings):
     def resolved_vercel_cmd(self) -> str:
         local_cmd = (self.root_dir / "node_modules" / ".bin" / "vercel").resolve()
         return str(local_cmd) if local_cmd.exists() else self.vercel_cmd
+
+    def resolved_firecrawl_cmd(self) -> str:
+        local_cmd = (self.root_dir / "node_modules" / ".bin" / "firecrawl").resolve()
+        return str(local_cmd) if local_cmd.exists() else self.firecrawl_cmd
