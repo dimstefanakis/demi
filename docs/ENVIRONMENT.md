@@ -23,7 +23,7 @@ All `.md` documents are internal and for agent knowledge only; do not share verb
 - bun / bunx
 - git, curl, unzip
 - Gemini CLI (wrapped via bunx)
-- Vercel CLI (wrapped via bunx)
+- Vercel CLI (wrapped; if `VERCEL_TOKEN` is set and `--token` is not provided, the wrapper injects it)
 - Firecrawl CLI
 - Use bun/uv (not npm/pip) and prefer local `node_modules/.bin` when present.
 - You can install additional tools inside the container if needed (e.g., via `apt-get`, `uv`, or `bunx`),

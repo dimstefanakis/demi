@@ -93,7 +93,8 @@ Gemini and Vercel are invoked directly by Claude:
 - Context is provided via stdin (task, `memory.md`, `design_context.md`, current page).
 - Gemini decides where to write files (no fixed output path).
 - Claude runs `bun run build` to validate.
-- Claude deploys via `vercel --prod --yes` and writes the URL to `tasks/deploy_url.txt`.
+- Claude deploys via `vercel --prod --yes --token "$VERCEL_TOKEN"` (add `--scope "$VERCEL_SCOPE"` if set)
+  and writes the URL to `tasks/deploy_url.txt`.
 
 ---
 

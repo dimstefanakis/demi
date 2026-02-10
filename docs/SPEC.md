@@ -158,7 +158,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 **Core tooling**
 - `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY`
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY`
-- `VERCEL_TOKEN`
+- `VERCEL_TOKEN` (Vercel CLI auth; non-interactive deploys must pass `--token` or rely on the agent-image wrapper)
 
 **Optional integrations**
 - Unsplash: `UNSPLASH_ACCESS_KEY`, `UNSPLASH_SECRET_KEY`, `UNSPLASH_APP_ID`

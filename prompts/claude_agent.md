@@ -334,6 +334,8 @@ After payment:
 - Unsplash backfill: use the `unsplash-backfill` skill (and allow `images.unsplash.com` if next/image).
 - Build: run `bun run build` and fix errors.
 - Deploy: `vercel --prod --yes --token "$VERCEL_TOKEN"` (add `--scope "$VERCEL_SCOPE"` if set).
+- IMPORTANT: Vercel CLI does not read `VERCEL_TOKEN` from env automatically; if you see `no-credentials-found`,
+  it means `--token` was not passed (rerun with `--token` instead of asking the user for a new token).
 - Capture deploy output to `tasks/deploy_output.txt` and verify success (exit code 0 + URL).
   If deploy fails, DO NOT call `record_deploy`. Ask the interaction agent to send a brief,
   non-technical failure update and stop.

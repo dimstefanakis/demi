@@ -9,13 +9,13 @@ Use this skill to run Vercel CLI operations for deployments and project manageme
 
 ## Workflow
 1. Prefer the local CLI if available: `./node_modules/.bin/vercel`.
-2. If running in CI or non-interactive contexts, always use `--token`.
-3. Default deploy command for production: `vercel --prod --yes`.
+2. If running in CI or non-interactive contexts, always use `--token "$VERCEL_TOKEN"` (and `--scope "$VERCEL_SCOPE"` if set).
+3. Default deploy command for production (non-interactive): `vercel --prod --yes --token "$VERCEL_TOKEN"`.
 4. Parse the deployment URL from CLI output and persist it.
 5. For domain purchase requests, **never buy immediately**. Quote first, ask user to proceed, then buy.
 
 ## Commands (common)
-- Deploy prod: `vercel --prod --yes`
+- Deploy prod (non-interactive): `vercel --prod --yes --token "$VERCEL_TOKEN"`
 - Check version: `vercel --version`
 - Env management: `vercel env ls|add|rm`
 - Project info: `vercel project ls|inspect`
