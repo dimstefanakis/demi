@@ -1078,6 +1078,63 @@ async def test_orchestrator_reset_clears_state(tmp_path, reset_text):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_reset_without_directive_uses_active_project(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    active_workspace = workspace_manager.ensure_workspace(tenant.key, project_name="beta")
+
+    db.set_tenant_kv(
+        tenant.id,
+        "execution",
+        "claude_session:main",
+        {"session_id": "main-session"},
+    )
+    db.set_tenant_kv(
+        tenant.id,
+        "execution",
+        "claude_session:beta",
+        {"session_id": "beta-session"},
+    )
+
+    main_run_id = db.create_run(tenant.id, message_id=0, project_name="main")
+    beta_run_id = db.create_run(tenant.id, message_id=0, project_name="beta")
+
+    reset_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="reset-active-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="/reset",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(reset_msg)
+
+    assert result.status == "accepted"
+    assert active_workspace.project_name == "beta"
+    assert db.get_tenant_kv(tenant.id, "execution", "claude_session:beta") is None
+    main_session = db.get_tenant_kv(tenant.id, "execution", "claude_session:main")
+    assert main_session == {"session_id": "main-session"}
+
+    main_run = db.get_run(main_run_id)
+    beta_run = db.get_run(beta_run_id)
+    assert main_run["status"] == "running"
+    assert beta_run["status"] == "failed"
+    assert beta_run["error"] == "user_reset"
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_uses_active_project_without_explicit_project(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")

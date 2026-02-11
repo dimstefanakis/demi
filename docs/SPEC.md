@@ -68,6 +68,9 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
     ┌──────────────────────────────┐
     │ Execution Subagents          │
     │ - planner (writes tasks/prd) │
+    │ - product-designer (Gemini)  │
+    │ - software-engineer (TDD)    │
+    │ - devops-engineer (release)  │
     │ - reviewer (tests + gaps)    │
     └──────────────┬───────────────┘
                    ▼
@@ -124,9 +127,12 @@ demi/
 │   └── SPEC.md
 ├── prompts/
 │   ├── claude_agent.md
+│   ├── devops_engineer_agent.md
 │   ├── interaction_agent.md
 │   ├── planner_agent.md
-│   └── reviewer_agent.md
+│   ├── product_designer_agent.md
+│   ├── reviewer_agent.md
+│   └── software_engineer_agent.md
 ├── src/
 │   └── demi/
 │       ├── app.py                     # FastAPI entrypoint
@@ -189,6 +195,9 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   (default `2048`; values <=0 disable it, values between 1-1023 are clamped to 1024)
 - Execution subagents:
   - `planner` runs before implementation to write `tasks/prd.md` and `tasks/test_plan.md`
+  - `product-designer` handles Gemini-driven design/application of visual direction
+  - `software-engineer` handles TDD-backed implementation and end-to-end wiring
+  - `devops-engineer` handles git hygiene, build/deploy, and release recording
   - `reviewer` runs at the end to run tests (when possible) and write `tasks/review.md`
 - Interaction-agent routing controls:
   - `INTERACTION_AGENT_ROUTING_MAX_RETRIES` (legacy `INTERACTION_ROUTER_MAX_RETRIES` still accepted)

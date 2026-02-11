@@ -32,9 +32,37 @@ def test_default_subagents_configured():
     agent = ClaudeAgent()
     assert "interaction-helper" in agent.agents
     assert "planner" in agent.agents
+    assert "product-designer" in agent.agents
+    assert "software-engineer" in agent.agents
+    assert "devops-engineer" in agent.agents
     assert "reviewer" in agent.agents
     tools = agent.agents["interaction-helper"].tools or []
     assert "mcp__demi-chat__send_payment_link" in tools
+    assert "Skill" in tools
+
+    designer_tools = agent.agents["product-designer"].tools or []
+    assert "Skill" in designer_tools
+    assert "Bash" in designer_tools
+    assert "mcp__demi-unsplash__search_photos" in designer_tools
+
+    software_tools = agent.agents["software-engineer"].tools or []
+    assert "Skill" in software_tools
+    assert "Bash" in software_tools
+    assert "mcp__demi-supabase__provision_managed_backend" in software_tools
+
+    devops_tools = agent.agents["devops-engineer"].tools or []
+    assert "Skill" in devops_tools
+    assert "Bash" in devops_tools
+    assert "mcp__demi-github__prepare_repo" in devops_tools
+    assert "mcp__demi-chat__record_deploy" in devops_tools
+
+
+def test_subagent_model_defaults():
+    agent = ClaudeAgent()
+    assert agent.agents["product-designer"].model == "sonnet"
+    assert agent.agents["software-engineer"].model == "sonnet"
+    assert agent.agents["devops-engineer"].model == "sonnet"
+    assert agent.agents["reviewer"].model == "opus"
 
 
 def test_subagents_do_not_have_task_tool():
@@ -44,11 +72,14 @@ def test_subagents_do_not_have_task_tool():
         assert "Task" not in tools, f"subagent {name} should not include Task in its tools"
 
 
-def test_execution_prompt_explicitly_requires_planner_and_reviewer():
+def test_execution_prompt_explicitly_requires_specialized_subagents():
     settings = Settings()
     prompt = settings.claude_prompt_path.read_text(encoding="utf-8").lower()
     assert "use the planner agent" in prompt
     assert "use the reviewer agent" in prompt
+    assert "product-designer" in prompt
+    assert "software-engineer" in prompt
+    assert "devops-engineer" in prompt
 
 
 def test_sdk_message_log_data_does_not_include_repr():

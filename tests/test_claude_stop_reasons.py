@@ -1,9 +1,11 @@
+import asyncio
 from datetime import datetime, timezone
 
 import pytest
 
 import demi.agent.claude as claude_module
 from demi.agent.claude import ClaudeAgent
+from demi.agent.inflight import InflightTextStream
 from demi.models import NormalizedMessage
 from demi.workspace.core import WorkspaceManager
 from tests.utils import build_test_db, create_test_tenant
@@ -306,3 +308,88 @@ async def test_prepare_context_sets_tool_search_memory_env_and_records_usage(
     assert payload["run_id"] == 555
     usage = payload["usage"] or {}
     assert usage["output_tokens"] == 1
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_resume_fallback_reenables_inflight_stream(tmp_path, monkeypatch):
+    capture: dict[str, list] = {
+        "accepting_at_query_start": [],
+        "resume_options": [],
+    }
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "ok"
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "session-fresh"
+
+    stream = InflightTextStream(queue=asyncio.Queue())
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            capture["resume_options"].append(options.resume)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            capture["accepting_at_query_start"].append(stream.accepting)
+            async for _ in prompt_stream:
+                pass
+            return None
+
+        async def receive_response(self):
+            if self.options.resume:
+                raise RuntimeError("invalid session")
+            yield FakeSystemMessage("init", {"session_id": "session-fresh"})
+            yield FakeResultMessage()
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.write_task("# Task\n\nDo work\n")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="resume-fallback-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a site",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    result = await agent.prepare_context(
+        workspace=workspace,
+        task_path=task_path,
+        message=message,
+        messenger=DummyMessenger(),
+        inflight_stream=stream,
+        tenant_id=tenant.id,
+        db=db,
+        run_id=777,
+        session_id="session-stale",
+    )
+
+    assert result.session_id == "session-fresh"
+    assert capture["resume_options"] == ["session-stale", None]
+    assert capture["accepting_at_query_start"] == [True, True]

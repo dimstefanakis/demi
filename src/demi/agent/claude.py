@@ -569,24 +569,6 @@ class ClaudeAgent:
             runtime_env=runtime_env,
             tooling_bin_path=tooling_result.bin_path if tooling_result is not None else None,
         )
-        options = ClaudeAgentOptions(
-            allowed_tools=self.allowed_tools,
-            permission_mode=self.permission_mode,
-            system_prompt=self.system_prompt,
-            setting_sources=self.setting_sources,
-            model=settings.execution_model,
-            max_thinking_tokens=settings.execution_thinking_max_tokens(),
-            cwd=workspace.root,
-            add_dirs=self._execution_add_dirs(workspace),
-            env=execution_env,
-            plugins=self.plugins,
-            agents=self.agents,
-            mcp_servers=mcp_servers,
-            stderr=_cli_stderr_logger(workspace.tasks_dir, "primary"),
-        )
-        client = ClaudeSDKClient(options=options)
-        await client.connect()
-
         prompt = self._build_prompt(task_path=task_path, memory_path=workspace.memory_path)
         log_agent_event(
             workspace.tasks_dir,
@@ -597,117 +579,153 @@ class ClaudeAgent:
                 "message": (message.text or "").strip(),
             },
         )
-        stop_event = None
-        if inflight_stream is not None:
-            stop_event = asyncio.Event()
-        log_agent_event(
-            workspace.tasks_dir,
-            "query_start",
-            {
-                "session_id": session_id or "default",
-                "task_path": str(task_path),
-            },
-        )
-        summary = None
-        new_session_id = session_id
-        total_cost_usd = None
-        usage: dict[str, Any] | None = None
-        stop_reason: str | None = None
-        result_subtype: str | None = None
 
-        query_task: asyncio.Task[None] | None = None
-        try:
-            query_task = asyncio.create_task(
-                client.query(
-                    self._prompt_stream(
-                        prompt,
-                        inflight_stream=inflight_stream,
-                        stop_event=stop_event,
-                    ),
-                    session_id=session_id or "default",
-                )
+        async def _execute_once(resume_session_id: str | None) -> AgentResult:
+            if inflight_stream is not None:
+                inflight_stream.accepting = True
+            options = ClaudeAgentOptions(
+                allowed_tools=self.allowed_tools,
+                permission_mode=self.permission_mode,
+                system_prompt=self.system_prompt,
+                setting_sources=self.setting_sources,
+                model=settings.execution_model,
+                max_thinking_tokens=settings.execution_thinking_max_tokens(),
+                resume=resume_session_id or None,
+                cwd=workspace.root,
+                add_dirs=self._execution_add_dirs(workspace),
+                env=execution_env,
+                plugins=self.plugins,
+                agents=self.agents,
+                mcp_servers=mcp_servers,
+                stderr=_cli_stderr_logger(workspace.tasks_dir, "primary"),
             )
-            async for msg in client.receive_response():
-                log_agent_event(
-                    workspace.tasks_dir,
-                    "sdk_message",
-                    _sdk_message_log_data(msg),
-                )
-                _log_subagent_invocations(workspace.tasks_dir, msg)
-                if isinstance(msg, SystemMessage) and msg.subtype == "init":
-                    new_session_id = msg.data.get("session_id", new_session_id)
-                if isinstance(msg, ResultMessage):
-                    new_session_id = msg.session_id or new_session_id
-                    stop_reason = self._normalize_stop_reason(
-                        getattr(msg, "stop_reason", None)
-                    )
-                    result_subtype = self._normalize_result_subtype(
-                        getattr(msg, "subtype", None)
-                    )
-                    self._record_stop_reason_event(
-                        tasks_dir=workspace.tasks_dir,
-                        db=db,
-                        tenant_id=tenant_id,
-                        context="prepare_context",
-                        stop_reason=stop_reason,
-                        result_subtype=result_subtype,
-                        session_id=new_session_id,
-                        run_id=run_id,
-                        project_name=workspace.project_name,
-                    )
-                    summary = msg.result
-                    total_cost_usd = msg.total_cost_usd
-                    usage = msg.usage
-                    self._record_usage_event(
-                        tasks_dir=workspace.tasks_dir,
-                        db=db,
-                        tenant_id=tenant_id,
-                        context="prepare_context",
-                        total_cost_usd=total_cost_usd,
-                        usage=usage,
-                        session_id=new_session_id,
-                        run_id=run_id,
-                        project_name=workspace.project_name,
-                    )
-                    stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
-                    if stop_reason_error:
-                        raise RuntimeError(stop_reason_error)
-                    if stop_event is not None:
-                        stop_event.set()
-        finally:
-            if stop_event is not None:
-                stop_event.set()
-            if query_task is not None:
-                try:
-                    await asyncio.wait_for(query_task, timeout=5.0)
-                except asyncio.TimeoutError:
-                    query_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await query_task
-                except Exception:
-                    pass
+            client = ClaudeSDKClient(options=options)
+            await client.connect()
+
+            stop_event = None
+            if inflight_stream is not None:
+                stop_event = asyncio.Event()
             log_agent_event(
                 workspace.tasks_dir,
-                "run_end",
+                "query_start",
                 {
-                    "session_id": new_session_id,
-                    "summary": (summary or "")[:500],
-                    "total_cost_usd": total_cost_usd,
-                    "usage": usage,
-                    "stop_reason": stop_reason,
-                    "result_subtype": result_subtype,
+                    "session_id": resume_session_id or "default",
+                    "task_path": str(task_path),
+                    "resuming": bool(resume_session_id),
                 },
             )
-            await client.disconnect()
+            summary = None
+            new_session_id = resume_session_id
+            total_cost_usd = None
+            usage: dict[str, Any] | None = None
+            stop_reason: str | None = None
+            result_subtype: str | None = None
 
-        return AgentResult(
-            session_id=new_session_id,
-            summary=summary,
-            total_cost_usd=total_cost_usd,
-            usage=usage,
-            stop_reason=stop_reason,
-            result_subtype=result_subtype,
-        )
+            query_task: asyncio.Task[None] | None = None
+            try:
+                query_task = asyncio.create_task(
+                    client.query(
+                        self._prompt_stream(
+                            prompt,
+                            inflight_stream=inflight_stream,
+                            stop_event=stop_event,
+                        ),
+                        session_id=resume_session_id or "default",
+                    )
+                )
+                async for msg in client.receive_response():
+                    log_agent_event(
+                        workspace.tasks_dir,
+                        "sdk_message",
+                        _sdk_message_log_data(msg),
+                    )
+                    _log_subagent_invocations(workspace.tasks_dir, msg)
+                    if isinstance(msg, SystemMessage) and msg.subtype == "init":
+                        new_session_id = msg.data.get("session_id", new_session_id)
+                    if isinstance(msg, ResultMessage):
+                        new_session_id = msg.session_id or new_session_id
+                        stop_reason = self._normalize_stop_reason(
+                            getattr(msg, "stop_reason", None)
+                        )
+                        result_subtype = self._normalize_result_subtype(
+                            getattr(msg, "subtype", None)
+                        )
+                        self._record_stop_reason_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="prepare_context",
+                            stop_reason=stop_reason,
+                            result_subtype=result_subtype,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            project_name=workspace.project_name,
+                        )
+                        summary = msg.result
+                        total_cost_usd = msg.total_cost_usd
+                        usage = msg.usage
+                        self._record_usage_event(
+                            tasks_dir=workspace.tasks_dir,
+                            db=db,
+                            tenant_id=tenant_id,
+                            context="prepare_context",
+                            total_cost_usd=total_cost_usd,
+                            usage=usage,
+                            session_id=new_session_id,
+                            run_id=run_id,
+                            project_name=workspace.project_name,
+                        )
+                        stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
+                        if stop_reason_error:
+                            raise RuntimeError(stop_reason_error)
+                        if stop_event is not None:
+                            stop_event.set()
+            finally:
+                if stop_event is not None:
+                    stop_event.set()
+                if query_task is not None:
+                    try:
+                        await asyncio.wait_for(query_task, timeout=5.0)
+                    except asyncio.TimeoutError:
+                        query_task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await query_task
+                    except Exception:
+                        pass
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "run_end",
+                    {
+                        "session_id": new_session_id,
+                        "summary": (summary or "")[:500],
+                        "total_cost_usd": total_cost_usd,
+                        "usage": usage,
+                        "stop_reason": stop_reason,
+                        "result_subtype": result_subtype,
+                    },
+                )
+                await client.disconnect()
+
+            return AgentResult(
+                session_id=new_session_id,
+                summary=summary,
+                total_cost_usd=total_cost_usd,
+                usage=usage,
+                stop_reason=stop_reason,
+                result_subtype=result_subtype,
+            )
+
+        try:
+            return await _execute_once(session_id)
+        except Exception as exc:
+            if session_id and self._is_resume_error(exc):
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "execution_resume_fallback",
+                    {"error": str(exc), "stale_session_id": session_id},
+                )
+                return await _execute_once(None)
+            raise
 
     @observe(name="claude.send_interaction_message", ignore_input=True)
     async def send_interaction_message(
@@ -1627,18 +1645,38 @@ class ClaudeAgent:
         settings = Settings()
         interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
         planner_prompt = ClaudeAgent._load_prompt_file(settings.planner_prompt_path)
+        product_designer_prompt = ClaudeAgent._load_prompt_file(
+            settings.product_designer_prompt_path
+        )
+        software_engineer_prompt = ClaudeAgent._load_prompt_file(
+            settings.software_engineer_prompt_path
+        )
+        devops_engineer_prompt = ClaudeAgent._load_prompt_file(
+            settings.devops_engineer_prompt_path
+        )
         reviewer_prompt = ClaudeAgent._load_prompt_file(settings.reviewer_prompt_path)
         interaction_subagent_model = ClaudeAgent._agent_definition_model(
             settings.interaction_model
         )
         planner_subagent_model = interaction_subagent_model or "opus"
-        reviewer_subagent_model = ClaudeAgent._agent_definition_model(settings.execution_model) or "sonnet"
-        interaction_tools = [
+        execution_subagent_model: Literal["sonnet", "opus", "haiku"] = "sonnet"
+        reviewer_subagent_model: Literal["sonnet", "opus", "haiku"] = "opus"
+        default_skill_tools = [
             "Read",
             "Write",
             "Edit",
             "Grep",
             "Glob",
+            "Skill",
+        ]
+        engineering_tools = [
+            *default_skill_tools,
+            "Bash",
+            "WebSearch",
+            "WebFetch",
+        ]
+        interaction_tools = [
+            *default_skill_tools,
             f"mcp__{CHAT_SERVER_NAME}__check_for_status",
             f"mcp__{CHAT_SERVER_NAME}__should_send_message",
             f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
@@ -1657,14 +1695,50 @@ class ClaudeAgent:
                     "UI/copy tweaks (no build/deploy)."
                 ),
                 prompt=planner_prompt,
-                tools=[
-                    "Read",
-                    "Write",
-                    "Edit",
-                    "Grep",
-                    "Glob",
-                ],
+                tools=default_skill_tools,
                 model=planner_subagent_model,
+            ),
+            "product-designer": AgentDefinition(
+                description=(
+                    "Product designer subagent. Runs Gemini-driven UI/design work, applies design "
+                    "references, and logs design outputs for the execution agent."
+                ),
+                prompt=product_designer_prompt,
+                tools=[
+                    *engineering_tools,
+                    UNSPLASH_SEARCH_TOOL,
+                ],
+                model=execution_subagent_model,
+            ),
+            "software-engineer": AgentDefinition(
+                description=(
+                    "Software engineer subagent. Implements business logic with TDD, completes "
+                    "end-to-end wiring, and removes placeholders/mocks."
+                ),
+                prompt=software_engineer_prompt,
+                tools=[
+                    *engineering_tools,
+                    UNSPLASH_SEARCH_TOOL,
+                    f"mcp__{SUPABASE_SERVER_NAME}__provision_managed_backend",
+                    f"mcp__{SUPABASE_SERVER_NAME}__upgrade_managed_backend",
+                    f"mcp__{ClaudeAgent.SUPABASE_MCP_SERVER_NAME}__*",
+                ],
+                model=execution_subagent_model,
+            ),
+            "devops-engineer": AgentDefinition(
+                description=(
+                    "DevOps engineer subagent. Owns git hygiene, release packaging, build, "
+                    "deployment, and deployment recording."
+                ),
+                prompt=devops_engineer_prompt,
+                tools=[
+                    *engineering_tools,
+                    f"mcp__{GITHUB_SERVER_NAME}__prepare_repo",
+                    f"mcp__{CHAT_SERVER_NAME}__record_deploy",
+                    f"mcp__{CHAT_SERVER_NAME}__record_domain_quote",
+                    f"mcp__{CHAT_SERVER_NAME}__record_billing_status",
+                ],
+                model=execution_subagent_model,
             ),
             "interaction-helper": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
@@ -1684,6 +1758,7 @@ class ClaudeAgent:
                     "Write",
                     "Grep",
                     "Glob",
+                    "Skill",
                     "Bash",
                 ],
                 model=reviewer_subagent_model,

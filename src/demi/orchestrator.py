@@ -28,6 +28,9 @@ INTERACTION_SESSION_NAMESPACE = "interaction"
 INTERACTION_ROUTE_SESSION_KEY = "claude_route_session"
 INTERACTION_INSTRUCTION_SESSION_KEY = "claude_instruction_session"
 
+EXECUTION_SESSION_NAMESPACE = "execution"
+EXECUTION_SESSION_KEY_PREFIX = "claude_session:"
+
 
 @dataclass
 class InteractionRouteSession:
@@ -123,6 +126,40 @@ class Orchestrator:
                 self.db.finish_interaction_session(session.db_session_id, status=status)
             except Exception:
                 pass
+
+    def _get_execution_session_id(
+        self, tenant_id: int, project_name: str | None
+    ) -> str | None:
+        key = f"{EXECUTION_SESSION_KEY_PREFIX}{project_name or 'main'}"
+        try:
+            payload = self.db.get_tenant_kv(
+                int(tenant_id),
+                EXECUTION_SESSION_NAMESPACE,
+                key,
+            ) or {}
+        except Exception:
+            return None
+        value = str(payload.get("session_id") or "").strip()
+        return value or None
+
+    def _set_execution_session_id(
+        self,
+        tenant_id: int,
+        project_name: str | None,
+        session_id: str | None,
+    ) -> None:
+        key = f"{EXECUTION_SESSION_KEY_PREFIX}{project_name or 'main'}"
+        cleaned = str(session_id or "").strip()
+        payload = {"session_id": cleaned} if cleaned else None
+        try:
+            self.db.set_tenant_kv(
+                int(tenant_id),
+                EXECUTION_SESSION_NAMESPACE,
+                key,
+                payload,
+            )
+        except Exception:
+            pass
 
     def _open_interaction_session(
         self,
@@ -1091,7 +1128,7 @@ class Orchestrator:
             self.db.update_run_context(
                 run_id,
                 task_path=str(task_path_value),
-                session_id=getattr(tenant, "session_id", None),
+                session_id=self._get_execution_session_id(tenant.id, workspace.project_name),
             )
         except Exception:
             pass
@@ -1119,11 +1156,14 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=tenant.session_id,
+                session_id=self._get_execution_session_id(tenant.id, workspace.project_name),
                 run_id=run_id,
                 runtime_env=runtime_env,
             )
             if agent_result.session_id:
+                self._set_execution_session_id(
+                    tenant.id, workspace.project_name, agent_result.session_id
+                )
                 self.db.update_tenant_session(tenant.id, agent_result.session_id)
             self.db.add_run_usage(
                 run_id,
@@ -1551,6 +1591,9 @@ class Orchestrator:
             "recent_runs": recent_runs,
             "billing_status": billing_status,
             "billing_checked_at": billing_checked_at,
+            "execution_session_exists": bool(
+                self._get_execution_session_id(tenant.id, project_name)
+            ) if project_name else False,
         }
         path = workspace.tasks_dir / "interaction_context.json"
         try:
@@ -1975,11 +2018,13 @@ class Orchestrator:
         tenant: Any,
         project_name: str | None = None,
     ) -> None:
-        self.db.finish_running_runs(tenant.id, project_name, error="user_reset")
-        self.db.clear_pending_and_processing_messages(tenant.id, project_name)
-        self.db.clear_active_run(tenant.id, project_name)
-        self.db.cancel_run_inputs(tenant.id, project_name)
-        self._clear_inflight_stream(tenant.key, project_name)
+        active_project = project_name or workspace.project_name
+        self.db.finish_running_runs(tenant.id, active_project, error="user_reset")
+        self.db.clear_pending_and_processing_messages(tenant.id, active_project)
+        self.db.clear_active_run(tenant.id, active_project)
+        self.db.cancel_run_inputs(tenant.id, active_project)
+        self._clear_inflight_stream(tenant.key, active_project)
+        self._set_execution_session_id(tenant.id, active_project, None)
         self._clear_run_artifacts(workspace.tasks_dir)
         for name in (
             "inflight_updates.jsonl",
@@ -2489,19 +2534,20 @@ class Orchestrator:
         if tool_runs is not None:
             self.db.update_run_tool_runs(run_id, tool_runs)
         self.db.finish_run(run_id, status=status, error=error)
+        project_name = (
+            run["project_name"]
+            if hasattr(run, "keys") and "project_name" in run.keys()
+            else None
+        )
         session_id = payload.get("session_id")
         if session_id:
+            self._set_execution_session_id(tenant.id, project_name, session_id)
             self.db.update_tenant_session(tenant.id, session_id)
         message_id = run["message_id"] if hasattr(run, "keys") else run.get("message_id")
         if message_id:
             self.db.update_message_status(
                 int(message_id), "processed" if status == "completed" else "failed"
             )
-        project_name = (
-            run["project_name"]
-            if hasattr(run, "keys") and "project_name" in run.keys()
-            else None
-        )
         self.db.clear_active_run(tenant.id, project_name)
         self._clear_inflight_stream(tenant.key, project_name)
         return True

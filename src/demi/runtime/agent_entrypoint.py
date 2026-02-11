@@ -442,6 +442,27 @@ def _write_run_result_error(tasks_dir: Path, exc: Exception) -> None:
         return
 
 
+def _resolve_execution_session_id(
+    *,
+    db,
+    tenant_id: int,
+    project_name: str | None,
+    run_session_id: str | None,
+) -> str | None:
+    session_id = str(run_session_id or "").strip() or None
+    if session_id:
+        return session_id
+    if not tenant_id or db is None:
+        return None
+    exec_session_key = f"claude_session:{project_name or 'main'}"
+    try:
+        payload = db.get_tenant_kv(int(tenant_id), "execution", exec_session_key) or {}
+    except Exception:
+        return None
+    value = str(payload.get("session_id") or "").strip()
+    return value or None
+
+
 async def _run(run_id: int) -> int:
     settings = Settings()
     initialize_laminar(settings.lmnr_project_api_key)
@@ -521,7 +542,12 @@ async def _run(run_id: int) -> int:
 
         agent = ClaudeAgent()
         runtime_env = _load_runtime_env_from_process()
-        session_id = run_row.get("session_id") or getattr(tenant, "session_id", None)
+        session_id = _resolve_execution_session_id(
+            db=db,
+            tenant_id=tenant_id,
+            project_name=project_name,
+            run_session_id=run_row.get("session_id"),
+        )
 
         monitor = RunLeaseHeartbeat(
             db=db,

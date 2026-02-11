@@ -108,3 +108,55 @@ def test_pump_inflight_updates_filters_by_run_id_and_does_not_replay(tmp_path):
 
     assert first_values == ["current-run-update"]
     assert second_values == []
+
+
+class _SessionDb:
+    def __init__(self, payload=None):
+        self.payload = payload
+        self.calls: list[tuple[int, str, str]] = []
+
+    def get_tenant_kv(self, tenant_id: int, namespace: str, key: str):
+        self.calls.append((tenant_id, namespace, key))
+        return self.payload
+
+
+def test_resolve_execution_session_id_prefers_run_session_id():
+    db = _SessionDb(payload={"session_id": "project-session"})
+
+    session_id = agent_entrypoint._resolve_execution_session_id(
+        db=db,
+        tenant_id=123,
+        project_name="beta",
+        run_session_id="run-session",
+    )
+
+    assert session_id == "run-session"
+    assert db.calls == []
+
+
+def test_resolve_execution_session_id_uses_project_scoped_kv():
+    db = _SessionDb(payload={"session_id": "  beta-session  "})
+
+    session_id = agent_entrypoint._resolve_execution_session_id(
+        db=db,
+        tenant_id=123,
+        project_name="beta",
+        run_session_id=None,
+    )
+
+    assert session_id == "beta-session"
+    assert db.calls == [(123, "execution", "claude_session:beta")]
+
+
+def test_resolve_execution_session_id_returns_none_when_project_session_missing():
+    db = _SessionDb(payload=None)
+
+    session_id = agent_entrypoint._resolve_execution_session_id(
+        db=db,
+        tenant_id=123,
+        project_name="beta",
+        run_session_id=None,
+    )
+
+    assert session_id is None
+    assert db.calls == [(123, "execution", "claude_session:beta")]

@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
     planner_prompt_path: Path = Path("prompts/planner_agent.md")
+    product_designer_prompt_path: Path = Path("prompts/product_designer_agent.md")
+    software_engineer_prompt_path: Path = Path("prompts/software_engineer_agent.md")
+    devops_engineer_prompt_path: Path = Path("prompts/devops_engineer_agent.md")
     reviewer_prompt_path: Path = Path("prompts/reviewer_agent.md")
     interaction_agent_routing_prompt_path: Path | None = None
     # Legacy alias kept for backward compatibility.

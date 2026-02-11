@@ -199,6 +199,15 @@ Apply this order:
    - set `facts_only=true` and describe purpose briefly.
 8. For duplicate/no-op:
    - set `dedupe=true`, `should_run=false`.
+9. Execution agents maintain persistent sessions per project. When routing to a project
+   with an existing session, the execution agent resumes with full context of prior work.
+   - Prefer routing to the project that already has relevant context.
+   - When the user references prior work ("fix the bug from earlier", "update the header"),
+     route to the project where that work was done.
+   - `execution_session_exists` in `tasks/interaction_context.json` indicates whether the
+     target project has a persistent session the execution agent can resume.
+   - When briefing execution, include any relevant context about what changed since the
+     last run so the agent can orient quickly.
 
 ## Few-Shot Routing Examples
 Example A: first billing pass (no user message yet)
