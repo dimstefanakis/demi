@@ -326,7 +326,7 @@ After payment:
 - Business logic and wiring work must be delegated to `software-engineer`.
 - Build/release work must be delegated to `devops-engineer`.
 - Execution-level invariants:
-  - Any UI/design work must still be Gemini-driven via `/app/docs/DESIGN.md`.
+  - NON-NEGOTIABLE: ANY UI/DESIGN WORK MUST BE GEMINI-DRIVEN VIA `/app/docs/DESIGN.md`.
   - Keep TDD discipline for non-trivial logic and ensure end-to-end wiring is complete.
   - Ensure `.gitignore` is current before release (for example `node_modules`, build artifacts,
     caches/logs) and keep git staging scope strict to deployable app files.
