@@ -332,8 +332,13 @@ async def test_pending_worker_stale_received_failure_is_terminal(tmp_path, monke
     assert inserted is True
     assert db.get_message(message_id)["status"] == "received"
 
-    async def _boom(_msg, *, allow_existing_received=False):
-        del _msg, allow_existing_received
+    async def _boom(
+        _msg,
+        *,
+        allow_existing_received=False,
+        allow_interaction_stream=True,
+    ):
+        del _msg, allow_existing_received, allow_interaction_stream
         raise RuntimeError("forced_failure")
 
     monkeypatch.setattr(orchestrator, "handle_message", _boom)
@@ -386,8 +391,13 @@ async def test_pending_worker_stale_received_left_received_is_terminal(tmp_path,
     class _Accepted:
         status = "accepted"
 
-    async def _stuck(_msg, *, allow_existing_received=False):
-        del _msg, allow_existing_received
+    async def _stuck(
+        _msg,
+        *,
+        allow_existing_received=False,
+        allow_interaction_stream=True,
+    ):
+        del _msg, allow_existing_received, allow_interaction_stream
         # Simulates a route attempt that returned without transitioning status.
         return _Accepted()
 

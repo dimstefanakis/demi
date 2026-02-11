@@ -407,6 +407,7 @@ class Orchestrator:
         msg: NormalizedMessage,
         *,
         allow_existing_received: bool = False,
+        allow_interaction_stream: bool = True,
     ) -> OrchestratorResult:
         tenant = self.db.get_or_create_tenant(msg.provider, msg.tenant_external_id)
 
@@ -436,7 +437,7 @@ class Orchestrator:
             if recovered is not None:
                 msg = recovered
         existing_session = self._interaction_session_for(tenant.id)
-        if existing_session is not None and existing_session.stream.accepting:
+        if allow_interaction_stream and existing_session is not None and existing_session.stream.accepting:
             streamed = await self._stream_into_interaction_session(
                 session=existing_session,
                 message_id=int(message_id),
@@ -462,7 +463,11 @@ class Orchestrator:
                 if status and status != "received":
                     return OrchestratorResult(status="duplicate", detail="message already handled")
             existing_session = self._interaction_session_for(tenant.id)
-            if existing_session is not None and existing_session.stream.accepting:
+            if (
+                allow_interaction_stream
+                and existing_session is not None
+                and existing_session.stream.accepting
+            ):
                 streamed = await self._stream_into_interaction_session(
                     session=existing_session,
                     message_id=int(message_id),

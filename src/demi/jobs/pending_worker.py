@@ -176,7 +176,9 @@ class PendingWorker:
                 continue
             try:
                 result = await self.orchestrator.handle_message(
-                    msg, allow_existing_received=True
+                    msg,
+                    allow_existing_received=True,
+                    allow_interaction_stream=False,
                 )
                 # If stale-recovery returns while the row is still "received",
                 # fail it to avoid repeated high-cost recovery loops.
