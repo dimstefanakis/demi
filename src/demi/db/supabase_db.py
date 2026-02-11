@@ -487,6 +487,22 @@ class SupabaseDatabase:
         )
         return list(data or [])
 
+    def fetch_stale_received_messages(
+        self,
+        *,
+        before: datetime,
+        limit: int = 25,
+    ) -> list[dict[str, Any]]:
+        data = self._execute(
+            self._table("messages")
+            .select("*")
+            .eq("status", "received")
+            .lt("received_at", before.isoformat())
+            .order("received_at", desc=True)
+            .limit(limit)
+        )
+        return list(data or [])
+
     def fetch_processing_message_groups(self, limit: int = 25) -> list[dict[str, Any]]:
         data = self._execute(
             self._table("processing_message_groups")

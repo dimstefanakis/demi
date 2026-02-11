@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import timedelta
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -51,6 +52,7 @@ class PendingWorker:
         self._running = True
         idle_streak = 0
         next_active_check = 0.0
+        next_received_recovery_check = 0.0
         try:
             while self._running:
                 groups = await self._db_call(
@@ -62,6 +64,12 @@ class PendingWorker:
                     if now >= next_active_check:
                         await self._check_active_runs()
                         next_active_check = now + max(
+                            self.config.poll_interval,
+                            self.config.active_check_interval_seconds,
+                        )
+                    if now >= next_received_recovery_check:
+                        await self._recover_stale_received_messages()
+                        next_received_recovery_check = now + max(
                             self.config.poll_interval,
                             self.config.active_check_interval_seconds,
                         )
@@ -140,3 +148,28 @@ class PendingWorker:
                 await self._db_call(self.db.clear_active_run, tenant.id, project_name)
                 continue
             await self._resolve_inflight_run(tenant, project_name, run_row)
+
+    async def _recover_stale_received_messages(self) -> None:
+        grace_seconds = max(0.0, float(self.config.processing_grace_seconds))
+        cutoff = self.orchestrator._now() - timedelta(seconds=grace_seconds)
+        rows = await self._db_call(
+            self.db.fetch_stale_received_messages,
+            before=cutoff,
+            limit=self.config.batch_size,
+        )
+        if not rows:
+            return
+        for row in rows:
+            tenant_id = row.get("tenant_id")
+            if tenant_id is None:
+                continue
+            tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
+            if tenant is None:
+                continue
+            msg = self.orchestrator._message_from_message_row(tenant, row)
+            if msg is None:
+                continue
+            try:
+                await self.orchestrator.handle_message(msg, allow_existing_received=True)
+            except Exception:
+                continue

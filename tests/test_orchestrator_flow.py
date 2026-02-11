@@ -220,6 +220,44 @@ async def test_orchestrator_passes_github_runtime_env(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_can_recover_existing_received_message(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="recover-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Please continue",
+        images=[],
+        raw={},
+    )
+    message_id, inserted = db.record_message(
+        db.get_or_create_tenant("telegram", tenant_external_id).id,
+        msg,
+    )
+    assert inserted is True
+
+    duplicate = await orchestrator.handle_message(msg)
+    assert duplicate.status == "duplicate"
+    assert db.get_message(message_id)["status"] == "received"
+
+    recovered = await orchestrator.handle_message(msg, allow_existing_received=True)
+    assert recovered.status == "accepted"
+    assert db.get_message(message_id)["status"] == "processed"
+    assert agent.calls
+
+
+@pytest.mark.asyncio
 async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypatch):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")

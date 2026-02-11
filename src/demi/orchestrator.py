@@ -402,12 +402,39 @@ class Orchestrator:
             project_name=latest.project_name,
         )
 
-    async def handle_message(self, msg: NormalizedMessage) -> OrchestratorResult:
+    async def handle_message(
+        self,
+        msg: NormalizedMessage,
+        *,
+        allow_existing_received: bool = False,
+    ) -> OrchestratorResult:
         tenant = self.db.get_or_create_tenant(msg.provider, msg.tenant_external_id)
 
         message_id, inserted = self.db.record_message(tenant.id, msg)
         if not inserted:
-            return OrchestratorResult(status="duplicate", detail="message already processed")
+            if not allow_existing_received:
+                return OrchestratorResult(status="duplicate", detail="message already processed")
+            existing_row = None
+            try:
+                existing_row = self.db.get_message(int(message_id))
+            except Exception:
+                existing_row = None
+            existing_status = ""
+            if existing_row is not None:
+                try:
+                    existing_status = str(
+                        existing_row.get("status")
+                        if hasattr(existing_row, "get")
+                        else existing_row["status"]
+                        or ""
+                    ).strip().lower()
+                except Exception:
+                    existing_status = ""
+            if existing_status != "received":
+                return OrchestratorResult(status="duplicate", detail="message already handled")
+            recovered = self._message_from_message_row(tenant, existing_row)
+            if recovered is not None:
+                msg = recovered
         existing_session = self._interaction_session_for(tenant.id)
         if existing_session is not None and existing_session.stream.accepting:
             streamed = await self._stream_into_interaction_session(

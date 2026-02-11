@@ -13,6 +13,46 @@ class FakeAgent:
     def __init__(self):
         self.calls = []
 
+    async def route_interaction(
+        self,
+        *,
+        workspace,
+        message,
+        messenger=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        message_id=None,
+        billing_checked=False,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        del (
+            message,
+            messenger,
+            tenant_id,
+            db,
+            payments,
+            session_id,
+            provider,
+            tenant_external_id,
+            message_id,
+            billing_checked,
+            asset_paths,
+            execution_bridge,
+        )
+        return {
+            "ok": True,
+            "project_name": workspace.project_name,
+            "should_run": True,
+            "queue_run": False,
+            "dedupe": False,
+            "ask_questions": [],
+        }
+
     async def prepare_context(
         self,
         workspace,
@@ -211,6 +251,52 @@ async def test_pending_worker_drains_queue(tmp_path):
     groups = db.fetch_queued_run_input_groups(limit=5)
     assert groups
     await worker._handle_group(groups[0])
+
+    row = db.get_message(message_id)
+    assert row is not None
+    assert row["status"] == "processed"
+    assert agent.calls
+
+
+@pytest.mark.asyncio
+async def test_pending_worker_recovers_stale_received_messages(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    stale_received_at = datetime.now(tz=timezone.utc) - timedelta(seconds=120)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stale-received-1",
+        tenant_external_id=tenant.external_id,
+        received_at=stale_received_at,
+        text="Recover me",
+        images=[],
+        raw={},
+        project_name="main",
+    )
+    message_id, inserted = db.record_message(tenant.id, msg)
+    assert inserted is True
+    assert db.get_message(message_id)["status"] == "received"
+
+    worker = PendingWorker(
+        db=db,
+        orchestrator=orchestrator,
+        config=PendingWorkerConfig(
+            poll_interval=0.01,
+            batch_size=5,
+            processing_grace_seconds=30,
+        ),
+    )
+
+    await worker._recover_stale_received_messages()
 
     row = db.get_message(message_id)
     assert row is not None
