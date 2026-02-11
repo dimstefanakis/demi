@@ -4,6 +4,7 @@ import asyncio
 import pytest
 from demi.agent.claude import ClaudeAgent, _sdk_message_log_data
 from demi.agent.inflight import InflightTextStream
+from demi.config import Settings
 
 
 def test_default_allowed_tools():
@@ -34,6 +35,20 @@ def test_default_subagents_configured():
     assert "reviewer" in agent.agents
     tools = agent.agents["interaction-helper"].tools or []
     assert "mcp__demi-chat__send_payment_link" in tools
+
+
+def test_subagents_do_not_have_task_tool():
+    agent = ClaudeAgent()
+    for name, definition in agent.agents.items():
+        tools = definition.tools or []
+        assert "Task" not in tools, f"subagent {name} should not include Task in its tools"
+
+
+def test_execution_prompt_explicitly_requires_planner_and_reviewer():
+    settings = Settings()
+    prompt = settings.claude_prompt_path.read_text(encoding="utf-8").lower()
+    assert "use the planner agent" in prompt
+    assert "use the reviewer agent" in prompt
 
 
 def test_sdk_message_log_data_does_not_include_repr():

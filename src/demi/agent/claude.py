@@ -12,7 +12,7 @@ from contextlib import suppress
 import asyncio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
-from claude_agent_sdk.types import ResultMessage, SystemMessage
+from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from demi.agent.chat_tools import (
     CHAT_SERVER_NAME,
@@ -78,6 +78,32 @@ def _sdk_message_log_data(msg: Any) -> dict[str, Any]:
         "class": msg.__class__.__name__,
         "subtype": getattr(msg, "subtype", None),
     }
+
+
+def _log_subagent_invocations(tasks_dir: Path, msg: Any) -> None:
+    """Emit lightweight telemetry when Claude invokes a subagent via the Task tool.
+
+    Claude Agent SDK subagents are invoked through ToolUse blocks with name "Task".
+    We log only the subagent type (no inputs) to avoid accidentally persisting secrets.
+    """
+
+    if not isinstance(msg, AssistantMessage):
+        return
+    for block in msg.content or []:
+        if getattr(block, "name", None) != "Task":
+            continue
+        payload = getattr(block, "input", None)
+        subagent_type = None
+        if isinstance(payload, dict):
+            subagent_type = payload.get("subagent_type") or payload.get("subagentType")
+        try:
+            log_agent_event(
+                tasks_dir,
+                "subagent_invoked",
+                {"subagent_type": str(subagent_type or "unknown")},
+            )
+        except Exception:
+            pass
 
 
 def _cli_stderr_logger(tasks_dir: Path, tag: str) -> Callable[[str], None]:
@@ -591,6 +617,7 @@ class ClaudeAgent:
                     "sdk_message",
                     _sdk_message_log_data(msg),
                 )
+                _log_subagent_invocations(workspace.tasks_dir, msg)
                 if isinstance(msg, SystemMessage) and msg.subtype == "init":
                     new_session_id = msg.data.get("session_id", new_session_id)
                 if isinstance(msg, ResultMessage):
@@ -772,6 +799,7 @@ class ClaudeAgent:
                     session_id=resume_session_id or "interaction",
                 )
                 async for msg in client.receive_response():
+                    _log_subagent_invocations(workspace.tasks_dir, msg)
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -962,6 +990,7 @@ class ClaudeAgent:
                     )
                 )
                 async for msg in client.receive_response():
+                    _log_subagent_invocations(workspace.tasks_dir, msg)
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -1213,6 +1242,7 @@ class ClaudeAgent:
                     session_id=resume_session_id or "interaction",
                 )
                 async for msg in client.receive_response():
+                    _log_subagent_invocations(workspace.tasks_dir, msg)
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
                     if isinstance(msg, ResultMessage):
@@ -1602,8 +1632,9 @@ class ClaudeAgent:
         return {
             "planner": AgentDefinition(
                 description=(
-                    "Creates/updates a concrete PRD + acceptance criteria + test plan for the "
-                    "current user request. Writes artifacts to tasks/ (no build/deploy)."
+                    "Planner subagent. Always run first to write tasks/prd.md + tasks/test_plan.md "
+                    "for the latest request. Handles new builds, bugfixes, refactors, and small "
+                    "UI/copy tweaks (no build/deploy)."
                 ),
                 prompt=planner_prompt,
                 tools=[
@@ -1623,8 +1654,9 @@ class ClaudeAgent:
             ),
             "reviewer": AgentDefinition(
                 description=(
-                    "Reviews implementation vs PRD, runs tests, and writes a short review report "
-                    "to tasks/ (no code changes)."
+                    "Quality gate subagent. Always run last: runs tests, audits vs PRD, verifies "
+                    "wiring, and writes tasks/review.md. Reviews the actual code delta against "
+                    "tasks/prd.md (no code changes)."
                 ),
                 prompt=reviewer_prompt,
                 tools=[

@@ -129,10 +129,12 @@ Rules:
 ## Core Run Lifecycle
 
 - Read the task brief and memory file first.
-- Planning (required): before implementing, run the `planner` subagent (via `Task`) to create/refresh:
+- Planning (required): at the start of every run, use the planner agent (via the `Task` tool) to
+  (re)generate:
   - `tasks/prd.md`
   - `tasks/test_plan.md`
-    If the PRD already exists and clearly matches the current request, you may skip regeneration.
+  Do this even if these files already exist. Do not proceed to implementation until they are updated
+  for the latest request.
 - Always read `tasks/chat_history.md` before any retry.
   If the last assistant message says you’re escalating or blocked, do NOT retry.
 - If `tasks/request_status.md` exists, read it.
@@ -174,9 +176,11 @@ Rules:
   - exact next action.
 - Use absolute dates/times and explicit identifiers. Avoid vague references ("that", "earlier", "soon").
 - If context is ambiguous after compaction, read source files/logs again instead of guessing.
-- Review (required): before your final `send_message` update seed, run the `reviewer` subagent (via `Task`).
-  Address critical issues it flags, ensure tests pass, and make sure any required user actions are
-  captured in `<needs_from_user>`.
+- Review (required): before your final `send_message` update seed, use the reviewer agent (via the
+  `Task` tool) to run tests and write `tasks/review.md`.
+  Treat it as a hard quality gate: if it returns NEEDS-FIX, fix issues and rerun the reviewer until
+  PASS (or until you are blocked and can state why).
+  Ensure any required user actions are captured in `<needs_from_user>`.
 
 ### Memory Updates
 
