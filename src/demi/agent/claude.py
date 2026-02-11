@@ -339,7 +339,66 @@ class ClaudeAgent:
         text = str(exc).strip().lower()
         if not text:
             return False
-        return "agent_result_subtype_error_during_execution" in text
+        if "agent_result_subtype_error_during_execution" in text:
+            return True
+        if "agent_result_summary_external_api_error" in text:
+            return True
+        # Claude SDK can surface opaque process exits during connect/initialize
+        # with no stderr details. Retry once on a fresh session.
+        if (
+            "command failed with exit code 1" in text
+            and "check stderr output for details" in text
+        ):
+            return True
+        return False
+
+    @staticmethod
+    def _usage_looks_empty(usage: dict[str, Any] | None) -> bool:
+        if not isinstance(usage, dict):
+            return False
+        has_metric = False
+        for key in (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        ):
+            if key not in usage:
+                continue
+            has_metric = True
+            value = usage.get(key)
+            try:
+                if float(value or 0.0) != 0.0:
+                    return False
+            except (TypeError, ValueError):
+                return False
+        return has_metric
+
+    @classmethod
+    def _execution_summary_error(
+        cls,
+        *,
+        summary: str | None,
+        total_cost_usd: float | None,
+        usage: dict[str, Any] | None,
+        result_subtype: str | None,
+    ) -> str | None:
+        if result_subtype and result_subtype.startswith("error_"):
+            return None
+        text = str(summary or "").strip().lower()
+        if not text:
+            return None
+        # SDK sometimes returns transport/auth failures as a "success" result text.
+        if not text.startswith("api error:"):
+            return None
+        cost_is_zero = False
+        try:
+            cost_is_zero = float(total_cost_usd or 0.0) == 0.0
+        except (TypeError, ValueError):
+            cost_is_zero = False
+        if cost_is_zero or cls._usage_looks_empty(usage):
+            return "agent_result_summary_external_api_error"
+        return None
 
     @staticmethod
     def _invalid_interaction_output_signature(raw: str | None) -> str:
@@ -692,6 +751,25 @@ class ClaudeAgent:
                             run_id=run_id,
                             project_name=workspace.project_name,
                         )
+                        summary_error = self._execution_summary_error(
+                            summary=summary,
+                            total_cost_usd=total_cost_usd,
+                            usage=usage,
+                            result_subtype=result_subtype,
+                        )
+                        if summary_error:
+                            log_agent_event(
+                                workspace.tasks_dir,
+                                "execution_summary_error",
+                                {
+                                    "error": summary_error,
+                                    "summary": (summary or "")[:500],
+                                    "session_id": new_session_id,
+                                    "run_id": run_id,
+                                    "project_name": workspace.project_name,
+                                },
+                            )
+                            raise RuntimeError(summary_error)
                         stop_reason_error = self._stop_reason_error(stop_reason, result_subtype)
                         if stop_reason_error:
                             raise RuntimeError(stop_reason_error)

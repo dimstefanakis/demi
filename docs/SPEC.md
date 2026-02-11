@@ -371,6 +371,9 @@ Flow:
 5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
 6. If execution returns result subtype `error_during_execution`, execution is retried once with a fresh
    SDK session before surfacing the failure.
+7. Execution also retries once on opaque SDK process exits (`ProcessError` with generic
+   "check stderr output for details" text) and treats zero-usage `API Error:` summaries as failures
+   rather than successful completions.
 
 ---
 
@@ -485,6 +488,8 @@ Run selection when streaming to execution:
     - `run_result.json` includes Claude SDK stop metadata (`stop_reason`, `result_subtype`).
     - Terminal stop reasons (`end_turn`, `stop_sequence`) are treated as successful completion unless
       `result_subtype` indicates an SDK error.
+    - Zero-usage `API Error:` execution summaries are classified as external transport/auth failures
+      and fail the run (instead of being marked completed).
     - Non-terminal execution stop reasons (for example `max_tokens`, `refusal`, `model_context_window_exceeded`)
       fail the run instead of being treated as successful completion.
 14. Any queued `run_inputs` are drained into the next run.

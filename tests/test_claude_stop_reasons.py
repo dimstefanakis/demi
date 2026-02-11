@@ -484,3 +484,171 @@ async def test_prepare_context_retries_once_on_error_during_execution(tmp_path, 
     assert result.session_id == "session-recovered"
     assert result.result_subtype == "success"
     assert capture["resume_options"] == ["session-stale", None]
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_retries_once_on_opaque_process_error(tmp_path, monkeypatch):
+    capture: dict[str, list] = {
+        "resume_options": [],
+    }
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "ok"
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "session-fresh"
+
+    class FakeClient:
+        connect_calls = 0
+
+        def __init__(self, options):
+            self.options = options
+            capture["resume_options"].append(options.resume)
+
+        async def connect(self):
+            FakeClient.connect_calls += 1
+            if FakeClient.connect_calls == 1:
+                raise RuntimeError(
+                    "Command failed with exit code 1 (exit code: 1)\n"
+                    "Error output: Check stderr output for details"
+                )
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for _ in prompt_stream:
+                pass
+            return None
+
+        async def receive_response(self):
+            yield FakeSystemMessage("init", {"session_id": "session-fresh"})
+            yield FakeResultMessage()
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.write_task("# Task\n\nDo work\n")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="retry-opaque-process-error-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a site",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    result = await agent.prepare_context(
+        workspace=workspace,
+        task_path=task_path,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+        run_id=889,
+        session_id="session-stale",
+    )
+
+    assert result.session_id == "session-fresh"
+    assert result.result_subtype == "success"
+    assert capture["resume_options"] == ["session-stale", None]
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_fails_on_zero_usage_api_error_summary(tmp_path, monkeypatch):
+    capture: dict[str, list] = {
+        "resume_options": [],
+    }
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "API Error: Unable to connect to API (ECONNRESET)"
+            self.total_cost_usd = 0.0
+            self.usage = {
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_creation_input_tokens": 0,
+                "cache_read_input_tokens": 0,
+            }
+            self.session_id = "session-zero-usage"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            capture["resume_options"].append(options.resume)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for _ in prompt_stream:
+                pass
+            return None
+
+        async def receive_response(self):
+            yield FakeSystemMessage("init", {"session_id": "session-zero-usage"})
+            yield FakeResultMessage()
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.write_task("# Task\n\nDo work\n")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="retry-zero-usage-api-error-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a site",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    with pytest.raises(RuntimeError, match="agent_result_summary_external_api_error"):
+        await agent.prepare_context(
+            workspace=workspace,
+            task_path=task_path,
+            message=message,
+            messenger=DummyMessenger(),
+            tenant_id=tenant.id,
+            db=db,
+            run_id=890,
+            session_id="session-stale",
+        )
+
+    assert capture["resume_options"] == ["session-stale", None]
