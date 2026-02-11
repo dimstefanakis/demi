@@ -92,6 +92,7 @@ class Settings(BaseSettings):
     claude_api_key: str | None = None
     gemini_api_key: str | None = None
     google_api_key: str | None = None
+    lmnr_project_api_key: str | None = None
 
     events_signing_secret: str | None = None
     events_require_signature: bool = True

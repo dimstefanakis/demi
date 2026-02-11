@@ -105,6 +105,7 @@ Background workers (poll main DB):
 - API: FastAPI (`src/demi/app.py`)
 - Orchestration: Python (`src/demi/orchestrator.py`)
 - Agent runtime: Claude Agent SDK (`claude_agent_sdk`) with optional Docker isolation
+- Observability: Laminar (`lmnr[claude-agent-sdk]`) for Claude Agent SDK traces
 - Web data: Firecrawl CLI (optional; scrape/search/crawl/map)
 - Design: Gemini CLI driven by `docs/DESIGN.md` template (runtime path `/app/docs/DESIGN.md`), editing app files directly (auto-edit mode)
 - Deploy: Vercel CLI
@@ -171,6 +172,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - GitHub App: `GITHUB_ORG`, `GITHUB_APP_*`
 - Chrome DevTools MCP: `CHROME_DEVTOOLS_MCP_*`
 - Admin API: `ADMIN_API_TOKEN` (required for `/admin/runs/:id/cancel`)
+- Laminar tracing: `LMNR_PROJECT_API_KEY` (enables optional Claude Agent SDK tracing)
 
 **Agent runtime mode**
 - `AGENT_RUNTIME=local` (default) runs Claude in-process
@@ -397,6 +399,12 @@ happened in Supabase dashboards.
 - `tenant_events` (`event_type='agent_usage'`)
 - Claude Agent SDK usage/cost telemetry persisted per turn.
 - Payload fields include `context`, `total_cost_usd`, raw `usage`, and run/message metadata when available.
+
+- Laminar traces (optional)
+- When `LMNR_PROJECT_API_KEY` is configured, API/worker/runtime entrypoints initialize Laminar once.
+- `ClaudeAgent` wraps `prepare_context`, `run_interaction_agent`, `send_interaction_message`,
+  and `send_interaction_instruction` with `@observe(...)` parent spans so each Claude SDK turn
+  is visible in Laminar trace views (including subagent/tool activity captured by the integration).
 
 Execution runtime consumption:
 - Agent runtime claims `execution_stream_inputs.status='pending'` for its `run_id`,

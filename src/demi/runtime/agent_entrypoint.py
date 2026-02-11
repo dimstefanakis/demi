@@ -21,6 +21,7 @@ from demi.db.factory import build_database
 from demi.messaging.file import FileMessenger
 from demi.messaging.telegram import TelegramClient, TelegramConfig, TelegramUpdateParser
 from demi.models import NormalizedMessage
+from demi.observability import initialize_laminar
 from demi.workspace.core import WorkspaceManager
 
 logger = logging.getLogger(__name__)
@@ -443,6 +444,7 @@ def _write_run_result_error(tasks_dir: Path, exc: Exception) -> None:
 
 async def _run(run_id: int) -> int:
     settings = Settings()
+    initialize_laminar(settings.lmnr_project_api_key)
     tasks_dir: Path | None = None
     try:
         design_prompt_path = settings.resolved_design_prompt_path()

@@ -14,6 +14,7 @@ from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.messaging.telegram import TelegramClient, TelegramConfig
+from demi.observability import initialize_laminar
 from demi.orchestrator import Orchestrator
 from demi.payments.stripe import StripeClient, build_stripe_config
 from demi.runtime.docker_agent import DockerAgent, load_env_file_values
@@ -23,6 +24,7 @@ from demi.workspace.core import WorkspaceManager
 
 async def _run_workers() -> None:
     settings = Settings()
+    initialize_laminar(settings.lmnr_project_api_key)
     db = build_database(settings)
     db.init()
 

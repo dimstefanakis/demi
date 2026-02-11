@@ -40,6 +40,7 @@ from demi.agent.tool_logging import log_agent_event
 from demi.config import Settings
 from demi.agent.inflight import InflightTextStream
 from demi.models import NormalizedMessage
+from demi.observability import observe
 from demi.runtime.tenant_tooling import bootstrap_tenant_tooling
 from demi.workspace.core import Workspace
 
@@ -481,6 +482,7 @@ class ClaudeAgent:
             dirs.append(current)
         return dirs
 
+    @observe(name="claude.prepare_context", ignore_input=True)
     async def prepare_context(
         self,
         workspace: Workspace,
@@ -707,6 +709,7 @@ class ClaudeAgent:
             result_subtype=result_subtype,
         )
 
+    @observe(name="claude.send_interaction_message", ignore_input=True)
     async def send_interaction_message(
         self,
         workspace: Workspace,
@@ -865,6 +868,7 @@ class ClaudeAgent:
                 return await _run_once(None)
             raise
 
+    @observe(name="claude.run_interaction_agent", ignore_input=True)
     async def run_interaction_agent(
         self,
         *,
@@ -1159,6 +1163,7 @@ class ClaudeAgent:
             inflight_stream=inflight_stream,
         )
 
+    @observe(name="claude.send_interaction_instruction", ignore_input=True)
     async def send_interaction_instruction(
         self,
         workspace: Workspace,

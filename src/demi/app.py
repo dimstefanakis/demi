@@ -23,6 +23,7 @@ from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
+from demi.observability import initialize_laminar
 from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
 from demi.workspace.core import WorkspaceManager
@@ -30,6 +31,7 @@ from demi.workspace.core import WorkspaceManager
 
 def create_app() -> FastAPI:
     settings = Settings()
+    initialize_laminar(settings.lmnr_project_api_key)
     db = build_database(settings)
     db.init()
     logger = logging.getLogger("demi.app")
