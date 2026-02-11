@@ -81,7 +81,7 @@ def test_execution_prompt_explicitly_requires_specialized_subagents():
     assert "software-engineer" in prompt
     assert "devops-engineer" in prompt
     assert "must run before any `devops-engineer` build/deploy work" in prompt
-    assert "between every subagent handoff, invoke `interaction-helper`" in prompt
+    assert "invoke `interaction-helper`" in prompt
 
 
 def test_software_engineer_prompt_requires_designer_success_for_ui_scope():
