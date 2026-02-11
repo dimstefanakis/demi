@@ -371,6 +371,9 @@ Flow:
 5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
 6. If execution returns result subtype `error_during_execution`, execution is retried once with a fresh
    SDK session before surfacing the failure.
+7. Execution session IDs are only persisted when the run reports usage/cost activity (non-zero token/cost signal).
+   Zero-activity execution outcomes are treated as failed transport/runtime outcomes and clear stored execution
+   session state to avoid resume loops on poisoned sessions.
 
 ---
 
@@ -485,6 +488,8 @@ Run selection when streaming to execution:
     - `run_result.json` includes Claude SDK stop metadata (`stop_reason`, `result_subtype`).
     - Terminal stop reasons (`end_turn`, `stop_sequence`) are treated as successful completion unless
       `result_subtype` indicates an SDK error.
+    - Execution outcomes that provide usage/cost fields but report zero activity are marked failed
+      (`agent_result_no_usage_activity`) instead of successful completion.
     - Non-terminal execution stop reasons (for example `max_tokens`, `refusal`, `model_context_window_exceeded`)
       fail the run instead of being treated as successful completion.
 14. Any queued `run_inputs` are drained into the next run.

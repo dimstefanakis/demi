@@ -1194,6 +1194,11 @@ class Orchestrator:
                 run_id=run_id,
                 runtime_env=runtime_env,
             )
+            result_total_cost = getattr(agent_result, "total_cost_usd", None)
+            result_usage = getattr(agent_result, "usage", None)
+            has_usage_signal = result_total_cost is not None or result_usage is not None
+            if has_usage_signal and not self._usage_has_activity(result_total_cost, result_usage):
+                raise RuntimeError("agent_result_no_usage_activity")
             if agent_result.session_id:
                 self._set_execution_session_id(
                     tenant.id, workspace.project_name, agent_result.session_id
@@ -1201,8 +1206,8 @@ class Orchestrator:
                 self.db.update_tenant_session(tenant.id, agent_result.session_id)
             self.db.add_run_usage(
                 run_id,
-                total_cost_usd=getattr(agent_result, "total_cost_usd", None),
-                usage=getattr(agent_result, "usage", None),
+                total_cost_usd=result_total_cost,
+                usage=result_usage,
                 usage_key="primary",
             )
             self.db.update_run_result_summary(run_id, getattr(agent_result, "summary", None))
@@ -1229,6 +1234,12 @@ class Orchestrator:
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
             retry_run_inputs = bool(run_input_ids)
+            if not self._primary_usage_recorded(run_id, None, None):
+                self._set_execution_session_id(tenant.id, workspace.project_name, None)
+                try:
+                    self.db.update_tenant_session(tenant.id, "")
+                except Exception:
+                    pass
             self.db.finish_run(run_id, status="failed", error=str(exc))
             if message_ids:
                 self.db.update_message_statuses(message_ids, "failed")
@@ -2530,6 +2541,38 @@ class Orchestrator:
                 return True
         return False
 
+    @staticmethod
+    def _numeric_usage_value(value: Any) -> float:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if numeric > 0:
+            return numeric
+        return 0.0
+
+    @classmethod
+    def _usage_has_activity(cls, total_cost: Any, usage: Any) -> bool:
+        if cls._numeric_usage_value(total_cost) > 0:
+            return True
+        if not isinstance(usage, dict):
+            return False
+        token_keys = (
+            "input_tokens",
+            "output_tokens",
+            "cache_creation_input_tokens",
+            "cache_read_input_tokens",
+        )
+        for key in token_keys:
+            if cls._numeric_usage_value(usage.get(key)) > 0:
+                return True
+        cache_creation = usage.get("cache_creation")
+        if isinstance(cache_creation, dict):
+            for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
+                if cls._numeric_usage_value(cache_creation.get(key)) > 0:
+                    return True
+        return False
+
     def _reconcile_inflight_run(self, tenant: Any, run: Any, workspace: Workspace) -> bool:
         result_path = workspace.tasks_dir / "run_result.json"
         if not result_path.exists():
@@ -2580,6 +2623,11 @@ class Orchestrator:
         usage = payload.get("usage")
         summary = payload.get("summary")
         tool_summary = payload.get("tool_summary")
+        has_usage_signal = total_cost is not None or usage is not None
+        has_usage_activity = self._usage_has_activity(total_cost, usage)
+        if not error and has_usage_signal and not has_usage_activity:
+            error = "agent_result_no_usage_activity"
+            status = "failed"
         if (total_cost is not None or usage is not None) and not self._primary_usage_recorded(
             run_id, total_cost, usage
         ):
@@ -2603,9 +2651,15 @@ class Orchestrator:
             else None
         )
         session_id = payload.get("session_id")
-        if session_id:
+        if status == "completed" and session_id:
             self._set_execution_session_id(tenant.id, project_name, session_id)
             self.db.update_tenant_session(tenant.id, session_id)
+        elif status == "failed" and has_usage_signal and not has_usage_activity:
+            self._set_execution_session_id(tenant.id, project_name, None)
+            try:
+                self.db.update_tenant_session(tenant.id, "")
+            except Exception:
+                pass
         message_id = run["message_id"] if hasattr(run, "keys") else run.get("message_id")
         if message_id:
             self.db.update_message_status(
