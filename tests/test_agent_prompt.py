@@ -13,12 +13,13 @@ def test_prompt_includes_core_instructions(tmp_path):
 
     assert "bun-next-shadcn" in prompt
     assert "tasks/app_name.txt" in prompt
-    assert "gemini-3-pro-preview" in prompt
+    assert "product-designer" in prompt
+    assert "software-engineer" in prompt
+    assert "devops-engineer" in prompt
     assert "record_deploy" in prompt
     assert "record_domain_quote" in prompt
     assert "Domain Search & Purchase (Vercel CLI Only)" in prompt
     assert "interaction agent" in prompt
-    assert "unsplash-backfill" in prompt
     assert "Memory contents for snapshot" in prompt
     assert "Your email is not configured." in prompt
 
