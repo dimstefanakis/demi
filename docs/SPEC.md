@@ -204,7 +204,10 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
     + `demi-chat.send_message` so long-running runs remain visible to users
 - Interaction-agent routing controls:
   - `INTERACTION_AGENT_ROUTING_MAX_RETRIES` (legacy `INTERACTION_ROUTER_MAX_RETRIES` still accepted)
+  - `INTERACTION_AGENT_ROUTING_MAX_COST_USD` (legacy `INTERACTION_ROUTER_MAX_COST_USD` still accepted)
   - `INTERACTION_AGENT_ROUTING_PROMPT_PATH` (legacy `INTERACTION_ROUTER_PROMPT_PATH` still accepted)
+  - Routing retries include a repeated-invalid-output circuit breaker to avoid multi-attempt
+    token burn when the agent returns the same non-JSON diagnostic output repeatedly.
 - `INTERACTION_SESSION_CACHE_DIR` stores tenant-scoped Claude interaction session/cache files
   for SDK `resume` continuity (default `data/interaction_sessions`)
 - `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
@@ -508,7 +511,8 @@ Background workers poll the main DB and run in the API process or the worker con
   Idle polling uses exponential backoff but caps sleep to the active-run check interval to avoid
   multi-minute delays when new queued inputs arrive after an idle period.
   It also scans for stale `messages.status='received'` rows and re-invokes orchestrator handling
-  in recovery mode so webhook-accepted messages do not get stranded.
+  in recovery mode so webhook-accepted messages do not get stranded. Recovery failures are
+  terminalized (`messages.status='failed'`) to avoid repeated high-cost routing loops on a single row.
 - OutboxWorker: Sends deferred messages from the `outbox` table for busy acknowledgments and fallback notifications.
   Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
   Uses bounded retries, stale `sending` reclaim, and throttled fallback file scans to prevent

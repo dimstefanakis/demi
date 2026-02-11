@@ -305,6 +305,7 @@ async def test_route_interaction_raises_after_retry_exhaustion(
     tmp_path, monkeypatch
 ):
     query_calls = {"count": 0}
+    result_calls = {"count": 0}
 
     class FakeSystemMessage:
         def __init__(self, subtype: str, data: dict | None = None):
@@ -313,9 +314,10 @@ async def test_route_interaction_raises_after_retry_exhaustion(
 
     class FakeResultMessage:
         def __init__(self):
+            result_calls["count"] += 1
             self.stop_reason = "end_turn"
             self.subtype = "success"
-            self.result = "still invalid"
+            self.result = f"still invalid {result_calls['count']}"
             self.structured_output = None
             self.total_cost_usd = 0.01
             self.usage = {"output_tokens": 1}
@@ -380,3 +382,166 @@ async def test_route_interaction_raises_after_retry_exhaustion(
         )
     # Initial attempt + 2 retries
     assert query_calls["count"] == 3
+
+
+@pytest.mark.asyncio
+async def test_route_interaction_aborts_on_repeated_invalid_output(tmp_path, monkeypatch):
+    query_calls = {"count": 0}
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "API Error: Unable to connect to API (ECONNRESET)"
+            self.structured_output = None
+            self.total_cost_usd = 0.0
+            self.usage = {"output_tokens": 0}
+            self.session_id = "interaction-session-repeat-invalid"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            query_calls["count"] += 1
+            async for _ in prompt_stream:
+                break
+            return None
+
+        async def receive_messages(self):
+            yield FakeSystemMessage("init", {"session_id": "interaction-session-repeat-invalid"})
+            yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="route-invalid-repeated",
+        tenant_external_id=tenant.external_id,
+        received_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+        text="status?",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    monkeypatch.setenv("INTERACTION_AGENT_ROUTING_MAX_RETRIES", "8")
+    with pytest.raises(RuntimeError, match="interaction_agent_invalid_output"):
+        await agent.route_interaction(
+            workspace=workspace,
+            message=message,
+            messenger=DummyMessenger(),
+            tenant_id=tenant.id,
+            db=db,
+            provider=tenant.provider,
+            tenant_external_id=tenant.external_id,
+            billing_checked=True,
+        )
+    # First invalid output + one retry, then abort due to repeated invalid output.
+    assert query_calls["count"] == 2
+
+
+@pytest.mark.asyncio
+async def test_route_interaction_aborts_on_retry_cost_budget(tmp_path, monkeypatch):
+    query_calls = {"count": 0}
+    result_calls = {"count": 0}
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            result_calls["count"] += 1
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = f"invalid output {result_calls['count']}"
+            self.structured_output = None
+            self.total_cost_usd = 0.08
+            self.usage = {"output_tokens": 0}
+            self.session_id = "interaction-session-retry-cost"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            query_calls["count"] += 1
+            async for _ in prompt_stream:
+                break
+            return None
+
+        async def receive_messages(self):
+            yield FakeSystemMessage("init", {"session_id": "interaction-session-retry-cost"})
+            yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="route-invalid-cost-budget",
+        tenant_external_id=tenant.external_id,
+        received_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+        text="status?",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    monkeypatch.setenv("INTERACTION_AGENT_ROUTING_MAX_RETRIES", "8")
+    monkeypatch.setenv("INTERACTION_AGENT_ROUTING_MAX_COST_USD", "0.1")
+    with pytest.raises(RuntimeError, match="interaction_agent_invalid_output"):
+        await agent.route_interaction(
+            workspace=workspace,
+            message=message,
+            messenger=DummyMessenger(),
+            tenant_id=tenant.id,
+            db=db,
+            provider=tenant.provider,
+            tenant_external_id=tenant.external_id,
+            billing_checked=True,
+        )
+    # Attempt1 (0.08) continues; attempt2 pushes cumulative cost above 0.1 and aborts.
+    assert query_calls["count"] == 2

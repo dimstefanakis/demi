@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import base64
+import hashlib
 import json
 import mimetypes
 from pathlib import Path
@@ -339,6 +340,15 @@ class ClaudeAgent:
         if not text:
             return False
         return "agent_result_subtype_error_during_execution" in text
+
+    @staticmethod
+    def _invalid_interaction_output_signature(raw: str | None) -> str:
+        text = " ".join(str(raw or "").strip().lower().split())
+        if not text:
+            return "empty"
+        if len(text) > 1024:
+            text = text[:1024]
+        return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     @staticmethod
     def _clear_interaction_session_state(
@@ -1117,9 +1127,12 @@ class ClaudeAgent:
                     raise
 
         max_attempts = max(1, int(settings.interaction_routing_max_retries()) + 1)
+        max_retry_cost_usd = settings.interaction_routing_max_cost_usd()
         attempt = 1
         retry_note: str | None = None
         resume_session_id = session_id
+        invalid_output_signatures: dict[str, int] = {}
+        cumulative_retry_cost_usd = 0.0
         while True:
             await _query_router_with_resume(
                 resume_session_id=resume_session_id,
@@ -1127,6 +1140,52 @@ class ClaudeAgent:
             )
             if _decision_valid(decision):
                 break
+            attempt_cost_usd = 0.0
+            try:
+                attempt_cost_usd = float(total_cost_usd or 0.0)
+            except (TypeError, ValueError):
+                attempt_cost_usd = 0.0
+            if attempt_cost_usd > 0:
+                cumulative_retry_cost_usd += attempt_cost_usd
+            if (
+                max_retry_cost_usd is not None
+                and cumulative_retry_cost_usd > max_retry_cost_usd
+            ):
+                try:
+                    log_agent_event(
+                        workspace.tasks_dir,
+                        "interaction_agent_retry_aborted",
+                        {
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "reason": "max_retry_cost_exceeded",
+                            "max_retry_cost_usd": max_retry_cost_usd,
+                            "cumulative_retry_cost_usd": cumulative_retry_cost_usd,
+                            "raw_output": raw_output,
+                        },
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("interaction_agent_invalid_output")
+            output_signature = self._invalid_interaction_output_signature(raw_output)
+            invalid_output_signatures[output_signature] = (
+                invalid_output_signatures.get(output_signature, 0) + 1
+            )
+            if invalid_output_signatures[output_signature] >= 2:
+                try:
+                    log_agent_event(
+                        workspace.tasks_dir,
+                        "interaction_agent_retry_aborted",
+                        {
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "reason": "repeated_invalid_output",
+                            "raw_output": raw_output,
+                        },
+                    )
+                except Exception:
+                    pass
+                raise RuntimeError("interaction_agent_invalid_output")
             if attempt >= max_attempts:
                 raise RuntimeError("interaction_agent_invalid_output")
             attempt += 1

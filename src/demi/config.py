@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     interaction_agent_routing_max_retries: int | None = None
     # Legacy alias kept for backward compatibility.
     interaction_router_max_retries: int | None = None
+    interaction_agent_routing_max_cost_usd: float | None = 0.25
+    # Legacy alias kept for backward compatibility.
+    interaction_router_max_cost_usd: float | None = None
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
     claude_enable_tool_search: bool = True
     claude_enable_memory_tool: bool = True
@@ -194,6 +197,20 @@ class Settings(BaseSettings):
             return max(0, int(value))
         except (TypeError, ValueError):
             return 8
+
+    def interaction_routing_max_cost_usd(self) -> float | None:
+        value = self.interaction_agent_routing_max_cost_usd
+        if value is None:
+            value = self.interaction_router_max_cost_usd
+        if value is None:
+            return None
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        return parsed
 
     def execution_thinking_max_tokens(self) -> int | None:
         value = self.execution_max_thinking_tokens

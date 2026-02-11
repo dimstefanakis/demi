@@ -160,6 +160,11 @@ class PendingWorker:
         if not rows:
             return
         for row in rows:
+            message_id = row.get("id")
+            try:
+                message_id = int(message_id) if message_id is not None else None
+            except (TypeError, ValueError):
+                message_id = None
             tenant_id = row.get("tenant_id")
             if tenant_id is None:
                 continue
@@ -170,6 +175,38 @@ class PendingWorker:
             if msg is None:
                 continue
             try:
-                await self.orchestrator.handle_message(msg, allow_existing_received=True)
+                result = await self.orchestrator.handle_message(
+                    msg, allow_existing_received=True
+                )
+                # If recovery falls through as duplicate while row is still received,
+                # fail the row to avoid expensive infinite recovery loops.
+                if result.status == "duplicate" and message_id is not None:
+                    latest = await self._db_call(self.db.get_message, int(message_id))
+                    latest_status = ""
+                    if latest is not None:
+                        try:
+                            latest_status = str(
+                                latest.get("status")
+                                if hasattr(latest, "get")
+                                else latest["status"]
+                                or ""
+                            ).strip().lower()
+                        except Exception:
+                            latest_status = ""
+                    if latest_status == "received":
+                        await self._db_call(
+                            self.db.update_message_status,
+                            int(message_id),
+                            "failed",
+                        )
             except Exception:
+                if message_id is not None:
+                    try:
+                        await self._db_call(
+                            self.db.update_message_status,
+                            int(message_id),
+                            "failed",
+                        )
+                    except Exception:
+                        pass
                 continue

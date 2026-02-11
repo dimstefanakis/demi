@@ -305,6 +305,57 @@ async def test_pending_worker_recovers_stale_received_messages(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_pending_worker_stale_received_failure_is_terminal(tmp_path, monkeypatch):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    stale_received_at = datetime.now(tz=timezone.utc) - timedelta(seconds=120)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stale-received-fail-1",
+        tenant_external_id=tenant.external_id,
+        received_at=stale_received_at,
+        text="Recover me maybe",
+        images=[],
+        raw={},
+        project_name="main",
+    )
+    message_id, inserted = db.record_message(tenant.id, msg)
+    assert inserted is True
+    assert db.get_message(message_id)["status"] == "received"
+
+    async def _boom(_msg, *, allow_existing_received=False):
+        del _msg, allow_existing_received
+        raise RuntimeError("forced_failure")
+
+    monkeypatch.setattr(orchestrator, "handle_message", _boom)
+
+    worker = PendingWorker(
+        db=db,
+        orchestrator=orchestrator,
+        config=PendingWorkerConfig(
+            poll_interval=0.01,
+            batch_size=5,
+            processing_grace_seconds=30,
+        ),
+    )
+
+    await worker._recover_stale_received_messages()
+
+    row = db.get_message(message_id)
+    assert row is not None
+    assert row["status"] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
