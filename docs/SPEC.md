@@ -504,6 +504,8 @@ Background workers poll the main DB and run in the API process or the worker con
 
 - EventWorker: Consumes `event_jobs` from the main DB, relies on `/events` to persist payloads in `tenant_events` (Supabase), and triggers the orchestrator with a normalized event message.
 - PendingWorker: Drains queued `run_inputs` once a project is idle and reclaims stale runs after lease expiry.
+  Idle polling uses exponential backoff but caps sleep to the active-run check interval to avoid
+  multi-minute delays when new queued inputs arrive after an idle period.
 - OutboxWorker: Sends deferred messages from the `outbox` table for busy acknowledgments and fallback notifications.
   Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
   Uses bounded retries, stale `sending` reclaim, and throttled fallback file scans to prevent

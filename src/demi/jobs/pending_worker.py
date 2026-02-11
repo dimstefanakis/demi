@@ -66,7 +66,12 @@ class PendingWorker:
                             self.config.active_check_interval_seconds,
                         )
                     idle_streak = min(idle_streak + 1, 6)
-                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
+                    backoff_sleep = self.config.poll_interval * (2**idle_streak)
+                    max_idle_sleep = max(
+                        self.config.poll_interval,
+                        self.config.active_check_interval_seconds,
+                    )
+                    await asyncio.sleep(min(backoff_sleep, max_idle_sleep))
                     continue
                 idle_streak = 0
                 for group in groups:

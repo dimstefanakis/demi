@@ -118,6 +118,44 @@ async def test_pending_worker_sleeps_when_inflight(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_pending_worker_idle_backoff_is_capped(tmp_path, monkeypatch):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+    worker = PendingWorker(
+        db=db,
+        orchestrator=orchestrator,
+        config=PendingWorkerConfig(
+            poll_interval=2.5,
+            batch_size=5,
+            active_check_interval_seconds=10.0,
+        ),
+    )
+
+    sleeps: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        if len(sleeps) >= 3:
+            worker.stop()
+
+    async def fake_check_active_runs() -> None:
+        return None
+
+    monkeypatch.setattr("demi.jobs.pending_worker.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(worker, "_check_active_runs", fake_check_active_runs)
+
+    await worker.run_forever()
+
+    assert sleeps == [5.0, 10.0, 10.0]
+
+
+@pytest.mark.asyncio
 async def test_pending_worker_drains_queue(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
