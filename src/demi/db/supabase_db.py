@@ -620,6 +620,25 @@ class SupabaseDatabase:
         data = self._execute(query)
         return list(data or [])
 
+    def count_failed_runs_for_message(
+        self,
+        *,
+        tenant_id: int,
+        message_id: int,
+        project_name: str | None = None,
+    ) -> int:
+        query = (
+            self._table("runs")
+            .select("id")
+            .eq("tenant_id", tenant_id)
+            .eq("message_id", message_id)
+            .eq("status", "failed")
+        )
+        if project_name:
+            query = query.eq("project_name", project_name)
+        data = self._execute(query)
+        return len(data or [])
+
     def create_run(
         self,
         tenant_id: int,

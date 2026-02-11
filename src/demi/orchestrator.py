@@ -46,6 +46,8 @@ class InteractionRouteSession:
 
 @dataclass
 class Orchestrator:
+    MAX_RETRY_FAILURE_NOTICES = 2
+
     db: Database
     workspace_manager: WorkspaceManager
     agent: Any
@@ -1194,9 +1196,7 @@ class Orchestrator:
             self._write_request_status(workspace, tenant)
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
-            retry_run_inputs = bool(
-                run_input_ids and self._is_retryable_run_input_error(exc)
-            )
+            retry_run_inputs = bool(run_input_ids)
             self.db.finish_run(run_id, status="failed", error=str(exc))
             if message_ids:
                 self.db.update_message_statuses(message_ids, "failed")
@@ -1207,7 +1207,12 @@ class Orchestrator:
                 )
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
-            if msg.provider != "event" and not retry_run_inputs:
+            if msg.provider != "event" and self._should_send_failure_notice(
+                tenant_id=tenant.id,
+                project_name=workspace.project_name,
+                message_id=message_id,
+                retrying=retry_run_inputs,
+            ):
                 await self._send_interaction_instruction(
                     workspace=workspace,
                     tenant=tenant,
@@ -1256,16 +1261,25 @@ class Orchestrator:
                 routing_decision=routing_decision,
             )
 
-    @staticmethod
-    def _is_retryable_run_input_error(exc: Exception) -> bool:
-        text = str(exc).strip().lower()
-        if text.startswith("agent_result_subtype_error_"):
-            return False
-        if text.startswith("agent_stop_reason_"):
-            return False
-        if exc.__class__.__name__.lower() == "processerror":
-            return False
-        return True
+    def _should_send_failure_notice(
+        self,
+        *,
+        tenant_id: int,
+        project_name: str | None,
+        message_id: int,
+        retrying: bool,
+    ) -> bool:
+        if not retrying:
+            return True
+        try:
+            failed_runs = self.db.count_failed_runs_for_message(
+                tenant_id=tenant_id,
+                message_id=message_id,
+                project_name=project_name,
+            )
+        except Exception:
+            return True
+        return failed_runs <= self.MAX_RETRY_FAILURE_NOTICES
 
     @staticmethod
     def _is_run_stale(

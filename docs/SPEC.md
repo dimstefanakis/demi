@@ -471,10 +471,9 @@ Run selection when streaming to execution:
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
     - Git versioning is scoped to deployable app files within the project (for example `site/` or another app root);
       orchestration metadata files are excluded from website commits.
-    - If a run fails while draining queued `run_inputs`, retry behavior is error-aware:
-      retryable transient failures are re-queued, but non-retryable agent/runtime failures
-      (for example `agent_result_subtype_error_*` and CLI `ProcessError`) are marked failed to
-      avoid infinite retry loops and repeated user failure notifications.
+    - If a run fails while draining queued `run_inputs`, the input is re-queued for retry.
+      User-facing "try again shortly" notifications are capped to the first two failed attempts
+      for the same message to avoid repeated spam during prolonged failures.
     - The agent can create an assistant subscription order by calling `request_assistant_subscription`
       after delivering value, then sends the payment link via the interaction agent.
 13. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).

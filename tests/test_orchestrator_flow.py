@@ -1039,7 +1039,7 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_non_retryable_run_input_failure_marks_failed(tmp_path):
+async def test_orchestrator_run_input_failure_requeues(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FailingAgent(RuntimeError("agent_result_subtype_error_during_execution"))
@@ -1075,9 +1075,9 @@ async def test_orchestrator_non_retryable_run_input_failure_marks_failed(tmp_pat
     with pytest.raises(RuntimeError, match="agent_result_subtype_error_during_execution"):
         await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
 
-    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
-    failed = db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
-    assert failed
+    queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert queued
+    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
     stored = db.get_message(message_id)
     assert stored is not None
     assert stored["status"] == "failed"
@@ -1085,7 +1085,7 @@ async def test_orchestrator_non_retryable_run_input_failure_marks_failed(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_retryable_run_input_failure_requeues_without_message(tmp_path):
+async def test_orchestrator_retry_failure_notice_capped_after_two_attempts(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     agent = FailingAgent(RuntimeError("temporary network hiccup"))
@@ -1118,16 +1118,25 @@ async def test_orchestrator_retryable_run_input_failure_requeues_without_message
         status="queued",
     )
 
-    with pytest.raises(RuntimeError, match="temporary network hiccup"):
-        await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+    for _ in range(3):
+        with pytest.raises(RuntimeError, match="temporary network hiccup"):
+            await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
 
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
     assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
+    assert (
+        db.count_failed_runs_for_message(
+            tenant_id=tenant.id,
+            message_id=message_id,
+            project_name=workspace.project_name,
+        )
+        == 3
+    )
     stored = db.get_message(message_id)
     assert stored is not None
     assert stored["status"] == "failed"
-    assert agent.instruction_calls == 0
+    assert agent.instruction_calls == 2
 
 
 @pytest.mark.asyncio
