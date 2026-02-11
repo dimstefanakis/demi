@@ -80,6 +80,24 @@ def test_execution_prompt_explicitly_requires_specialized_subagents():
     assert "product-designer" in prompt
     assert "software-engineer" in prompt
     assert "devops-engineer" in prompt
+    assert "must run before any `devops-engineer` build/deploy work" in prompt
+    assert "between every subagent handoff, invoke `interaction-helper`" in prompt
+
+
+def test_software_engineer_prompt_requires_designer_success_for_ui_scope():
+    settings = Settings()
+    prompt = settings.software_engineer_prompt_path.read_text(encoding="utf-8").lower()
+    assert "tasks/design_result.md" in prompt
+    assert "status `success`" in prompt
+    assert "invoke `product-designer` first" in prompt
+
+
+def test_reviewer_prompt_runs_before_devops():
+    settings = Settings()
+    prompt = settings.reviewer_prompt_path.read_text(encoding="utf-8").lower()
+    assert "you run after `software-engineer` and before `devops-engineer`" in prompt
+    assert "devops-engineer" in prompt
+    assert "status is `pass`" in prompt
 
 
 def test_sdk_message_log_data_does_not_include_repr():

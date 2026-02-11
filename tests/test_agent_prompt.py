@@ -16,6 +16,10 @@ def test_prompt_includes_core_instructions(tmp_path):
     assert "product-designer" in prompt
     assert "software-engineer" in prompt
     assert "devops-engineer" in prompt
+    assert "`reviewer` -> `devops-engineer`" in prompt
+    assert "between every subagent handoff, invoke `interaction-helper`" in prompt.lower()
+    assert "tasks/design_result.md" in prompt
+    assert "do not ask `software-engineer` to derive or choose design patterns" in prompt.lower()
     assert "record_deploy" in prompt
     assert "record_domain_quote" in prompt
     assert "Domain Search & Purchase (Vercel CLI Only)" in prompt

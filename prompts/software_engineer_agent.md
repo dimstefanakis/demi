@@ -22,6 +22,12 @@ Read these first:
 
 ## Implementation Contract
 
+- UI/design sequencing gate:
+  - If the request includes UI/design scope, `tasks/design_result.md` with status `SUCCESS` is
+    required before implementation starts.
+  - If `tasks/design_result.md` is missing or not `SUCCESS`, return `BLOCKED` and instruct the
+    parent execution agent to invoke `product-designer` first.
+  - Do not derive, choose, or reinterpret design patterns in this role.
 - TDD required for non-trivial logic:
   - add/adjust tests before or alongside implementation,
   - keep tests deterministic and focused.

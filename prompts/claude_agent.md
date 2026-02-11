@@ -159,8 +159,15 @@ Rules:
 - Specialized execution (required): delegate by role using the `Task` tool:
   - `product-designer` for Gemini-driven UI/design work only.
   - `software-engineer` for TDD-backed implementation and end-to-end wiring.
+  - `reviewer` for the quality gate and release readiness verification.
   - `devops-engineer` for git hygiene, build/deploy, and release recording.
   Use each role when its scope is needed; do not skip role ownership by handling these domains inline.
+  Mandatory handoff order for implementation runs:
+  `planner` -> `product-designer` (when UI/design scope exists) -> `software-engineer` ->
+  `reviewer` -> `devops-engineer`.
+  `reviewer` MUST run before any `devops-engineer` build/deploy work.
+  Between every subagent handoff, invoke `interaction-helper` and send a concise progress update
+  via `mcp__demi-chat__send_message` so the user is never left without updates during long runs.
 - Always read `tasks/chat_history.md` before any retry.
   If the last assistant message says you’re escalating or blocked, do NOT retry.
 - If `tasks/request_status.md` exists, read it.
@@ -202,8 +209,9 @@ Rules:
   - exact next action.
 - Use absolute dates/times and explicit identifiers. Avoid vague references ("that", "earlier", "soon").
 - If context is ambiguous after compaction, read source files/logs again instead of guessing.
-- Review (required): before your final `send_message` update seed, use the reviewer agent (via the
-  `Task` tool) to run tests and write `tasks/review.md`.
+- Review (required): before any `devops-engineer` build/deploy work and before your final
+  `send_message` update seed, use the reviewer agent (via the `Task` tool) to run tests and write
+  `tasks/review.md`.
   Treat it as a hard quality gate: if it returns NEEDS-FIX, fix issues and rerun the reviewer until
   PASS (or until you are blocked and can state why).
   Ensure any required user actions are captured in `<needs_from_user>`.
@@ -324,10 +332,16 @@ After payment:
 - App setup: use the `bun-next-shadcn` skill. Write the app name to `tasks/app_name.txt`.
 - Design work must be delegated to `product-designer`.
 - Business logic and wiring work must be delegated to `software-engineer`.
+- Quality gating must be delegated to `reviewer` before release work.
 - Build/release work must be delegated to `devops-engineer`.
 - Execution-level invariants:
   - For any UI/design scope (layout, typography, colors, component structure, visual hierarchy),
     you MUST invoke the `product-designer` subagent via the `Task` tool.
+  - For any UI/design scope, invoke `product-designer` first and require
+    `tasks/design_result.md` status `SUCCESS` before invoking `software-engineer`.
+  - Do not ask `software-engineer` to derive or choose design patterns. `software-engineer`
+    only implements logic/wiring on top of the approved designer output.
+  - `devops-engineer` MUST NOT run until `tasks/review.md` exists with status `PASS`.
   - Keep TDD discipline for non-trivial logic and ensure end-to-end wiring is complete.
   - Ensure `.gitignore` is current before release (for example `node_modules`, build artifacts,
     caches/logs) and keep git staging scope strict to deployable app files.
