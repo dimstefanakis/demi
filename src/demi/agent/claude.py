@@ -334,6 +334,13 @@ class ClaudeAgent:
         return any(needle in text for needle in needles)
 
     @staticmethod
+    def _is_retryable_execution_error(exc: Exception) -> bool:
+        text = str(exc).strip().lower()
+        if not text:
+            return False
+        return "agent_result_subtype_error_during_execution" in text
+
+    @staticmethod
     def _clear_interaction_session_state(
         *,
         db: Any | None,
@@ -723,6 +730,13 @@ class ClaudeAgent:
                     workspace.tasks_dir,
                     "execution_resume_fallback",
                     {"error": str(exc), "stale_session_id": session_id},
+                )
+                return await _execute_once(None)
+            if self._is_retryable_execution_error(exc):
+                log_agent_event(
+                    workspace.tasks_dir,
+                    "execution_error_during_execution_fallback",
+                    {"error": str(exc), "session_id": session_id},
                 )
                 return await _execute_once(None)
             raise

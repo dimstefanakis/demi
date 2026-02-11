@@ -67,6 +67,76 @@ class FakeAgent:
         return type("AgentResult", (), {"session_id": session_id, "summary": "ok"})()
 
 
+class FailingAgent(FakeAgent):
+    def __init__(self, error: Exception):
+        super().__init__()
+        self.error = error
+        self.instruction_calls = 0
+
+    async def prepare_context(
+        self,
+        workspace,
+        task_path,
+        message,
+        messenger=None,
+        inflight_stream=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        run_id=None,
+        runtime_env=None,
+    ):
+        del (
+            workspace,
+            task_path,
+            message,
+            messenger,
+            inflight_stream,
+            tenant_id,
+            db,
+            payments,
+            session_id,
+            run_id,
+            runtime_env,
+        )
+        raise self.error
+
+    async def send_interaction_instruction(
+        self,
+        workspace,
+        instruction,
+        messenger,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        run_id=None,
+        message_id=None,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        del (
+            workspace,
+            instruction,
+            messenger,
+            tenant_id,
+            db,
+            payments,
+            session_id,
+            provider,
+            tenant_external_id,
+            run_id,
+            message_id,
+            asset_paths,
+            execution_bridge,
+        )
+        self.instruction_calls += 1
+        return type("AgentResult", (), {"session_id": None, "summary": "ok"})()
+
+
 class FakeMessenger:
     def __init__(self):
         self.sent = []
@@ -966,6 +1036,98 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
     assert not agent.calls
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_non_retryable_run_input_failure_marks_failed(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FailingAgent(RuntimeError("agent_result_subtype_error_during_execution"))
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="queued-fail-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Queue this and fail non-retryable",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=workspace.project_name,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    with pytest.raises(RuntimeError, match="agent_result_subtype_error_during_execution"):
+        await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+
+    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    failed = db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
+    assert failed
+    stored = db.get_message(message_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert agent.instruction_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_retryable_run_input_failure_requeues_without_message(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FailingAgent(RuntimeError("temporary network hiccup"))
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="queued-retry-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Queue this and retry",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name=workspace.project_name,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    with pytest.raises(RuntimeError, match="temporary network hiccup"):
+        await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+
+    queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert queued
+    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
+    stored = db.get_message(message_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert agent.instruction_calls == 0
 
 
 @pytest.mark.asyncio

@@ -366,6 +366,8 @@ Flow:
 3. Both execution and interaction agents return updated session IDs.
 4. The orchestrator/workers persist each session ID in its own scope.
 5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
+6. If execution returns result subtype `error_during_execution`, execution is retried once with a fresh
+   SDK session before surfacing the failure.
 
 ---
 
@@ -469,6 +471,10 @@ Run selection when streaming to execution:
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
     - Git versioning is scoped to deployable app files within the project (for example `site/` or another app root);
       orchestration metadata files are excluded from website commits.
+    - If a run fails while draining queued `run_inputs`, retry behavior is error-aware:
+      retryable transient failures are re-queued, but non-retryable agent/runtime failures
+      (for example `agent_result_subtype_error_*` and CLI `ProcessError`) are marked failed to
+      avoid infinite retry loops and repeated user failure notifications.
     - The agent can create an assistant subscription order by calling `request_assistant_subscription`
       after delivering value, then sends the payment link via the interaction agent.
 13. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).

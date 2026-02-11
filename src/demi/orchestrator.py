@@ -1194,14 +1194,20 @@ class Orchestrator:
             self._write_request_status(workspace, tenant)
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
+            retry_run_inputs = bool(
+                run_input_ids and self._is_retryable_run_input_error(exc)
+            )
             self.db.finish_run(run_id, status="failed", error=str(exc))
             if message_ids:
                 self.db.update_message_statuses(message_ids, "failed")
             if run_input_ids:
-                self.db.update_run_inputs_statuses(run_input_ids, "queued")
+                self.db.update_run_inputs_statuses(
+                    run_input_ids,
+                    "queued" if retry_run_inputs else "failed",
+                )
             self._clear_inflight_stream(tenant.key, workspace.project_name)
             self.db.clear_active_run(tenant.id, workspace.project_name)
-            if msg.provider != "event":
+            if msg.provider != "event" and not retry_run_inputs:
                 await self._send_interaction_instruction(
                     workspace=workspace,
                     tenant=tenant,
@@ -1249,6 +1255,17 @@ class Orchestrator:
                 project_name=project_name,
                 routing_decision=routing_decision,
             )
+
+    @staticmethod
+    def _is_retryable_run_input_error(exc: Exception) -> bool:
+        text = str(exc).strip().lower()
+        if text.startswith("agent_result_subtype_error_"):
+            return False
+        if text.startswith("agent_stop_reason_"):
+            return False
+        if exc.__class__.__name__.lower() == "processerror":
+            return False
+        return True
 
     @staticmethod
     def _is_run_stale(
