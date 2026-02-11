@@ -178,9 +178,9 @@ class PendingWorker:
                 result = await self.orchestrator.handle_message(
                     msg, allow_existing_received=True
                 )
-                # If recovery falls through as duplicate while row is still received,
-                # fail the row to avoid expensive infinite recovery loops.
-                if result.status == "duplicate" and message_id is not None:
+                # If stale-recovery returns while the row is still "received",
+                # fail it to avoid repeated high-cost recovery loops.
+                if message_id is not None:
                     latest = await self._db_call(self.db.get_message, int(message_id))
                     latest_status = ""
                     if latest is not None:
