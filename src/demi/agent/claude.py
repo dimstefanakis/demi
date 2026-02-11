@@ -139,7 +139,6 @@ class ClaudeAgent:
         "Task",
         "Skill",
         UNSPLASH_SEARCH_TOOL,
-        f"mcp__{CHAT_SERVER_NAME}__decide_project",
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
         f"mcp__{CHAT_SERVER_NAME}__check_for_status",
         f"mcp__{CHAT_SERVER_NAME}__ack_inflight_updates",
@@ -416,6 +415,11 @@ class ClaudeAgent:
             # Point memory tool writes at the project-local durable memory file.
             env[MEMORY_TOOL_ENABLED_ENV_KEY] = "true"
             env[MEMORY_TOOL_PATH_ENV_KEY] = str(workspace.memory_path)
+        agent_email = str(settings.agent_email or "").strip()
+        if agent_email:
+            env["AGENT_EMAIL"] = agent_email
+            env.setdefault("GIT_AUTHOR_EMAIL", agent_email)
+            env.setdefault("GIT_COMMITTER_EMAIL", agent_email)
         return env
 
     @classmethod
@@ -466,6 +470,16 @@ class ClaudeAgent:
         # Restrict interaction file access to the tenant workspace scope.
         tenant_root = getattr(workspace, "tenant_root", workspace.root)
         return [Path(tenant_root)]
+
+    @staticmethod
+    def _execution_add_dirs(workspace: Workspace) -> list[Path]:
+        # Execution must be able to inspect all tenant projects and choose the best fit.
+        tenant_root = Path(getattr(workspace, "tenant_root", workspace.root))
+        current = Path.cwd()
+        dirs: list[Path] = [tenant_root]
+        if current != tenant_root:
+            dirs.append(current)
+        return dirs
 
     async def prepare_context(
         self,
@@ -561,7 +575,7 @@ class ClaudeAgent:
             model=settings.execution_model,
             max_thinking_tokens=settings.execution_thinking_max_tokens(),
             cwd=workspace.root,
-            add_dirs=[Path.cwd()],
+            add_dirs=self._execution_add_dirs(workspace),
             env=execution_env,
             plugins=self.plugins,
             agents=self.agents,
@@ -924,7 +938,6 @@ class ClaudeAgent:
                 "Edit",
                 "Grep",
                 "Glob",
-                f"mcp__{CHAT_SERVER_NAME}__decide_project",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
@@ -1438,12 +1451,14 @@ class ClaudeAgent:
         settings = Settings()
         template = ClaudeAgent._load_prompt_file(settings.claude_prompt_path)
         event_url = settings.event_url or "not configured"
+        agent_email = str(settings.agent_email or "").strip() or "not configured"
         memory_snapshot = ClaudeAgent._read_memory_snapshot(memory_path)
         return (
             template.replace("<<TASK_PATH>>", str(task_path))
             .replace("<<MEMORY_PATH>>", str(memory_path))
             .replace("<<MEMORY_SNAPSHOT>>", memory_snapshot)
             .replace("<<EVENT_URL>>", event_url)
+            .replace("<<AGENT_EMAIL>>", agent_email)
             .rstrip()
             + "\n"
         )

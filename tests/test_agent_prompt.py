@@ -1,5 +1,6 @@
-from demi.agent.claude import ClaudeAgent
 from pathlib import Path
+
+from demi.agent.claude import ClaudeAgent
 
 
 def test_prompt_includes_core_instructions(tmp_path):
@@ -19,3 +20,17 @@ def test_prompt_includes_core_instructions(tmp_path):
     assert "interaction agent" in prompt
     assert "unsplash-backfill" in prompt
     assert "Memory contents for snapshot" in prompt
+    assert "Your email is not configured." in prompt
+
+
+def test_prompt_includes_agent_email_from_env(tmp_path, monkeypatch):
+    task = tmp_path / "task.md"
+    memory = tmp_path / "memory.md"
+    task.write_text("Task")
+    memory.write_text("Memory")
+    monkeypatch.setenv("AGENT_EMAIL", "demi-bot@example.com")
+
+    prompt = ClaudeAgent._build_prompt(task_path=task, memory_path=memory)
+
+    assert "Your email is demi-bot@example.com." in prompt
+    assert "<<AGENT_EMAIL>>" not in prompt

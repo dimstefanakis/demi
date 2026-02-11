@@ -19,7 +19,6 @@ from demi.agent.inflight import InflightTextStream
 from demi.memory.logs import append_log, write_chat_history
 
 from demi.failure_guard import clear_block, get_block, record_hard_failure
-from demi.workspace.project_decider import decide_project
 from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager, MAX_REPO_NAME_LENGTH
 from demi.config import Settings
 
@@ -1581,15 +1580,9 @@ class Orchestrator:
         if project_name:
             if msg.project_name != project_name:
                 msg = replace(msg, project_name=project_name)
-            return msg, project_name
-        tenant_root = self._tenant_root_for(tenant)
-        decision = decide_project(tenant_root, msg.text, payload=msg.raw or {})
-        inferred = decision.project_name if decision else None
-        if inferred and msg.project_name != inferred:
-            msg = replace(msg, project_name=inferred)
-        if inferred:
-            self.workspace_manager.set_active_project(tenant_root, inferred)
-        return msg, inferred
+            tenant_root = self._tenant_root_for(tenant)
+            self.workspace_manager.set_active_project(tenant_root, project_name)
+        return msg, project_name
 
     def _tenant_root_for(self, tenant: Any) -> Path:
         workspace_path = getattr(tenant, "workspace_path", None)

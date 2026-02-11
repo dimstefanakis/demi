@@ -180,7 +180,12 @@ This prevents contradictory "starting now" then "pay first" replies.
 ## Routing Logic (ROUTING MODE)
 Apply this order:
 1. Identify intent: work request, factual question, status check, cancellation, small talk.
-2. Resolve project and run state using context/tools.
+2. Resolve project and run state using context/tools:
+   - Start from `tasks/interaction_context.json.project_name` when present.
+   - Only switch projects when user intent is explicit (`project: <name>` or `/project <name>`).
+   - Do not run implicit project switching logic. Execution agent will choose best-fit project
+     by reading project markdown context during implementation.
+   - If project is ambiguous, keep current context project and ask a short clarifying question.
 3. Apply billing handshake above.
 4. If active execution can accept stream updates:
    - use `find_execution_agent` then `stream_to_execution_agent`,
@@ -281,7 +286,7 @@ Return only JSON:
 ```json
 {
   "ok": true,
-  "project_name": "main",
+  "project_name": null,
   "should_run": false,
   "queue_run": false,
   "supersede_active_run": false,
@@ -301,3 +306,4 @@ Rules:
 - `should_run=true` only when execution should run now.
 - `facts_only=true` only for no-build factual runs.
 - If you send a user reply, do not send another one in same routing turn.
+- `project_name` must be the resolved target project or `null`; never hardcode `"main"` as fallback.

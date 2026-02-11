@@ -1078,11 +1078,11 @@ async def test_orchestrator_reset_clears_state(tmp_path, reset_text):
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_infers_project_from_description(tmp_path):
+async def test_orchestrator_uses_active_project_without_explicit_project(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
-    agent = FakeAgent(decision_project="cafe")
+    agent = FakeAgent()
     orchestrator = Orchestrator(
         db=db,
         workspace_manager=workspace_manager,
@@ -1117,7 +1117,7 @@ async def test_orchestrator_infers_project_from_description(tmp_path):
     assert result.status == "accepted"
     assert agent.calls
     used_root = agent.calls[-1][0]
-    assert used_root == cafe_ws.root
+    assert used_root == main_ws.root
 
 
 @pytest.mark.asyncio

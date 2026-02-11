@@ -34,6 +34,7 @@ class Settings(BaseSettings):
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
     claude_enable_tool_search: bool = True
     claude_enable_memory_tool: bool = True
+    agent_email: str | None = None
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")

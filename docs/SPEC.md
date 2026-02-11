@@ -158,6 +158,7 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 **Core tooling**
 - `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY`
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY`
+- `AGENT_EMAIL` (execution-agent identity injected into prompt/env; also used for git author/committer email defaults)
 - `VERCEL_TOKEN` (Vercel CLI auth; non-interactive deploys must pass `--token` or rely on the agent-image wrapper)
 
 **Optional integrations**
@@ -328,7 +329,9 @@ data/<tenant_key>/
 **Project routing**
 - Each tenant can have multiple projects.
 - `projects/active.txt` stores the current default project.
-- The orchestrator can infer a project from recent context or explicit directives.
+- The orchestrator applies explicit project directives from message payload/text (`project:` or `/project`).
+- Without an explicit directive, it keeps the active project and leaves deeper project-fit selection
+  to the execution prompt flow.
 
 ---
 
@@ -423,7 +426,7 @@ Run selection when streaming to execution:
 4. Interaction routing is serialized per tenant (single interaction loop per tenant).
    Each inbound message starts its own interaction turn unless a turn is already running for the tenant.
    In that case, the new message is streamed into the active interaction turn as an in-flight update.
-5. Project selection is resolved (explicit directive or inferred from context).
+5. Project selection is resolved from explicit directives when provided; otherwise active project is used.
 6. If configured, the orchestrator calls the billing status endpoint during routing.
    It writes `tasks/billing_status.json` when no other run is active; if a run is already in flight it writes
    `tasks/billing_status_<run_id>.json` for the new run to avoid clobbering the in-flight payload. Billing
@@ -432,6 +435,8 @@ Run selection when streaming to execution:
 7. The orchestrator merges any attachments for the current interaction turn, saves them under `assets/`, writes
    `tasks/interaction_context.json`, and calls the interaction agent in routing mode.
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
+   - Interaction routing avoids implicit project switching; execution flow performs project-fit checks
+     by reading per-project markdown context.
    - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
    - GitHub repo linkage is recovered from `github_repo.json` and, if missing, from local `site/.git` origin
      before creating a new repo name.

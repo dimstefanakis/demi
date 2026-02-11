@@ -28,6 +28,7 @@ def test_base_agent_env_includes_env_file_values(tmp_path, monkeypatch):
                 "ANTHROPIC_API_KEY=test-anthropic-key",
                 "VERCEL_TOKEN=test-vercel-token",
                 "CUSTOM_AGENT_VAR=custom-value",
+                "AGENT_EMAIL=demi@example.com",
             ]
         )
         + "\n",
@@ -43,6 +44,9 @@ def test_base_agent_env_includes_env_file_values(tmp_path, monkeypatch):
     assert env.get("ANTHROPIC_API_KEY") == "test-anthropic-key"
     assert env.get("VERCEL_TOKEN") == "test-vercel-token"
     assert env.get("CUSTOM_AGENT_VAR") == "custom-value"
+    assert env.get("AGENT_EMAIL") == "demi@example.com"
+    assert env.get("GIT_AUTHOR_EMAIL") == "demi@example.com"
+    assert env.get("GIT_COMMITTER_EMAIL") == "demi@example.com"
 
 
 @pytest.mark.asyncio
