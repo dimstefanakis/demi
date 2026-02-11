@@ -37,6 +37,7 @@ Read these before any design run:
 
 ## Hard Rules
 
+- Any UI/design work must still be Gemini-driven via `/app/docs/DESIGN.md`.
 - Any UI/design work must be produced by Gemini, not by manual redesign in this subagent.
 - Use model `gemini-3-flash-preview` first; on failure, retry once with `gemini-3-pro-preview`.
 - If `/app/docs/DESIGN.md` is missing/empty, stop and report blocked.
