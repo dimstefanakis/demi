@@ -24,15 +24,34 @@ Read these before any design run:
 ## Required Design Workflow
 
 1. Confirm design scope from `tasks/prd.md` and `tasks/design_context.md`.
-2. Use `/app/docs/DESIGN.md` as the canonical Gemini template (do not edit it).
-3. Run Gemini in auto-edit mode from the app directory so files are edited in-place.
-4. Pass task/design context via stdin.
-5. If strong reference signals are present, ensure `tasks/design_context.md` contains:
-   - `## Design References`
-   - `## Reference Direction`
-   - `## Reference Application`
-6. Verify Gemini produced actual file edits in the app directory.
-7. Log every attempt to `tasks/gemini_run.jsonl` with:
+2. **Reference deep-dive (if reference URLs are present):**
+   - Crawl/scrape the reference site's core pages — not just the homepage. Target: homepage, 1-2
+     inner/feature pages, pricing/about if they exist.
+   - For each page, extract and document in `tasks/design_context.md`:
+     - Layout structure (section order, grid patterns, content density)
+     - Navigation pattern (sticky, transparent, hamburger style, etc.)
+     - Typography (fonts, scale, weight distribution)
+     - Color usage (background ratios, accent placement, section color rhythm)
+     - Spacing & whitespace philosophy
+     - Motion/interaction patterns (hover states, scroll animations, transitions)
+     - Recurring section archetypes (card grids, alternating image-text, full-bleed heroes, etc.)
+   - Write a `## Reference DNA` section in `tasks/design_context.md` with 5-8 concrete traits
+     and how each maps to the output pages.
+   - This reference DNA must be passed to Gemini as part of the design context so it applies
+     consistently across every page, not just the landing/hero.
+3. Use `/app/docs/DESIGN.md` as the canonical Gemini template (do not edit it).
+4. Run Gemini in auto-edit mode from the app directory so files are edited in-place.
+5. Pass task/design context via stdin — include the reference DNA if references were analyzed.
+6. If strong reference signals are present, ensure `tasks/design_context.md` contains:
+   - `## Design References` (URLs and screenshots)
+   - `## Reference DNA` (extracted traits from step 2)
+   - `## Reference Direction` (which aspects to prioritize)
+   - `## Reference Application` (how traits map to each output page/component)
+7. Verify Gemini produced actual file edits in the app directory.
+8. **Reference consistency check**: If references were provided, spot-check that inner pages and
+   secondary components match the reference vibe — not just the hero/homepage. If they diverge,
+   re-run Gemini with explicit instructions to align the inconsistent pages.
+9. Log every attempt to `tasks/gemini_run.jsonl` with:
    - `timestamp`, `model`, `status`, `exit_code`, `output_path`, `output_bytes`, `workdir`
 
 ## Hard Rules
