@@ -359,6 +359,9 @@ Execution and interaction sessions are tracked separately:
 - Interaction routing session IDs: `tenant_state(namespace='interaction', key='claude_route_session')`.
 - Interaction instruction/update session IDs:
   `tenant_state(namespace='interaction', key='claude_instruction_session')`.
+- Execution session cache files are written under `<tenant_root>/.execution_home/` by setting
+  `HOME` for execution runs. In Docker, this resolves to `/workspace/.execution_home/` and is
+  persisted via the tenant workspace bind mount so SDK `resume` works across fresh containers.
 - Interaction session cache files are written under `INTERACTION_SESSION_CACHE_DIR/tenant-<id>/`.
   This path is not mounted into execution containers.
 
@@ -477,6 +480,7 @@ Run selection when streaming to execution:
 11. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
 12. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
+    - Execution completion always enqueues a final interaction update (outbox) as a safety-net so successful runs cannot finish silently even if the model never calls `send_message`.
     - Git versioning is scoped to deployable app files within the project (for example `site/` or another app root);
       orchestration metadata files are excluded from website commits.
     - If a run fails while draining queued `run_inputs`, the input is re-queued for retry.

@@ -362,7 +362,11 @@ def test_should_send_message_blocks_after_final(tmp_path):
 def test_send_message_primary_enqueues_interaction_update(tmp_path):
     db = build_test_db()
     tenant = create_test_tenant(db)
-    tasks_dir = tmp_path / "tasks"
+    project_name = "alpha"
+    tasks_dir = tmp_path / "projects" / project_name / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    run_id = db.create_run(tenant.id, project_name=project_name)
+    correlation_id = "execution-final:77"
     messenger = FakeMessenger()
     tools = build_chat_tools(
         ChatToolContext(
@@ -373,16 +377,21 @@ def test_send_message_primary_enqueues_interaction_update(tmp_path):
             db=db,
             tenant_id=tenant.id,
             provider=tenant.provider,
+            run_id=run_id,
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_message")
 
-    asyncio.run(send_tool.handler({"text": "Progress update"}))
+    asyncio.run(send_tool.handler({"text": "Progress update", "correlation_id": correlation_id}))
 
     assert messenger.sent == []
     outbox = db.list_outbox(tenant.id, limit=5)
     assert outbox
-    payload = outbox[-1]["payload_json"]
+    row = outbox[-1]
+    assert int(row["run_id"]) == run_id
+    assert row["project_name"] == project_name
+    assert row["correlation_id"] == correlation_id
+    payload = row["payload_json"]
     assert payload["type"] == "interaction_update"
     assert payload["text"] == "Progress update"
 

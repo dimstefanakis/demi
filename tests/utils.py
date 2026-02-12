@@ -15,6 +15,7 @@ def build_test_db():
     _clear_outbox(db)
     _clear_queue_tables(db)
     _clear_pending_message_statuses(db)
+    _clear_received_messages(db)
     return db
 
 
@@ -89,6 +90,19 @@ def _clear_pending_message_statuses(db) -> None:
             db._table("messages")
             .update({"status": "processed"})
             .in_("status", ["pending", "processing"])
+        )
+    except Exception:
+        return
+
+
+def _clear_received_messages(db) -> None:
+    # Tests create "received" messages explicitly; any leftovers from prior test
+    # runs can make stale-recovery tests nondeterministic.
+    try:
+        db._execute(
+            db._table("messages")
+            .update({"status": "processed"})
+            .eq("status", "received")
         )
     except Exception:
         return

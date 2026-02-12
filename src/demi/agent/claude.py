@@ -13,6 +13,7 @@ from contextlib import suppress
 import asyncio
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
+from claude_agent_sdk._errors import ProcessError
 from claude_agent_sdk.types import AssistantMessage, ResultMessage, SystemMessage
 
 from demi.agent.chat_tools import (
@@ -40,6 +41,7 @@ from demi.agent.github_tools import (
 from demi.agent.tool_logging import log_agent_event
 from demi.config import Settings
 from demi.agent.inflight import InflightTextStream
+from demi.agent.execution_outbox import execution_final_correlation_id, has_final_interaction_update
 from demi.models import NormalizedMessage
 from demi.observability import observe
 from demi.runtime.tenant_tooling import bootstrap_tenant_tooling
@@ -450,6 +452,18 @@ class ClaudeAgent:
         tooling_bin_path: Path | None = None,
     ) -> dict[str, str]:
         env = cls._base_agent_env(settings=settings, workspace=workspace)
+        # Execution runs must be resumable across fresh Docker containers. Claude Code / Agent SDK
+        # stores resume session state under HOME (e.g. ~/.claude). If HOME points at the container
+        # default (/root) and the container is ephemeral, persisted `--resume <session_id>` will
+        # fail even when the session ID is correct. Use a tenant-scoped, durable HOME instead.
+        tenant_root = Path(getattr(workspace, "tenant_root", workspace.root))
+        execution_home_dir = tenant_root / ".execution_home"
+        try:
+            execution_home_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+        else:
+            env["HOME"] = str(execution_home_dir)
         if tooling_bin_path:
             env["PATH"] = cls._prepend_path(os.environ.get("PATH"), tooling_bin_path)
         if runtime_env:
@@ -733,23 +747,141 @@ class ClaudeAgent:
             )
 
         try:
-            return await _execute_once(session_id)
+            result = await _execute_once(session_id)
         except Exception as exc:
-            if session_id and self._is_resume_error(exc):
+            if session_id and (self._is_resume_error(exc) or isinstance(exc, ProcessError)):
                 log_agent_event(
                     workspace.tasks_dir,
                     "execution_resume_fallback",
-                    {"error": str(exc), "stale_session_id": session_id},
+                    {
+                        "error": str(exc),
+                        "stale_session_id": session_id,
+                        "error_type": exc.__class__.__name__,
+                        "exit_code": getattr(exc, "exit_code", None),
+                    },
                 )
-                return await _execute_once(None)
-            if self._is_retryable_execution_error(exc):
+                result = await _execute_once(None)
+            elif self._is_retryable_execution_error(exc):
                 log_agent_event(
                     workspace.tasks_dir,
                     "execution_error_during_execution_fallback",
                     {"error": str(exc), "session_id": session_id},
                 )
-                return await _execute_once(None)
-            raise
+                result = await _execute_once(None)
+            else:
+                raise
+
+        # Ensure a completion update is always wired to the interaction agent even if
+        # the model didn't explicitly call send_message. The execution agent should
+        # create the outbox record using its own persistent session/context.
+        try:
+            if run_id is not None:
+                correlation_id = execution_final_correlation_id(run_id)
+                if has_final_interaction_update(workspace.tasks_dir, correlation_id=correlation_id):
+                    return result
+                reference = (result.summary or "").strip()
+                finalizer_prompt = "\n".join(
+                    [
+                        "A completed execution run must queue a FINAL interaction update.",
+                        "",
+                        "Rules:",
+                        f"- Call {SEND_MESSAGE_TOOL} exactly once.",
+                        "- Set final: true.",
+                        f"- Set correlation_id: {correlation_id}.",
+                        "- The message text must be a short, user-facing summary of what you did and the outcome.",
+                        "- Do NOT do any additional work or file edits. Do NOT send anything directly to the user.",
+                        "",
+                        "If helpful, you may read run artifacts (run_result.json, deploy_url.txt, gemini_output.txt) "
+                        "to accurately summarize what happened.",
+                        "",
+                        f"Reference (your last result output):\n{reference}",
+                    ]
+                ).strip()
+                allowed_tools = [
+                    "Read",
+                    "Grep",
+                    "Glob",
+                    SEND_MESSAGE_TOOL,
+                    f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
+                ]
+                if settings.claude_enable_memory_tool:
+                    allowed_tools.append("Memory")
+                options = ClaudeAgentOptions(
+                    allowed_tools=allowed_tools,
+                    permission_mode=self.permission_mode,
+                    system_prompt=self.system_prompt,
+                    setting_sources=self.setting_sources,
+                    model=settings.execution_model,
+                    max_thinking_tokens=min(settings.execution_thinking_max_tokens(), 800),
+                    resume=result.session_id or None,
+                    cwd=workspace.root,
+                    add_dirs=self._execution_add_dirs(workspace),
+                    env=execution_env,
+                    plugins=self.plugins,
+                    agents=self.agents,
+                    mcp_servers={CHAT_SERVER_NAME: chat_server},
+                    stderr=_cli_stderr_logger(workspace.tasks_dir, "primary_finalizer"),
+                )
+                try:
+                    client = ClaudeSDKClient(options=options)
+                    await client.connect()
+                    try:
+                        await client.query(
+                            self._prompt_stream(finalizer_prompt),
+                            session_id=result.session_id or "default",
+                        )
+                        async for _msg in client.receive_response():
+                            pass
+                    finally:
+                        await client.disconnect()
+                except Exception:
+                    # Best-effort; always attempt a local outbox/file fallback below.
+                    pass
+
+                if not has_final_interaction_update(
+                    workspace.tasks_dir,
+                    correlation_id=correlation_id,
+                ):
+                    # Last-resort fallback: never allow a silent success even if the model fails
+                    # to call send_message in the finalizer turn.
+                    text = reference or "Execution finished."
+                    payload = {
+                        "type": "interaction_update",
+                        "action": "send_message",
+                        "text": text,
+                        "final": True,
+                        "correlation_id": correlation_id,
+                        "run_id": int(run_id) if run_id is not None else None,
+                        "project_name": workspace.project_name,
+                        "provider": message.provider,
+                        "tenant_external_id": message.tenant_external_id,
+                        "source": "execution_final_fallback",
+                    }
+                    enqueued = False
+                    if db is not None and tenant_id is not None:
+                        try:
+                            db.enqueue_outbox(
+                                tenant_id=int(tenant_id),
+                                run_id=int(run_id) if run_id is not None else None,
+                                project_name=workspace.project_name,
+                                correlation_id=correlation_id,
+                                payload=payload,
+                            )
+                            enqueued = True
+                        except Exception:
+                            enqueued = False
+                    if not enqueued:
+                        try:
+                            path = workspace.tasks_dir / "interaction_updates.jsonl"
+                            path.parent.mkdir(parents=True, exist_ok=True)
+                            with path.open("a", encoding="utf-8") as handle:
+                                handle.write(json.dumps(payload, ensure_ascii=True) + "\n")
+                        except OSError:
+                            pass
+        except Exception:
+            # Best-effort: never fail the run due to notification wiring.
+            pass
+        return result
 
     @observe(name="claude.send_interaction_message", ignore_input=True)
     async def send_interaction_message(

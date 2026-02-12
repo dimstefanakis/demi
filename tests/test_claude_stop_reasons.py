@@ -314,6 +314,7 @@ async def test_prepare_context_sets_tool_search_memory_env_and_records_usage(
 async def test_prepare_context_resume_fallback_reenables_inflight_stream(tmp_path, monkeypatch):
     capture: dict[str, list] = {
         "accepting_at_query_start": [],
+        "options": [],
         "resume_options": [],
     }
 
@@ -336,6 +337,7 @@ async def test_prepare_context_resume_fallback_reenables_inflight_stream(tmp_pat
     class FakeClient:
         def __init__(self, options):
             self.options = options
+            capture["options"].append(options)
             capture["resume_options"].append(options.resume)
 
         async def connect(self):
@@ -391,8 +393,99 @@ async def test_prepare_context_resume_fallback_reenables_inflight_stream(tmp_pat
     )
 
     assert result.session_id == "session-fresh"
-    assert capture["resume_options"] == ["session-stale", None]
-    assert capture["accepting_at_query_start"] == [True, True]
+    assert capture["resume_options"][:2] == ["session-stale", None]
+    assert capture["accepting_at_query_start"][:2] == [True, True]
+    expected_home = str(workspace.tenant_root / ".execution_home")
+    assert all(str(options.env.get("HOME")) == expected_home for options in capture["options"])
+
+
+@pytest.mark.asyncio
+async def test_prepare_context_resume_fallback_on_process_error(tmp_path, monkeypatch):
+    capture: dict[str, list] = {
+        "options": [],
+        "resume_options": [],
+    }
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = "ok"
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "session-fresh"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            capture["options"].append(options)
+            capture["resume_options"].append(options.resume)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for _ in prompt_stream:
+                pass
+            return None
+
+        async def receive_response(self):
+            if self.options.resume:
+                from claude_agent_sdk._errors import ProcessError
+
+                raise ProcessError(
+                    "Command failed with exit code 1",
+                    exit_code=1,
+                    stderr="Check stderr output for details",
+                )
+            yield FakeSystemMessage("init", {"session_id": "session-fresh"})
+            yield FakeResultMessage()
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    task_path = workspace.write_task("# Task\n\nDo work\n")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="resume-fallback-process-error-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a site",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    result = await agent.prepare_context(
+        workspace=workspace,
+        task_path=task_path,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+        run_id=778,
+        session_id="session-stale",
+    )
+
+    assert result.session_id == "session-fresh"
+    assert capture["resume_options"][:2] == ["session-stale", None]
+    expected_home = str(workspace.tenant_root / ".execution_home")
+    assert all(str(options.env.get("HOME")) == expected_home for options in capture["options"])
 
 
 @pytest.mark.asyncio
@@ -483,4 +576,4 @@ async def test_prepare_context_retries_once_on_error_during_execution(tmp_path, 
 
     assert result.session_id == "session-recovered"
     assert result.result_subtype == "success"
-    assert capture["resume_options"] == ["session-stale", None]
+    assert capture["resume_options"][:2] == ["session-stale", None]

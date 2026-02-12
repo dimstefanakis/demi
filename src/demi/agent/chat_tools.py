@@ -13,6 +13,7 @@ import uuid
 
 from demi.db.core import Database
 from demi.memory.logs import append_log, write_chat_history
+from demi.agent.execution_outbox import execution_final_correlation_id
 from demi.agent.tool_logging import log_tool_run
 from demi.config import Settings
 from demi.workspace.project_decider import decide_project as decide_project_for_tenant
@@ -278,10 +279,38 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             if not correlation_id:
                 correlation_id = f"interaction-update:{uuid.uuid4()}"
                 payload["correlation_id"] = correlation_id
+
+            run_id = payload.get("run_id")
+            if run_id is not None:
+                try:
+                    run_id = int(run_id)
+                except (TypeError, ValueError):
+                    run_id = None
+            if run_id is None:
+                run_id = _current_run_id(context)
+                if run_id is not None:
+                    payload["run_id"] = run_id
+
+            project_name = payload.get("project_name")
+            if run_id is not None:
+                try:
+                    run_row = context.db.get_run(int(run_id))
+                except Exception:
+                    run_row = None
+                if isinstance(run_row, dict):
+                    project_from_run = str(run_row.get("project_name") or "").strip()
+                    if project_from_run:
+                        project_name = project_from_run
+                        payload["project_name"] = project_name
+
+            if not project_name:
+                project_name = _project_name_from_tasks_dir(context.tasks_dir)
+                if project_name:
+                    payload["project_name"] = project_name
             context.db.enqueue_outbox(
                 tenant_id=tenant_id,
-                run_id=None,
-                project_name=payload.get("project_name"),
+                run_id=run_id,
+                project_name=project_name,
                 correlation_id=str(correlation_id),
                 payload=payload,
             )
@@ -752,24 +781,40 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     @tool(
         "send_message",
         "Send a user-facing chat update via the active messaging provider.",
-        {"text": str, "final": bool, "reply_to_message_id": str, "reply_to_text": str},
+        {
+            "text": str,
+            "final": bool,
+            "reply_to_message_id": str,
+            "reply_to_text": str,
+            # Optional: allow deterministic outbox dedupe for retries/safety-nets.
+            "correlation_id": str,
+        },
     )
     async def send_message(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
         if str(context.role or "primary") != "interaction":
             text = str(args.get("text", "")).strip()
+            final = bool(args.get("final", False))
+            run_id = _current_run_id(context)
+            correlation_id = str(args.get("correlation_id") or "").strip()
+            if not correlation_id and final and run_id is not None:
+                correlation_id = execution_final_correlation_id(run_id)
+            if correlation_id:
+                args["correlation_id"] = correlation_id
             update_payload = {
                 "type": "interaction_update",
                 "action": "send_message",
                 "text": text,
-                "final": bool(args.get("final", False)),
+                "final": final,
                 "reply_to_message_id": str(args.get("reply_to_message_id", "")).strip(),
                 "reply_to_text": str(args.get("reply_to_text", "")).strip(),
                 "tenant_external_id": context.tenant_external_id,
                 "provider": context.provider,
                 "project_name": _project_name_from_tasks_dir(context.tasks_dir),
-                "run_id": _current_run_id(context),
+                "run_id": run_id,
             }
+            if correlation_id:
+                update_payload["correlation_id"] = correlation_id
             if not _enqueue_interaction_update(update_payload):
                 payload = {"queued": False, "status": "interaction_update_failed"}
                 _log("send_message", args, result=payload, start=start)
@@ -930,6 +975,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "final": {"type": "boolean"},
                 "reply_to_message_id": {"type": "string"},
                 "reply_to_text": {"type": "string"},
+                # Optional: allow deterministic outbox dedupe for retries/safety-nets.
+                "correlation_id": {"type": "string"},
             },
             "required": ["text"],
         },
@@ -944,20 +991,29 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "is_error": False,
             }
         if str(context.role or "primary") != "interaction":
+            final = bool(args.get("final", False))
+            run_id = _current_run_id(context)
+            correlation_id = str(args.get("correlation_id") or "").strip()
+            if not correlation_id and final and run_id is not None:
+                correlation_id = execution_final_correlation_id(run_id)
+            if correlation_id:
+                args["correlation_id"] = correlation_id
             update_payload = {
                 "type": "interaction_update",
                 "action": "send_payment_link",
                 "order_id": args.get("order_id"),
                 "source": str(args.get("source") or "").strip(),
                 "text": str(args.get("text", "")).strip(),
-                "final": bool(args.get("final", False)),
+                "final": final,
                 "reply_to_message_id": str(args.get("reply_to_message_id") or "").strip(),
                 "reply_to_text": str(args.get("reply_to_text") or "").strip(),
                 "tenant_external_id": context.tenant_external_id,
                 "provider": context.provider,
                 "project_name": _project_name_from_tasks_dir(context.tasks_dir),
-                "run_id": _current_run_id(context),
+                "run_id": run_id,
             }
+            if correlation_id:
+                update_payload["correlation_id"] = correlation_id
             if not _enqueue_interaction_update(update_payload):
                 payload = {"queued": False, "status": "interaction_update_failed"}
                 _log("send_payment_link", args, result=payload, start=start)
