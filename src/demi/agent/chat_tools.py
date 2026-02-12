@@ -883,12 +883,16 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 context.on_interaction_message_sent()
             except Exception:
                 pass
+        metadata: dict[str, Any] = {"final": final}
+        correlation_id = str(args.get("correlation_id") or "").strip()
+        if correlation_id:
+            metadata["correlation_id"] = correlation_id
         _record_outbound_event(
             text=text,
             message_type="message",
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            metadata={"final": final},
+            metadata=metadata,
         )
         _log("send_message", args, result={"sent": True}, start=start)
         return {
@@ -1112,16 +1116,20 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 context.on_interaction_message_sent()
             except Exception:
                 pass
+        metadata: dict[str, Any] = {
+            "final": final,
+            "order_id": order_id,
+            "source": source or None,
+        }
+        correlation_id = str(args.get("correlation_id") or "").strip()
+        if correlation_id:
+            metadata["correlation_id"] = correlation_id
         _record_outbound_event(
             text=message,
             message_type="payment_link",
             reply_to_message_id=reply_to_message_id,
             reply_to_text=reply_to_text,
-            metadata={
-                "final": final,
-                "order_id": order_id,
-                "source": source or None,
-            },
+            metadata=metadata,
         )
         payload = {"ok": True, "order_id": order_id, "sent": True}
         _log("send_payment_link", args, result=payload, start=start)

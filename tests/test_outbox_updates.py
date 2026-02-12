@@ -140,6 +140,7 @@ async def test_outbox_worker_routes_interaction_updates(tmp_path):
 
     assert agent.instructions
     assert "Final: True" in agent.instructions[0]["instruction"]
+    assert "Correlation ID: update-1" in agent.instructions[0]["instruction"]
     rows = db.list_outbox(tenant.id, limit=5)
     row = next((item for item in rows if str(item.get("id")) == str(outbox_id)), None)
     assert row is not None

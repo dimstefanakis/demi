@@ -359,6 +359,10 @@ class OutboxWorker:
             workspace = self.workspace_manager.ensure_workspace(
                 tenant.key, project_name=project_name
             )
+        if "correlation_id" not in payload:
+            correlation_id = str(row.get("correlation_id") or "").strip()
+            if correlation_id:
+                payload["correlation_id"] = correlation_id
         run_id = self._coerce_run_id(payload.get("run_id") or row.get("run_id"))
         return await self._send_interaction_update(tenant, workspace, payload, run_id)
 
@@ -424,6 +428,7 @@ class OutboxWorker:
         if action == "interaction_update":
             action = str(payload.get("action") or "send_message").strip().lower()
         instruction = ""
+        correlation_id = str(payload.get("correlation_id") or "").strip()
         if action == "send_payment_link":
             reply_to_message_id = str(payload.get("reply_to_message_id") or "").strip()
             reply_to_text = str(payload.get("reply_to_text") or "").strip()
@@ -431,6 +436,7 @@ class OutboxWorker:
                 "A payment link needs to be sent based on an execution update.",
                 f"Order ID: {payload.get('order_id')}",
                 f"Source: {payload.get('source')}",
+                f"Correlation ID: {correlation_id or 'n/a'} (include as correlation_id if you send)",
                 f"Text: {payload.get('text')}",
                 f"Final: {bool(payload.get('final', False))}",
             ]
@@ -448,6 +454,7 @@ class OutboxWorker:
             lines = [
                 "Execution update (decide if the user should be notified now).",
                 "If yes, send a short, friendly status update.",
+                f"Correlation ID: {correlation_id or 'n/a'} (include as correlation_id if you send)",
                 f"Final: {final_flag}. If final, set final: true on send_message.",
             ]
             if reply_to_message_id or reply_to_text:

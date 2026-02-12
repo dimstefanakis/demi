@@ -27,6 +27,7 @@ class Settings(BaseSettings):
     interaction_agent_routing_prompt_path: Path | None = None
     # Legacy alias kept for backward compatibility.
     interaction_router_prompt_path: Path | None = None
+    interaction_helper_prompt_path: Path = Path("prompts/interaction_helper.md")
     execution_model: str = "claude-sonnet-4-5-20250929"
     execution_max_thinking_tokens: int | None = 2048
     interaction_model: str = "claude-opus-4-6"

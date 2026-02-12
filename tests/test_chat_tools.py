@@ -255,6 +255,7 @@ def test_send_message_logs_outbound_event(tmp_path):
                 "final": True,
                 "reply_to_message_id": "msg-1",
                 "reply_to_text": "Build it",
+                "correlation_id": "update-1",
             }
         )
     )
@@ -269,6 +270,7 @@ def test_send_message_logs_outbound_event(tmp_path):
     assert row["provider_message_id"] == "msg-1"
     metadata = row["metadata_json"]
     assert metadata["final"] is True
+    assert metadata["correlation_id"] == "update-1"
 
 
 def test_send_payment_link_logs_outbound_event(tmp_path):
@@ -308,7 +310,14 @@ def test_send_payment_link_logs_outbound_event(tmp_path):
     send_tool = next(tool for tool in tools if tool.name == "send_payment_link")
 
     asyncio.run(
-        send_tool.handler({"source": "backend", "text": "Please pay to continue.", "final": True})
+        send_tool.handler(
+            {
+                "source": "backend",
+                "text": "Please pay to continue.",
+                "final": True,
+                "correlation_id": "update-pay-1",
+            }
+        )
     )
 
     events = db.list_message_events(tenant.id, limit=5)
@@ -319,6 +328,7 @@ def test_send_payment_link_logs_outbound_event(tmp_path):
     metadata = row["metadata_json"]
     assert metadata["final"] is True
     assert metadata["source"] == "backend"
+    assert metadata["correlation_id"] == "update-pay-1"
 
 
 @pytest.mark.skip(reason="Temporarily disabled per request (flake in local env).")

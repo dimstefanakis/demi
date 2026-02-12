@@ -788,7 +788,8 @@ class ClaudeAgent:
                         f"- Call {SEND_MESSAGE_TOOL} exactly once.",
                         "- Set final: true.",
                         f"- Set correlation_id: {correlation_id}.",
-                        "- The message text must be a short, user-facing summary of what you did and the outcome.",
+                        "- The message text MUST be an <execution_update> XML seed (see system prompt template).",
+                        "- Keep it short and factual. Put the outcome/live URL (if any) in <next_step>.",
                         "- Do NOT do any additional work or file edits. Do NOT send anything directly to the user.",
                         "",
                         "If helpful, you may read run artifacts (run_result.json, deploy_url.txt, gemini_output.txt) "
@@ -1849,6 +1850,9 @@ class ClaudeAgent:
     def _default_agents() -> dict[str, AgentDefinition]:
         settings = Settings()
         interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
+        interaction_helper_prompt = ClaudeAgent._load_prompt_file(
+            settings.interaction_helper_prompt_path
+        )
         planner_prompt = ClaudeAgent._load_prompt_file(settings.planner_prompt_path)
         product_designer_prompt = ClaudeAgent._load_prompt_file(
             settings.product_designer_prompt_path
@@ -1947,7 +1951,7 @@ class ClaudeAgent:
             ),
             "interaction-helper": AgentDefinition(
                 description="Creates friendly, concise user-facing chat updates and questions.",
-                prompt=interaction_prompt,
+                prompt=interaction_helper_prompt,
                 tools=interaction_tools,
                 model=interaction_subagent_model,
             ),
