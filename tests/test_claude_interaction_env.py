@@ -1,4 +1,6 @@
 import pytest
+import json
+from pathlib import Path
 
 import demi.agent.claude as claude_module
 from demi.agent.claude import ClaudeAgent
@@ -545,3 +547,169 @@ async def test_route_interaction_aborts_on_retry_cost_budget(tmp_path, monkeypat
         )
     # Attempt1 (0.08) continues; attempt2 pushes cumulative cost above 0.1 and aborts.
     assert query_calls["count"] == 2
+
+
+def test_migrate_interaction_resume_session_preserves_existing_session(tmp_path):
+    settings = Settings(root_dir=tmp_path)
+    tenant_id = 77
+    session_id = "legacy-session-123"
+
+    projects_root = (
+        settings.resolved_interaction_session_cache_dir()
+        / f"tenant-{tenant_id}"
+        / ".claude"
+        / "projects"
+    )
+    source_dir = projects_root / "-app-data-pool-tenant-77-projects-main"
+    source_dir.mkdir(parents=True, exist_ok=True)
+    source_file = source_dir / f"{session_id}.jsonl"
+    source_file.write_text('{"type":"user","message":{"role":"user","content":"hello"}}\n')
+    source_index_path = source_dir / "sessions-index.json"
+    source_index_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "entries": [
+                    {
+                        "sessionId": session_id,
+                        "fullPath": str(source_file),
+                        "fileMtime": int(source_file.stat().st_mtime * 1000),
+                        "firstPrompt": "legacy",
+                        "messageCount": 2,
+                        "created": "2026-02-01T00:00:00Z",
+                        "modified": "2026-02-01T00:05:00Z",
+                        "gitBranch": "",
+                        "projectPath": "/app/data/pool/tenant-77/projects/main",
+                        "isSidechain": False,
+                    }
+                ],
+                "originalPath": "/app/data/pool/tenant-77/projects/main",
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+
+    workspace = type("WorkspaceStub", (), {"root": Path("/app/data/pool/tenant-77")})()
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+
+    migrated = ClaudeAgent._migrate_interaction_resume_session(
+        settings=settings,
+        workspace=workspace,
+        tenant_id=tenant_id,
+        session_id=session_id,
+        tasks_dir=tasks_dir,
+    )
+    assert migrated is True
+
+    target_dir = projects_root / "-app-data-pool-tenant-77"
+    target_file = target_dir / f"{session_id}.jsonl"
+    assert target_file.exists()
+    assert target_file.read_text(encoding="utf-8") == source_file.read_text(encoding="utf-8")
+
+    target_index_path = target_dir / "sessions-index.json"
+    target_payload = json.loads(target_index_path.read_text(encoding="utf-8"))
+    entry = next(
+        item
+        for item in target_payload.get("entries", [])
+        if item.get("sessionId") == session_id
+    )
+    assert entry["projectPath"] == "/app/data/pool/tenant-77"
+    assert entry["messageCount"] == 2
+    assert target_payload["originalPath"] == "/app/data/pool/tenant-77"
+
+
+@pytest.mark.asyncio
+async def test_route_interaction_recovers_from_terminated_process_resume(
+    tmp_path, monkeypatch
+):
+    captured_resumes: list[str | None] = []
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = '{"should_run": false, "billing_check": false, "billing_checked": true}'
+            self.structured_output = {
+                "should_run": False,
+                "billing_check": False,
+                "billing_checked": True,
+            }
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "fresh-interaction-session"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+            captured_resumes.append(options.resume)
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for _ in prompt_stream:
+                break
+            if self.options.resume:
+                raise RuntimeError("Command failed with exit code 1")
+            return None
+
+        async def receive_response(self):
+            if self.options.resume:
+                return
+                yield  # pragma: no cover
+            yield FakeSystemMessage("init", {"session_id": "fresh-interaction-session"})
+            yield FakeResultMessage()
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    db.set_tenant_kv(
+        tenant.id,
+        "interaction",
+        "claude_route_session",
+        {"session_id": "stale-interaction-session"},
+    )
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="route-resume-fail-1",
+        tenant_external_id=tenant.external_id,
+        received_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+        text="ping",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    result = await agent.route_interaction(
+        workspace=workspace,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+        provider=tenant.provider,
+        tenant_external_id=tenant.external_id,
+        session_id="stale-interaction-session",
+        billing_checked=True,
+    )
+
+    assert result.decision["should_run"] is False
+    assert captured_resumes[0] == "stale-interaction-session"
+    assert captured_resumes[-1] is None
+    assert db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") is None

@@ -8,9 +8,11 @@ import mimetypes
 from pathlib import Path
 import os
 import re
+import shutil
 from typing import Any, Callable, Literal
 from contextlib import suppress
 import asyncio
+from datetime import datetime, timezone
 
 from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient, AgentDefinition
 from claude_agent_sdk._errors import ProcessError
@@ -335,6 +337,164 @@ class ClaudeAgent:
             "conversation not found",
         )
         return any(needle in text for needle in needles)
+
+    @staticmethod
+    def _is_terminated_process_error(exc: Exception) -> bool:
+        text = str(exc).strip().lower()
+        if not text:
+            return False
+        needles = (
+            "cannot write to terminated process",
+            "terminated process (exit code",
+            "command failed with exit code",
+            "fatal error in message reader",
+            "cliconnectionerror",
+        )
+        return any(needle in text for needle in needles)
+
+    @classmethod
+    def _should_reset_interaction_resume(cls, exc: Exception) -> bool:
+        return cls._is_resume_error(exc) or cls._is_terminated_process_error(exc)
+
+    @staticmethod
+    async def _safe_disconnect(
+        client: ClaudeSDKClient,
+        *,
+        tasks_dir: Path,
+        context: str,
+    ) -> None:
+        try:
+            await client.disconnect()
+        except Exception as exc:  # noqa: BLE001
+            try:
+                log_agent_event(
+                    tasks_dir,
+                    "disconnect_failed",
+                    {
+                        "context": context,
+                        "error": str(exc),
+                        "error_type": exc.__class__.__name__,
+                    },
+                )
+            except Exception:
+                pass
+
+    @staticmethod
+    def _project_session_dir_name(project_path: Path) -> str:
+        # Claude session index keys are path-derived with path separators normalized.
+        return re.sub(r"[^A-Za-z0-9._-]", "-", str(project_path))
+
+    @classmethod
+    def _migrate_interaction_resume_session(
+        cls,
+        *,
+        settings: Settings,
+        workspace: Workspace,
+        tenant_id: int | None,
+        session_id: str | None,
+        tasks_dir: Path,
+    ) -> bool:
+        session_value = str(session_id or "").strip()
+        if tenant_id is None or not session_value:
+            return False
+        base_dir = settings.resolved_interaction_session_cache_dir() / f"tenant-{int(tenant_id)}"
+        projects_root = base_dir / ".claude" / "projects"
+        if not projects_root.exists():
+            return False
+
+        current_project_path = Path(workspace.root).resolve()
+        target_dir = projects_root / cls._project_session_dir_name(current_project_path)
+        target_file = target_dir / f"{session_value}.jsonl"
+        if target_file.exists():
+            return False
+
+        source_candidates = sorted(
+            projects_root.glob(f"*/{session_value}.jsonl"),
+            key=lambda path: path.stat().st_mtime if path.exists() else 0,
+            reverse=True,
+        )
+        if not source_candidates:
+            return False
+        source_file = source_candidates[0]
+        if source_file.parent == target_dir:
+            return False
+
+        source_entry: dict[str, Any] | None = None
+        source_index_path = source_file.parent / "sessions-index.json"
+        try:
+            source_index_payload = (
+                json.loads(source_index_path.read_text(encoding="utf-8"))
+                if source_index_path.exists()
+                else None
+            )
+        except (OSError, json.JSONDecodeError):
+            source_index_payload = None
+        if isinstance(source_index_payload, dict):
+            for entry in source_index_payload.get("entries") or []:
+                if (
+                    isinstance(entry, dict)
+                    and str(entry.get("sessionId") or "").strip() == session_value
+                ):
+                    source_entry = dict(entry)
+                    break
+
+        target_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_file, target_file)
+
+        target_index_path = target_dir / "sessions-index.json"
+        try:
+            target_index_payload = (
+                json.loads(target_index_path.read_text(encoding="utf-8"))
+                if target_index_path.exists()
+                else {}
+            )
+        except (OSError, json.JSONDecodeError):
+            target_index_payload = {}
+        if not isinstance(target_index_payload, dict):
+            target_index_payload = {}
+        entries = [
+            entry
+            for entry in (target_index_payload.get("entries") or [])
+            if not (
+                isinstance(entry, dict)
+                and str(entry.get("sessionId") or "").strip() == session_value
+            )
+        ]
+        now_iso = datetime.now(tz=timezone.utc).isoformat().replace("+00:00", "Z")
+        migrated_entry: dict[str, Any] = {
+            "sessionId": session_value,
+            "fullPath": str(target_file),
+            "fileMtime": int(target_file.stat().st_mtime * 1000),
+            "projectPath": str(current_project_path),
+            "isSidechain": bool((source_entry or {}).get("isSidechain", False)),
+            "modified": now_iso,
+            "created": (source_entry or {}).get("created") or now_iso,
+        }
+        for key in ("firstPrompt", "messageCount", "gitBranch"):
+            value = (source_entry or {}).get(key)
+            if value is not None:
+                migrated_entry[key] = value
+        entries.append(migrated_entry)
+        target_index_payload["version"] = int(target_index_payload.get("version") or 1)
+        target_index_payload["entries"] = entries
+        target_index_payload["originalPath"] = str(current_project_path)
+        target_index_path.write_text(
+            json.dumps(target_index_payload, ensure_ascii=True, indent=2),
+            encoding="utf-8",
+        )
+        try:
+            log_agent_event(
+                tasks_dir,
+                "interaction_session_migrated",
+                {
+                    "session_id": session_value,
+                    "source_path": str(source_file),
+                    "target_path": str(target_file),
+                },
+            )
+        except Exception:
+            pass
+        return True
 
     @staticmethod
     def _is_retryable_execution_error(exc: Exception) -> bool:
@@ -770,7 +930,11 @@ class ClaudeAgent:
                         "result_subtype": result_subtype,
                     },
                 )
-                await client.disconnect()
+                await self._safe_disconnect(
+                    client,
+                    tasks_dir=workspace.tasks_dir,
+                    context="prepare_context",
+                )
 
             return AgentResult(
                 session_id=new_session_id,
@@ -869,7 +1033,11 @@ class ClaudeAgent:
                         async for _msg in client.receive_response():
                             pass
                     finally:
-                        await client.disconnect()
+                        await self._safe_disconnect(
+                            client,
+                            tasks_dir=workspace.tasks_dir,
+                            context="prepare_context_finalizer",
+                        )
                 except Exception:
                     # Best-effort; always attempt a local outbox/file fallback below.
                     pass
@@ -965,6 +1133,18 @@ class ClaudeAgent:
         )
 
         async def _run_once(resume_session_id: str | None) -> AgentResult:
+            cls = type(self)
+            if resume_session_id and tenant_id is not None:
+                try:
+                    cls._migrate_interaction_resume_session(
+                        settings=settings,
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=resume_session_id,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                except Exception:
+                    pass
             # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
             allowed_tools = [
                 "Read",
@@ -1062,7 +1242,11 @@ class ClaudeAgent:
                             project_name=workspace.project_name,
                         )
             finally:
-                await client.disconnect()
+                await self._safe_disconnect(
+                    client,
+                    tasks_dir=workspace.tasks_dir,
+                    context="send_interaction_message",
+                )
             return AgentResult(
                 session_id=new_session_id,
                 summary=None,
@@ -1075,10 +1259,28 @@ class ClaudeAgent:
         try:
             return await _run_once(session_id)
         except Exception as exc:
-            if session_id and self._is_resume_error(exc):
+            retry_exc = exc
+            migrated = False
+            if session_id and tenant_id is not None:
+                try:
+                    migrated = self._migrate_interaction_resume_session(
+                        settings=settings,
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                except Exception:
+                    migrated = False
+            if migrated:
+                try:
+                    return await _run_once(session_id)
+                except Exception as exc_after_migration:
+                    retry_exc = exc_after_migration
+            if session_id and self._should_reset_interaction_resume(retry_exc):
                 self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
                 return await _run_once(None)
-            raise
+            raise retry_exc
 
     @observe(name="claude.run_interaction_agent", ignore_input=True)
     async def run_interaction_agent(
@@ -1193,11 +1395,23 @@ class ClaudeAgent:
             retry_note: str | None = None,
         ) -> None:
             nonlocal total_cost_usd, usage, decision, raw_output, stop_reason, result_subtype, new_session_id
+            if resume_session_id and tenant_id is not None:
+                try:
+                    self._migrate_interaction_resume_session(
+                        settings=settings,
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=resume_session_id,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                except Exception:
+                    pass
             options = _build_options(resume_session_id)
             client = ClaudeSDKClient(options=options)
             await client.connect()
             stop_event = asyncio.Event() if inflight_stream is not None else None
             query_task: asyncio.Task[None] | None = None
+            query_error: Exception | None = None
             try:
                 prompt = (
                     "ROUTING MODE\n"
@@ -1272,9 +1486,15 @@ class ClaudeAgent:
                         query_task.cancel()
                         with suppress(asyncio.CancelledError):
                             await query_task
-                    except Exception:
-                        pass
-                await client.disconnect()
+                    except Exception as exc:  # noqa: BLE001
+                        query_error = exc
+                await self._safe_disconnect(
+                    client,
+                    tasks_dir=workspace.tasks_dir,
+                    context="run_interaction_agent",
+                )
+                if query_error is not None:
+                    raise query_error
 
         async def _query_router_with_resume(
             *,
@@ -1288,7 +1508,29 @@ class ClaudeAgent:
                     retry_note=retry_note,
                 )
             except Exception as exc:
-                if resume_session_id and self._is_resume_error(exc):
+                retry_exc = exc
+                migrated = False
+                if resume_session_id and tenant_id is not None:
+                    try:
+                        migrated = self._migrate_interaction_resume_session(
+                            settings=settings,
+                            workspace=workspace,
+                            tenant_id=tenant_id,
+                            session_id=resume_session_id,
+                            tasks_dir=workspace.tasks_dir,
+                        )
+                    except Exception:
+                        migrated = False
+                if migrated:
+                    try:
+                        await _query_router(
+                            resume_session_id=resume_session_id,
+                            retry_note=retry_note,
+                        )
+                        return
+                    except Exception as exc_after_migration:
+                        retry_exc = exc_after_migration
+                if resume_session_id and self._should_reset_interaction_resume(retry_exc):
                     self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
                     new_session_id = None
                     await _query_router(
@@ -1296,7 +1538,7 @@ class ClaudeAgent:
                         retry_note=retry_note,
                     )
                 else:
-                    raise
+                    raise retry_exc
 
         max_attempts = max(1, int(settings.interaction_routing_max_retries()) + 1)
         max_retry_cost_usd = settings.interaction_routing_max_cost_usd()
@@ -1470,6 +1712,18 @@ class ClaudeAgent:
         )
 
         async def _run_once(resume_session_id: str | None) -> AgentResult:
+            cls = type(self)
+            if resume_session_id and tenant_id is not None:
+                try:
+                    cls._migrate_interaction_resume_session(
+                        settings=settings,
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=resume_session_id,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                except Exception:
+                    pass
             # Interaction turns use SDK `resume` so the same tenant keeps conversational state.
             allowed_tools = [
                 "Read",
@@ -1559,7 +1813,11 @@ class ClaudeAgent:
                             project_name=workspace.project_name,
                         )
             finally:
-                await client.disconnect()
+                await self._safe_disconnect(
+                    client,
+                    tasks_dir=workspace.tasks_dir,
+                    context="send_interaction_instruction",
+                )
             return AgentResult(
                 session_id=new_session_id,
                 summary=None,
@@ -1572,10 +1830,28 @@ class ClaudeAgent:
         try:
             return await _run_once(session_id)
         except Exception as exc:
-            if session_id and self._is_resume_error(exc):
+            retry_exc = exc
+            migrated = False
+            if session_id and tenant_id is not None:
+                try:
+                    migrated = self._migrate_interaction_resume_session(
+                        settings=settings,
+                        workspace=workspace,
+                        tenant_id=tenant_id,
+                        session_id=session_id,
+                        tasks_dir=workspace.tasks_dir,
+                    )
+                except Exception:
+                    migrated = False
+            if migrated:
+                try:
+                    return await _run_once(session_id)
+                except Exception as exc_after_migration:
+                    retry_exc = exc_after_migration
+            if session_id and self._should_reset_interaction_resume(retry_exc):
                 self._clear_interaction_session_state(db=db, tenant_id=tenant_id)
                 return await _run_once(None)
-            raise
+            raise retry_exc
 
     @staticmethod
     def _parse_interaction_agent_json(raw: str | None) -> dict[str, Any]:
