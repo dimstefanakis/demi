@@ -31,13 +31,10 @@ class PendingWorker:
     async def _resolve_inflight_run(
         self,
         tenant: Any,
-        project_name: str | None,
         inflight: Any,
     ) -> bool:
         try:
-            workspace = await self.orchestrator._resolve_workspace(
-                tenant, project_name=project_name
-            )
+            workspace = await self.orchestrator._resolve_workspace(tenant)
             if self.orchestrator._reconcile_inflight_run(tenant, inflight, workspace):
                 return False
             stale_seconds = max(1, int(self.config.run_stale_seconds))
@@ -62,7 +59,7 @@ class PendingWorker:
                 if not groups:
                     now = time.monotonic()
                     if now >= next_active_check:
-                        await self._check_active_runs()
+                        await self._check_inflight_runs()
                         next_active_check = now + max(
                             self.config.poll_interval,
                             self.config.active_check_interval_seconds,
@@ -103,51 +100,45 @@ class PendingWorker:
         tenant = await self._db_call(self.db.get_tenant_by_id, tenant_id)
         if tenant is None:
             return
-        project_name = group.get("project_name")
         await self._db_call(
             self.db.expire_stale_runs,
             tenant.id,
-            project_name,
+            None,
             self.orchestrator._now(),
         )
-        inflight = await self._db_call(self.db.get_inflight_run, tenant.id, project_name)
+        inflight = await self._db_call(self.db.get_inflight_run, tenant.id, None)
         if inflight:
-            still_inflight = await self._resolve_inflight_run(
-                tenant, project_name, inflight
-            )
+            still_inflight = await self._resolve_inflight_run(tenant, inflight)
             if still_inflight:
                 sleep_for = self.config.poll_interval
                 if sleep_for <= 0:
                     sleep_for = 0.1
                 await asyncio.sleep(sleep_for)
                 return
-        await self.orchestrator._drain_run_inputs(tenant, project_name=project_name)
+        await self.orchestrator._drain_run_inputs(tenant)
 
-    async def _check_active_runs(self) -> None:
-        rows = await self._db_call(self.db.list_active_runs, self.config.batch_size)
-        if not rows:
-            return
-        for row in rows:
-            tenant_id = row.get("tenant_id")
-            if tenant_id is None:
-                continue
-            tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
-            if tenant is None:
-                continue
-            project_name = row.get("project_name")
-            run_id = row.get("run_id")
-            if run_id is None:
-                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
-                continue
-            run_row = await self._db_call(self.db.get_run, int(run_id))
-            if not run_row:
-                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
-                continue
-            status = run_row.get("status") if hasattr(run_row, "get") else None
-            if status and status != "running":
-                await self._db_call(self.db.clear_active_run, tenant.id, project_name)
-                continue
-            await self._resolve_inflight_run(tenant, project_name, run_row)
+    async def _check_inflight_runs(self) -> None:
+        # Tenant-scoped: scan currently running runs and reconcile stale ones.
+        batch_size = max(1, int(self.config.batch_size))
+        offset = 0
+        while True:
+            try:
+                rows = await self._db_call(self.db.list_inflight_runs, batch_size, offset)
+            except Exception:
+                return
+            if not rows:
+                return
+            for row in rows:
+                tenant_id = row.get("tenant_id")
+                if tenant_id is None:
+                    continue
+                tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
+                if tenant is None:
+                    continue
+                await self._resolve_inflight_run(tenant, row)
+            if len(rows) < batch_size:
+                return
+            offset += len(rows)
 
     async def _recover_stale_received_messages(self) -> None:
         grace_seconds = max(0.0, float(self.config.processing_grace_seconds))

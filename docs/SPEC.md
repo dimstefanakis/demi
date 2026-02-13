@@ -299,6 +299,7 @@ Workspace roots by runtime:
 
 ```
 data/<tenant_key>/
+├── MEMORY.md (optional)
 ├── tooling/
 │   ├── package.json
 │   ├── bun.lock
@@ -307,6 +308,7 @@ data/<tenant_key>/
 └── projects/
     ├── active.txt
     └── <project_name>/
+        ├── CONTEXT.md (optional)
         ├── tasks/
         │   ├── task-YYYYMMDD-HHMMSS.md
         │   ├── latest.md
@@ -333,6 +335,8 @@ data/<tenant_key>/
 ```
 
 **Memory files**
+- `MEMORY.md` (tenant root, optional) stores cross-project durable notes.
+- `CONTEXT.md` (project root, optional) stores the current working brief for the project.
 - `memory.md` stores durable business facts and decisions.
 - `chat_log.jsonl` captures conversation events.
 - `chat_history.md` keeps a short recent transcript.
@@ -345,10 +349,15 @@ data/<tenant_key>/
 
 **Project routing**
 - Each tenant can have multiple projects.
-- `projects/active.txt` stores the current default project.
+- `projects/active.txt` stores the current default project (best-effort; may be stale).
 - The orchestrator applies explicit project directives from message payload/text (`project:` or `/project`).
-- Without an explicit directive, it keeps the active project and leaves deeper project-fit selection
-  to the execution prompt flow.
+- Prompt-only routing contract:
+  - The interaction agent should attempt to infer the best-fit project by inspecting filesystem context
+    (`CONTEXT.md`, `DESCRIPTION.md`, `memory.md`, and recent `tasks/chat_summary.md` when present) and set
+    `project_name` in its routing decision.
+  - The execution agent treats the filesystem as state, keeps context files fresh, and applies stale-data
+    hygiene (update/archive/delete obsolete artifacts when safe).
+  - Storage conventions are guidance only; agents may adapt the layout when it improves clarity.
 
 ---
 
@@ -444,8 +453,8 @@ Execution runtime consumption:
 Run selection when streaming to execution:
 - Interaction agent first calls `find_execution_agent`.
 - `stream_to_execution_agent` targets `run_id` directly when provided.
-- Without `run_id`, it resolves by `project_name` when unique; if multiple candidates remain, it returns
-  `ambiguous_run` with candidates and does not stream.
+- Without `run_id`, it only auto-selects when exactly one active run exists for the tenant.
+  If multiple candidates remain, it returns `ambiguous_run` with candidates and does not stream.
 
 ---
 
@@ -474,10 +483,16 @@ Run selection when streaming to execution:
    - GitHub repo linkage is recovered from `github_repo.json` and, if missing, from local `site/.git` origin
      before creating a new repo name.
 9. If no run is needed, the messages included in the turn are marked processed. The interaction agent already replied.
-10. If a run is in flight for the same project, messages included in the turn are queued in `run_inputs`. The interaction agent handles the queued ack (orchestrator only falls back if no reply was sent).
+10. If routing decides `queue_run=true`, messages included in the turn are queued in `run_inputs`
+   for the selected active run. The interaction agent handles the queued ack (orchestrator only
+   falls back if no reply was sent).
    When streaming is supported, the interaction agent can optionally stream the new input to the
-   active execution agent instead of queueing a new run.
-11. Otherwise a new run is created and leased. The orchestrator updates the run context in Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
+   target active execution agent instead of queueing.
+11. If routing decides `should_run=true`, a new run is created and leased even when other runs are
+   already active (parallel execution is allowed). The orchestrator updates the run context in
+   Supabase (task_path, session_id). Standard acks are only sent as a fallback when no reply was sent.
+   - If routing includes `parallel_runs`, the orchestrator also starts one additional run per
+     listed execution context (fan-out) in the same interaction turn.
 12. The agent runtime executes. Execution agents do not send user-facing messages directly; they emit updates that the interaction agent delivers.
     - Execution agents emit interaction updates that are delivered by the interaction agent via outbox.
     - Execution completion always enqueues a final interaction update (outbox) as a safety-net so successful runs cannot finish silently even if the model never calls `send_message`.

@@ -16,7 +16,7 @@ ACTIVE_PROJECT_FILE = "active.txt"
 class Workspace:
     root: Path
     tenant_root: Path
-    project_name: str
+    project_name: str | None
     tasks_dir: Path
     assets_dir: Path
     site_dir: Path
@@ -39,21 +39,37 @@ class WorkspaceManager:
 
     def ensure_workspace(self, tenant_key: str, project_name: str | None = None) -> Workspace:
         tenant_root = self._tenant_root(tenant_key)
-        selected = self._resolve_project_name(tenant_root, project_name)
-        return self.ensure_project(tenant_root, selected)
+        # Project routing is prompt-only. The orchestrator always boots a tenant-scoped
+        # workspace and the agents choose/maintain project subfolders from filesystem state.
+        return self.ensure_workspace_at_path(
+            tenant_root,
+            tenant_root=tenant_root,
+        )
 
     def ensure_project_for_tenant_root(
         self, tenant_root: Path, project_name: str | None = None
     ) -> Workspace:
-        selected = self._resolve_project_name(tenant_root, project_name)
-        return self.ensure_project(tenant_root, selected)
+        # Backward-compat: callers may still pass a project root or a tenant root.
+        # Prefer tenant-root workspaces unless a project name is explicitly requested.
+        if not project_name:
+            return self.ensure_workspace_at_path(
+                Path(tenant_root),
+                tenant_root=Path(tenant_root),
+            )
+        selected = self._normalize_project_name(project_name)
+        projects_dir = Path(tenant_root) / PROJECTS_DIRNAME
+        project_root = projects_dir / selected
+        return self.ensure_workspace_at_path(
+            project_root,
+            tenant_root=Path(tenant_root),
+            project_name=selected,
+        )
 
     def ensure_project(self, tenant_root: Path, project_name: str | None = None) -> Workspace:
         tenant_root = Path(tenant_root)
         selected = self._normalize_project_name(project_name or DEFAULT_PROJECT_NAME)
         projects_dir = tenant_root / PROJECTS_DIRNAME
         project_root = projects_dir / selected
-        self._migrate_legacy_layout(tenant_root, project_root)
         return self.ensure_workspace_at_path(
             project_root,
             tenant_root=tenant_root,
@@ -68,7 +84,7 @@ class WorkspaceManager:
     ) -> Workspace:
         root = Path(root)
         inferred_tenant_root = tenant_root or self._infer_tenant_root(root)
-        inferred_project_name = project_name or root.name
+        inferred_project_name = project_name
 
         tasks_dir = root / "tasks"
         assets_dir = root / "assets"
@@ -136,6 +152,7 @@ class WorkspaceManager:
         return root
 
     def _resolve_project_name(self, tenant_root: Path, project_name: str | None) -> str:
+        # Legacy behavior: keep for compatibility with older callers.
         if project_name:
             selected = self._normalize_project_name(project_name)
             self._set_active_project(tenant_root, selected)

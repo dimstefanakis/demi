@@ -105,7 +105,7 @@ async def test_pending_worker_sleeps_when_inflight(tmp_path, monkeypatch):
     )
 
     tenant = create_test_tenant(db)
-    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -115,19 +115,18 @@ async def test_pending_worker_sleeps_when_inflight(tmp_path, monkeypatch):
         text="Queued request",
         images=[],
         raw={},
-        project_name=workspace.project_name,
+        project_name=None,
     )
     message_id, _ = db.record_message(tenant.id, msg)
     db.create_run(
         tenant.id,
         message_id=message_id,
-        project_name=workspace.project_name,
+        project_name=None,
         lease_seconds=3600,
     )
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",
@@ -184,11 +183,11 @@ async def test_pending_worker_idle_backoff_is_capped(tmp_path, monkeypatch):
         if len(sleeps) >= 3:
             worker.stop()
 
-    async def fake_check_active_runs() -> None:
+    async def fake_check_inflight_runs() -> None:
         return None
 
     monkeypatch.setattr("demi.jobs.pending_worker.asyncio.sleep", fake_sleep)
-    monkeypatch.setattr(worker, "_check_active_runs", fake_check_active_runs)
+    monkeypatch.setattr(worker, "_check_inflight_runs", fake_check_inflight_runs)
 
     await worker.run_forever()
 
@@ -208,7 +207,7 @@ async def test_pending_worker_drains_queue(tmp_path):
     )
 
     tenant = create_test_tenant(db)
-    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
 
     raw = {
         "message": {
@@ -226,13 +225,12 @@ async def test_pending_worker_drains_queue(tmp_path):
         text="How would you connect stripe?",
         images=[],
         raw=raw,
-        project_name=workspace.project_name,
+        project_name=None,
     )
     message_id, _ = db.record_message(tenant.id, msg)
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",
@@ -280,7 +278,7 @@ async def test_pending_worker_recovers_stale_received_messages(tmp_path):
         text="Recover me",
         images=[],
         raw={},
-        project_name="main",
+        project_name=None,
     )
     message_id, inserted = db.record_message(tenant.id, msg)
     assert inserted is True
@@ -326,7 +324,7 @@ async def test_pending_worker_stale_received_failure_is_terminal(tmp_path, monke
         text="Recover me maybe",
         images=[],
         raw={},
-        project_name="main",
+        project_name=None,
     )
     message_id, inserted = db.record_message(tenant.id, msg)
     assert inserted is True
@@ -382,7 +380,7 @@ async def test_pending_worker_stale_received_left_received_is_terminal(tmp_path,
         text="still received",
         images=[],
         raw={},
-        project_name="main",
+        project_name=None,
     )
     message_id, inserted = db.record_message(tenant.id, msg)
     assert inserted is True
@@ -433,7 +431,7 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     )
 
     tenant = create_test_tenant(db)
-    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -443,14 +441,14 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
         text="Hello",
         images=[],
         raw={},
-        project_name=workspace.project_name,
+        project_name=None,
     )
     message_id, _ = db.record_message(tenant.id, msg)
 
     run_id = db.create_run(
         tenant.id,
         message_id=message_id,
-        project_name=workspace.project_name,
+        project_name=None,
         lease_seconds=3600,
     )
     past = datetime.now(tz=timezone.utc) - timedelta(seconds=901)
@@ -464,7 +462,6 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",

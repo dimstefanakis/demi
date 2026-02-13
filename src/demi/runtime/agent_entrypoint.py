@@ -390,7 +390,6 @@ def _resolve_paths(
     settings: Settings,
     run_row: dict,
     tenant_workspace_path: str | None,
-    project_name: str | None,
 ) -> tuple[Path, Path]:
     mount_root = Path(settings.docker_mount_path or "/workspace")
     raw_task = run_row.get("task_path")
@@ -413,14 +412,13 @@ def _resolve_paths(
         else:
             task_path = mount_root / raw_path
 
-    project = project_name or "main"
     if task_path is None:
-        task_path = mount_root / "projects" / project / "tasks" / "latest.md"
+        task_path = mount_root / "tasks" / "latest.md"
 
     if task_path.parent.name == "tasks":
         workspace_root = task_path.parent.parent
     else:
-        workspace_root = mount_root / "projects" / project
+        workspace_root = mount_root
     return workspace_root, task_path
 
 
@@ -446,7 +444,6 @@ def _resolve_execution_session_id(
     *,
     db,
     tenant_id: int,
-    project_name: str | None,
     run_session_id: str | None,
 ) -> str | None:
     session_id = str(run_session_id or "").strip() or None
@@ -454,13 +451,17 @@ def _resolve_execution_session_id(
         return session_id
     if not tenant_id or db is None:
         return None
-    exec_session_key = f"claude_session:{project_name or 'main'}"
-    try:
-        payload = db.get_tenant_kv(int(tenant_id), "execution", exec_session_key) or {}
-    except Exception:
-        return None
-    value = str(payload.get("session_id") or "").strip()
-    return value or None
+    # Tenant-scoped session key with fallback to the only legacy key.
+    keys = ["claude_session", "claude_session:main"]
+    for exec_session_key in keys:
+        try:
+            payload = db.get_tenant_kv(int(tenant_id), "execution", exec_session_key) or {}
+        except Exception:
+            payload = {}
+        value = str(payload.get("session_id") or "").strip()
+        if value:
+            return value
+    return None
 
 
 async def _run(run_id: int) -> int:
@@ -484,7 +485,6 @@ async def _run(run_id: int) -> int:
         if not run_row:
             raise RuntimeError("run_not_found")
 
-        project_name = run_row.get("project_name")
         tenant_workspace_path = None
         tenant_id = int(run_row.get("tenant_id") or 0)
         if tenant_id:
@@ -496,7 +496,6 @@ async def _run(run_id: int) -> int:
             settings=settings,
             run_row=run_row,
             tenant_workspace_path=tenant_workspace_path,
-            project_name=project_name,
         )
         tenant_root = Path(settings.docker_mount_path or "/workspace")
         workspace_manager = WorkspaceManager(
@@ -506,7 +505,6 @@ async def _run(run_id: int) -> int:
         workspace = workspace_manager.ensure_workspace_at_path(
             workspace_root,
             tenant_root=tenant_root,
-            project_name=project_name,
         )
         tasks_dir = workspace.tasks_dir
 
@@ -532,7 +530,6 @@ async def _run(run_id: int) -> int:
                 text=None,
                 images=[],
                 raw={},
-                project_name=project_name,
             )
 
         if settings.telegram_bot_token:
@@ -545,7 +542,6 @@ async def _run(run_id: int) -> int:
         session_id = _resolve_execution_session_id(
             db=db,
             tenant_id=tenant_id,
-            project_name=project_name,
             run_session_id=run_row.get("session_id"),
         )
 

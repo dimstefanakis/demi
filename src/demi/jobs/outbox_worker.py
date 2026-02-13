@@ -179,7 +179,6 @@ class OutboxWorker:
                 workspace = self.workspace_manager.ensure_workspace_at_path(
                     project_root,
                     tenant_root=tenant_root,
-                    project_name=project_root.name,
                 )
                 processed = (
                     await self._consume_interaction_files(tenant, workspace, tasks_dir)
@@ -219,7 +218,6 @@ class OutboxWorker:
         if claimed_updates is not None:
             remaining: list[dict[str, Any]] = []
             for payload in payloads:
-                payload.setdefault("project_name", workspace.project_name)
                 sent, _error = await self._send_interaction_update(
                     tenant,
                     workspace,
@@ -237,7 +235,6 @@ class OutboxWorker:
         if claimed_request is not None:
             sent = False
             if isinstance(payload, dict):
-                payload.setdefault("project_name", workspace.project_name)
                 sent, _error = await self._send_interaction_update(
                     tenant,
                     workspace,
@@ -349,16 +346,14 @@ class OutboxWorker:
         tenant = await self._db_call(self.db.get_tenant_by_id, int(tenant_id))
         if tenant is None:
             return False, "tenant_not_found"
-        project_name = payload.get("project_name") or row.get("project_name")
+        # Project routing is prompt-only; outbox delivery uses tenant-scoped workspace.
         if getattr(tenant, "workspace_path", None):
             tenant_root = self.workspace_manager.infer_tenant_root(Path(tenant.workspace_path))
-            workspace = self.workspace_manager.ensure_project_for_tenant_root(
-                tenant_root, project_name=project_name
+            workspace = self.workspace_manager.ensure_workspace_at_path(
+                tenant_root, tenant_root=tenant_root
             )
         else:
-            workspace = self.workspace_manager.ensure_workspace(
-                tenant.key, project_name=project_name
-            )
+            workspace = self.workspace_manager.ensure_workspace(tenant.key)
         if "correlation_id" not in payload:
             correlation_id = str(row.get("correlation_id") or "").strip()
             if correlation_id:

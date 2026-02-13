@@ -67,7 +67,7 @@ async def test_migrate_legacy_queue_moves_pending_messages(tmp_path):
     migrated = await orchestrator.migrate_legacy_queue()
 
     assert migrated == 1
-    rows = db.fetch_run_inputs(tenant.id, "main", status="queued")
+    rows = db.fetch_run_inputs(tenant.id, None, status="queued")
     assert rows
     row = db.get_message(message_id)
     assert row["status"] == "processed"

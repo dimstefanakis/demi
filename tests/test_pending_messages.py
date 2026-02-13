@@ -84,7 +84,6 @@ async def test_pending_messages_coalesced(tmp_path):
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=None,
         message_id=id_a,
         msg=msg_a,
         status="queued",
@@ -92,7 +91,6 @@ async def test_pending_messages_coalesced(tmp_path):
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=None,
         message_id=id_b,
         msg=msg_b,
         status="queued",

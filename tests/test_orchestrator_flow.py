@@ -330,7 +330,7 @@ async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypa
         messenger=FakeMessenger(),
     )
     tenant = create_test_tenant(db)
-    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
 
     config = GitHubAppConfig(
         org="acme",
@@ -573,9 +573,9 @@ async def test_orchestrator_supersedes_and_cancels_active_run(tmp_path):
     )
     seed_id, _ = db.record_message(tenant.id, seed_msg)
     run_id = db.create_run(
-        tenant.id, message_id=seed_id, project_name=workspace.project_name
+        tenant.id, message_id=seed_id, project_name=None
     )
-    db.set_active_run(tenant.id, workspace.project_name, run_id, datetime.now(tz=timezone.utc).isoformat())
+    assert run_id
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -854,7 +854,6 @@ async def test_orchestrator_reconcile_zero_usage_result_marks_failed_and_clears_
     run_id = db.create_run(
         tenant.id, message_id=message_id, project_name=workspace.project_name
     )
-    db.set_active_run(tenant.id, workspace.project_name, run_id, datetime.now(tz=timezone.utc).isoformat())
 
     payload = {
         "run_id": run_id,
@@ -890,6 +889,7 @@ async def test_orchestrator_reconcile_zero_usage_result_marks_failed_and_clears_
     run_row = db.get_run(run_id)
     assert run_row["status"] == "failed"
     assert run_row["error"] == "agent_result_no_usage_activity"
+    assert db.get_tenant_kv(tenant.id, "execution", "claude_session") is None
     assert db.get_tenant_kv(tenant.id, "execution", "claude_session:main") is None
     message_row = db.get_message(message_id)
     assert message_row is not None
@@ -990,7 +990,7 @@ async def test_orchestrator_refreshes_interaction_context_after_project_switch(t
     context_payload = json.loads(
         (switched_workspace.tasks_dir / "interaction_context.json").read_text()
     )
-    assert context_payload["project_name"] == "project-b"
+    assert "project_name" not in context_payload
 
 
 @pytest.mark.asyncio
@@ -1105,7 +1105,9 @@ async def test_orchestrator_clears_block_on_retry(tmp_path):
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("directive", ["project: beta", "/project beta"])
-async def test_orchestrator_allows_parallel_projects(tmp_path, directive):
+async def test_orchestrator_starts_parallel_run_when_running_even_with_project_directive(
+    tmp_path, directive
+):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -1118,10 +1120,8 @@ async def test_orchestrator_allows_parallel_projects(tmp_path, directive):
     )
 
     tenant = create_test_tenant(db)
-    alpha_ws = workspace_manager.ensure_workspace(tenant.key, project_name="alpha")
-    beta_ws = workspace_manager.ensure_workspace(tenant.key, project_name="beta")
-
-    db.create_run(tenant.id, message_id=0, project_name=alpha_ws.project_name)
+    workspace_manager.ensure_workspace(tenant.key)
+    db.create_run(tenant.id, message_id=0, project_name=None)
 
     msg_text = f"{directive}\nUpdate the hero headline"
     msg = NormalizedMessage(
@@ -1138,7 +1138,8 @@ async def test_orchestrator_allows_parallel_projects(tmp_path, directive):
 
     assert result.status == "accepted"
     assert agent.calls
-    assert agent.calls[-1][0] == beta_ws.root
+    queued = db.fetch_run_inputs(tenant.id, None, status="queued")
+    assert not any(row.get("provider_message_id") == "parallel-1" for row in queued)
 
 
 @pytest.mark.asyncio
@@ -1155,8 +1156,7 @@ async def test_orchestrator_updates_request_status_for_pending(tmp_path):
 
     tenant = create_test_tenant(db)
     workspace = workspace_manager.ensure_workspace(tenant.key)
-    run_id = db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
-    db.set_active_run(tenant.id, workspace.project_name, run_id, None)
+    inflight_run_id = db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -1171,17 +1171,61 @@ async def test_orchestrator_updates_request_status_for_pending(tmp_path):
 
     result = await orchestrator.handle_message(msg)
 
-    assert result.status == "busy"
+    assert result.status == "accepted"
     status_text = (workspace.tasks_dir / "request_status.md").read_text()
+    assert "## Active Runs" in status_text
+    assert f"Run {inflight_run_id}" in status_text
     assert "Queued Run Inputs" in status_text
-    assert "Add a testimonials section" in status_text
 
 
 @pytest.mark.asyncio
 async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
-    agent = FakeAgent()
+
+    class QueueingAgent(FakeAgent):
+        async def route_interaction(
+            self,
+            *,
+            workspace,
+            message,
+            messenger=None,
+            tenant_id=None,
+            db=None,
+            payments=None,
+            session_id=None,
+            provider=None,
+            tenant_external_id=None,
+            message_id=None,
+            billing_checked=False,
+            asset_paths=None,
+            execution_bridge=None,
+        ):
+            del (
+                message,
+                messenger,
+                tenant_id,
+                db,
+                payments,
+                session_id,
+                provider,
+                tenant_external_id,
+                message_id,
+                billing_checked,
+                asset_paths,
+                execution_bridge,
+            )
+            return {
+                "ok": True,
+                "project_name": workspace.project_name,
+                "should_run": True,
+                "queue_run": True,
+                "dedupe": False,
+                "ask_questions": [],
+                "purpose": "queue_follow_up",
+            }
+
+    agent = QueueingAgent()
 
     orchestrator = Orchestrator(
         db=db,
@@ -1192,8 +1236,7 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
 
     tenant = create_test_tenant(db)
     workspace = workspace_manager.ensure_workspace(tenant.key)
-    run_id = db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
-    db.set_active_run(tenant.id, workspace.project_name, run_id, None)
+    db.create_run(tenant.id, message_id=0, project_name=workspace.project_name)
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -1212,6 +1255,99 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
     assert not agent.calls
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_starts_parallel_context_runs_from_single_turn(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class ParallelRoutingAgent(FakeAgent):
+        async def route_interaction(
+            self,
+            *,
+            workspace,
+            message,
+            messenger=None,
+            tenant_id=None,
+            db=None,
+            payments=None,
+            session_id=None,
+            provider=None,
+            tenant_external_id=None,
+            message_id=None,
+            billing_checked=False,
+            asset_paths=None,
+            execution_bridge=None,
+        ):
+            del (
+                workspace,
+                message,
+                messenger,
+                tenant_id,
+                db,
+                payments,
+                session_id,
+                provider,
+                tenant_external_id,
+                message_id,
+                billing_checked,
+                asset_paths,
+                execution_bridge,
+            )
+            return {
+                "ok": True,
+                "should_run": True,
+                "queue_run": False,
+                "dedupe": False,
+                "reply_sent": False,
+                "facts_only": False,
+                "execution_context": "Calculator",
+                "parallel_runs": [
+                    {
+                        "execution_context": "Tic Tac Toe",
+                        "text": "Start building the tic tac toe game now.",
+                    }
+                ],
+                "purpose": "start both",
+            }
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=ParallelRoutingAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="fanout-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="start calculator and tic tac toe in parallel",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    message_row = db.get_message_by_provider_id(tenant.id, "fanout-1")
+    assert message_row is not None
+    message_id = int(message_row["id"])
+
+    runs = db.list_recent_runs(tenant.id, limit=10)
+    matching_contexts: set[str] = set()
+    for row in runs:
+        run = db.get_run(int(row["id"]))
+        if not isinstance(run, dict):
+            continue
+        if int(run.get("message_id") or 0) != message_id:
+            continue
+        matching_contexts.add(str(run.get("execution_context") or "").strip())
+
+    assert "Calculator" in matching_contexts
+    assert "Tic Tac Toe" in matching_contexts
 
 
 @pytest.mark.asyncio
@@ -1242,14 +1378,13 @@ async def test_orchestrator_run_input_failure_requeues(tmp_path):
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",
     )
 
     with pytest.raises(RuntimeError, match="agent_result_subtype_error_during_execution"):
-        await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+        await orchestrator._drain_run_inputs(tenant)
 
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
@@ -1294,14 +1429,13 @@ async def test_orchestrator_run_input_zero_usage_result_requeues_and_clears_sess
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",
     )
 
     with pytest.raises(RuntimeError, match="agent_result_no_usage_activity"):
-        await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+        await orchestrator._drain_run_inputs(tenant)
 
     assert db.get_tenant_kv(tenant.id, "execution", "claude_session:main") is None
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
@@ -1339,7 +1473,6 @@ async def test_orchestrator_retry_failure_notice_capped_after_two_attempts(tmp_p
     orchestrator._enqueue_run_input(
         tenant_id=tenant.id,
         run_id=None,
-        project_name=workspace.project_name,
         message_id=message_id,
         msg=msg,
         status="queued",
@@ -1347,7 +1480,7 @@ async def test_orchestrator_retry_failure_notice_capped_after_two_attempts(tmp_p
 
     for _ in range(3):
         with pytest.raises(RuntimeError, match="temporary network hiccup"):
-            await orchestrator._drain_run_inputs(tenant, project_name=workspace.project_name)
+            await orchestrator._drain_run_inputs(tenant)
 
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
@@ -1476,7 +1609,7 @@ async def test_orchestrator_reset_clears_state(tmp_path, reset_text):
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_reset_without_directive_uses_active_project(tmp_path):
+async def test_orchestrator_reset_clears_execution_sessions_and_fails_running_runs(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -1488,24 +1621,23 @@ async def test_orchestrator_reset_without_directive_uses_active_project(tmp_path
     )
 
     tenant = create_test_tenant(db)
-    workspace_manager.ensure_workspace(tenant.key, project_name="main")
-    active_workspace = workspace_manager.ensure_workspace(tenant.key, project_name="beta")
+    workspace_manager.ensure_workspace(tenant.key)
 
+    db.set_tenant_kv(
+        tenant.id,
+        "execution",
+        "claude_session",
+        {"session_id": "tenant-session"},
+    )
     db.set_tenant_kv(
         tenant.id,
         "execution",
         "claude_session:main",
         {"session_id": "main-session"},
     )
-    db.set_tenant_kv(
-        tenant.id,
-        "execution",
-        "claude_session:beta",
-        {"session_id": "beta-session"},
-    )
 
-    main_run_id = db.create_run(tenant.id, message_id=0, project_name="main")
-    beta_run_id = db.create_run(tenant.id, message_id=0, project_name="beta")
+    run_a_id = db.create_run(tenant.id, message_id=0, project_name=None)
+    run_b_id = db.create_run(tenant.id, message_id=0, project_name=None)
 
     reset_msg = NormalizedMessage(
         provider="telegram",
@@ -1520,16 +1652,15 @@ async def test_orchestrator_reset_without_directive_uses_active_project(tmp_path
     result = await orchestrator.handle_message(reset_msg)
 
     assert result.status == "accepted"
-    assert active_workspace.project_name == "beta"
-    assert db.get_tenant_kv(tenant.id, "execution", "claude_session:beta") is None
-    main_session = db.get_tenant_kv(tenant.id, "execution", "claude_session:main")
-    assert main_session == {"session_id": "main-session"}
+    assert db.get_tenant_kv(tenant.id, "execution", "claude_session") is None
+    assert db.get_tenant_kv(tenant.id, "execution", "claude_session:main") is None
 
-    main_run = db.get_run(main_run_id)
-    beta_run = db.get_run(beta_run_id)
-    assert main_run["status"] == "running"
-    assert beta_run["status"] == "failed"
-    assert beta_run["error"] == "user_reset"
+    run_a = db.get_run(run_a_id)
+    run_b = db.get_run(run_b_id)
+    assert run_a["status"] == "failed"
+    assert run_a["error"] == "user_reset"
+    assert run_b["status"] == "failed"
+    assert run_b["error"] == "user_reset"
 
 
 @pytest.mark.asyncio
@@ -1546,16 +1677,8 @@ async def test_orchestrator_uses_active_project_without_explicit_project(tmp_pat
     )
 
     tenant = create_test_tenant(db)
-    main_ws = workspace_manager.ensure_workspace(tenant.key, project_name="main")
-    cafe_ws = workspace_manager.ensure_workspace(tenant.key, project_name="cafe")
-
-    (main_ws.root / "DESCRIPTION.md").write_text("Main brand site for the holding company.")
-    (cafe_ws.root / "DESCRIPTION.md").write_text(
-        "Cafe project. Coffee menu, pastries, and brunch."
-    )
-
-    active_path = main_ws.tenant_root / "projects" / "active.txt"
-    active_path.write_text("main\n")
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    (workspace.root / "DESCRIPTION.md").write_text("Tenant workspace root.")
 
     msg = NormalizedMessage(
         provider="telegram",
@@ -1572,7 +1695,7 @@ async def test_orchestrator_uses_active_project_without_explicit_project(tmp_pat
     assert result.status == "accepted"
     assert agent.calls
     used_root = agent.calls[-1][0]
-    assert used_root == main_ws.root
+    assert used_root == workspace.root
 
 
 @pytest.mark.asyncio
@@ -1603,11 +1726,9 @@ async def test_stream_to_execution_agent_persists_db_stream_input(tmp_path):
     )
     message_id, _ = db.record_message(tenant.id, seed)
     run_id = db.create_run(tenant.id, message_id=message_id, project_name=workspace.project_name)
-    db.set_active_run(tenant.id, workspace.project_name, run_id, datetime.now(tz=timezone.utc).isoformat())
 
     result = await orchestrator.stream_to_execution_agent(
         tenant_key=tenant.key,
-        project_name=workspace.project_name,
         run_id=run_id,
         text="new user input while running",
     )
@@ -1618,7 +1739,7 @@ async def test_stream_to_execution_agent_persists_db_stream_input(tmp_path):
     assert rows[-1]["text"] == "new user input while running"
 
 
-def test_list_execution_agents_includes_all_active_runs(tmp_path):
+def test_list_execution_agents_includes_inflight_run(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -1632,25 +1753,50 @@ def test_list_execution_agents_includes_all_active_runs(tmp_path):
         messenger=FakeMessenger(),
     )
     tenant = create_test_tenant(db)
-    now = datetime.now(tz=timezone.utc).isoformat()
-    main_run = db.create_run(tenant.id, message_id=0, project_name="main")
-    beta_run = db.create_run(tenant.id, message_id=0, project_name="beta")
-    db.set_active_run(tenant.id, "main", main_run, now)
-    db.set_active_run(tenant.id, "beta", beta_run, now)
+    run_id = db.create_run(tenant.id, message_id=0, project_name=None)
 
     agents = orchestrator.list_execution_agents(
         tenant_id=tenant.id,
         tenant_key=tenant.key,
-        project_name=None,
     )
 
-    run_ids = {int(agent["run_id"]) for agent in agents}
-    assert main_run in run_ids
-    assert beta_run in run_ids
+    assert agents
+    assert len(agents) == 1
+    assert int(agents[0]["run_id"]) == run_id
+
+
+def test_resolve_execution_agent_for_decision_keeps_existing_context_row(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db)
+    calculator = db.ensure_execution_agent(tenant_id=tenant.id, context="Calculator")
+    assert calculator is not None
+
+    resolved = orchestrator._resolve_execution_agent_for_decision(
+        tenant_id=tenant.id,
+        decision={
+            "execution_agent_id": int(calculator["id"]),
+            "execution_context": "Tic Tac Toe",
+        },
+    )
+
+    assert isinstance(resolved, dict)
+    assert resolved["context"] == "Tic Tac Toe"
+    assert int(resolved["id"]) != int(calculator["id"])
+
+    original = db.get_execution_agent(int(calculator["id"]))
+    assert isinstance(original, dict)
+    assert original["context"] == "Calculator"
 
 
 @pytest.mark.asyncio
-async def test_stream_to_execution_agent_reports_ambiguous_without_run_id(tmp_path):
+async def test_stream_to_execution_agent_uses_inflight_run_without_run_id(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
 
@@ -1664,21 +1810,15 @@ async def test_stream_to_execution_agent_reports_ambiguous_without_run_id(tmp_pa
         messenger=FakeMessenger(),
     )
     tenant = create_test_tenant(db)
-    now = datetime.now(tz=timezone.utc).isoformat()
-    main_run = db.create_run(tenant.id, message_id=0, project_name="main")
-    beta_run = db.create_run(tenant.id, message_id=0, project_name="beta")
-    db.set_active_run(tenant.id, "main", main_run, now)
-    db.set_active_run(tenant.id, "beta", beta_run, now)
+    run_id = db.create_run(tenant.id, message_id=0, project_name=None)
 
     result = await orchestrator.stream_to_execution_agent(
         tenant_key=tenant.key,
-        project_name=None,
         text="new user input while running",
     )
 
-    assert result["ok"] is False
-    assert result["status"] == "ambiguous_run"
-    assert len(result["candidates"]) >= 2
+    assert result["ok"] is True
+    assert int(result["run_id"]) == run_id
 
 
 @pytest.mark.asyncio
@@ -1701,7 +1841,6 @@ async def test_stream_to_execution_agent_rejects_foreign_run_id(tmp_path):
     run_id = db.create_run(tenant_b.id, message_id=0, project_name="main")
     result = await orchestrator.stream_to_execution_agent(
         tenant_key=tenant_a.key,
-        project_name="main",
         run_id=run_id,
         text="cross-tenant attempt",
     )
@@ -1732,7 +1871,6 @@ async def test_stream_to_execution_agent_rejects_inactive_explicit_run(tmp_path)
 
     result = await orchestrator.stream_to_execution_agent(
         tenant_key=tenant.key,
-        project_name="main",
         run_id=run_id,
         text="should not be accepted",
     )

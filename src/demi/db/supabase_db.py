@@ -11,6 +11,8 @@ from postgrest.exceptions import APIError
 
 from demi.models import NormalizedMessage, Tenant
 
+DEFAULT_EXECUTION_CONTEXT = "Main project"
+
 
 @dataclass
 class SupabaseDatabase:
@@ -58,6 +60,68 @@ class SupabaseDatabase:
         if "unique constraint" in message:
             return True
         return False
+
+    @staticmethod
+    def _is_schema_cache_missing(exc: Exception, token: str | None = None) -> bool:
+        if isinstance(exc, APIError):
+            try:
+                if exc.code == "PGRST204":
+                    return True
+            except Exception:
+                pass
+        message = str(exc)
+        lowered = message.lower()
+        if "schema cache" not in lowered:
+            return False
+        if token:
+            return token.lower() in lowered
+        return True
+
+    @staticmethod
+    def _is_missing_relation(exc: Exception, relation: str) -> bool:
+        if isinstance(exc, APIError):
+            try:
+                if exc.code == "42P01":
+                    return True
+            except Exception:
+                pass
+        lowered = str(exc).lower()
+        rel = str(relation or "").strip().lower()
+        if not rel:
+            return False
+        if f"relation '{rel}' does not exist" in lowered:
+            return True
+        if f'relation "{rel}" does not exist' in lowered:
+            return True
+        if f"table '{rel}'" in lowered and "schema cache" in lowered:
+            return True
+        return False
+
+    @staticmethod
+    def _legacy_execution_agent_row(tenant_id: int, context: str | None = None) -> dict[str, Any]:
+        return {
+            "id": None,
+            "tenant_id": int(tenant_id),
+            "context": str(context or "").strip() or DEFAULT_EXECUTION_CONTEXT,
+            "status": "active",
+            "session_id": None,
+            "last_run_id": None,
+            "metadata_json": None,
+            "created_at": None,
+            "updated_at": None,
+            "archived_at": None,
+        }
+
+    def _read_default_execution_session_from_kv(self, tenant_id: int) -> str | None:
+        for key in ("claude_session", "claude_session:main"):
+            try:
+                payload = self.get_tenant_kv(int(tenant_id), "execution", key) or {}
+            except Exception:
+                payload = {}
+            value = str(payload.get("session_id") or "").strip()
+            if value:
+                return value
+        return None
 
     def _select_one(self, table: str, **filters: Any) -> dict[str, Any] | None:
         query = self._table(table).select("*")
@@ -160,6 +224,192 @@ class SupabaseDatabase:
             .eq("id", tenant_id)
         )
 
+    @staticmethod
+    def _normalize_execution_context(context: str | None) -> str:
+        value = str(context or "").strip()
+        return value or DEFAULT_EXECUTION_CONTEXT
+
+    def list_execution_agents(
+        self,
+        tenant_id: int,
+        *,
+        include_inactive: bool = False,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        try:
+            query = (
+                self._table("execution_agents")
+                .select("*")
+                .eq("tenant_id", int(tenant_id))
+                .order("updated_at", desc=True)
+                .limit(max(1, int(limit)))
+            )
+            if not include_inactive:
+                query = query.eq("status", "active")
+            data = self._execute(query)
+            return list(data or [])
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return []
+            raise
+
+    def get_execution_agent(self, execution_agent_id: int) -> dict[str, Any] | None:
+        try:
+            return self._select_one("execution_agents", id=int(execution_agent_id))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return None
+            raise
+
+    def get_execution_agent_by_context(
+        self,
+        tenant_id: int,
+        context: str | None,
+    ) -> dict[str, Any] | None:
+        normalized = self._normalize_execution_context(context)
+        try:
+            data = self._execute(
+                self._table("execution_agents")
+                .select("*")
+                .eq("tenant_id", int(tenant_id))
+                .eq("context", normalized)
+                .order("updated_at", desc=True)
+                .limit(1)
+            )
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return None
+            raise
+        if data:
+            return data[0]
+        return None
+
+    def create_execution_agent(
+        self,
+        *,
+        tenant_id: int,
+        context: str | None,
+        session_id: str | None = None,
+        status: str = "active",
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        payload = {
+            "tenant_id": int(tenant_id),
+            "context": self._normalize_execution_context(context),
+            "status": str(status or "active").strip() or "active",
+            "session_id": str(session_id or "").strip() or None,
+            "metadata_json": metadata,
+            "last_run_id": None,
+            "created_at": now,
+            "updated_at": now,
+            "archived_at": None,
+        }
+        try:
+            data = self._execute(self._table("execution_agents").insert(payload))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return self._legacy_execution_agent_row(int(tenant_id), payload["context"])
+            raise
+        if not data:
+            raise RuntimeError("execution_agent_create_failed")
+        return dict(data[0])
+
+    def ensure_execution_agent(
+        self,
+        *,
+        tenant_id: int,
+        context: str | None = None,
+    ) -> dict[str, Any]:
+        normalized = self._normalize_execution_context(context)
+        fallback_session_id: str | None = None
+        if normalized == DEFAULT_EXECUTION_CONTEXT:
+            fallback_session_id = self._read_default_execution_session_from_kv(int(tenant_id))
+        existing = self.get_execution_agent_by_context(int(tenant_id), normalized)
+        if existing:
+            status = str(existing.get("status") or "").strip().lower()
+            archived_at = existing.get("archived_at")
+            if status != "active" or archived_at:
+                revived = self.update_execution_agent(
+                    int(existing["id"]),
+                    status="active",
+                    archived=False,
+                )
+                if revived:
+                    return revived
+            existing_session = str(existing.get("session_id") or "").strip()
+            if not existing_session and fallback_session_id:
+                try:
+                    hydrated = self.update_execution_agent(
+                        int(existing["id"]),
+                        session_id=fallback_session_id,
+                        status="active",
+                        archived=False,
+                    )
+                except Exception:
+                    hydrated = None
+                if isinstance(hydrated, dict):
+                    return hydrated
+            return existing
+        try:
+            return self.create_execution_agent(
+                tenant_id=int(tenant_id),
+                context=normalized,
+                session_id=fallback_session_id,
+                status="active",
+            )
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return self._legacy_execution_agent_row(int(tenant_id), normalized)
+            existing = self.get_execution_agent_by_context(int(tenant_id), normalized)
+            if existing:
+                return existing
+            raise
+
+    def update_execution_agent(
+        self,
+        execution_agent_id: int,
+        *,
+        context: str | None = None,
+        session_id: str | None = None,
+        status: str | None = None,
+        last_run_id: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        archived: bool | None = None,
+    ) -> dict[str, Any] | None:
+        updates: dict[str, Any] = {
+            "updated_at": datetime.now(tz=timezone.utc).isoformat(),
+        }
+        if context is not None:
+            updates["context"] = self._normalize_execution_context(context)
+        if session_id is not None:
+            updates["session_id"] = str(session_id or "").strip() or None
+        if status is not None:
+            updates["status"] = str(status).strip() or "active"
+        if last_run_id is not None:
+            updates["last_run_id"] = int(last_run_id)
+        if metadata is not None:
+            updates["metadata_json"] = metadata
+        if archived is True:
+            updates["archived_at"] = datetime.now(tz=timezone.utc).isoformat()
+            if "status" not in updates:
+                updates["status"] = "archived"
+        elif archived is False:
+            updates["archived_at"] = None
+            if "status" not in updates:
+                updates["status"] = "active"
+        try:
+            self._execute(
+                self._table("execution_agents")
+                .update(updates)
+                .eq("id", int(execution_agent_id))
+            )
+        except Exception as exc:
+            if self._is_missing_relation(exc, "execution_agents"):
+                return None
+            raise
+        return self.get_execution_agent(int(execution_agent_id))
+
     def create_event_job(
         self,
         tenant_id: int,
@@ -257,6 +507,7 @@ class SupabaseDatabase:
         )
 
     def record_message(self, tenant_id: int, msg: NormalizedMessage) -> tuple[int, bool]:
+        # Project routing is prompt-only; do not persist project_name on incoming messages.
         payload = {
             "tenant_id": tenant_id,
             "provider": msg.provider,
@@ -265,7 +516,7 @@ class SupabaseDatabase:
             "text": msg.text,
             "raw_json": msg.raw,
             "status": "received",
-            "project_name": msg.project_name,
+            "project_name": None,
         }
         try:
             data = self._execute(self._table("messages").insert(payload))
@@ -616,6 +867,38 @@ class SupabaseDatabase:
         data = self._execute(query)
         return data[0] if data else None
 
+    def list_tenant_inflight_runs(
+        self,
+        tenant_id: int,
+        *,
+        limit: int = 20,
+    ) -> list[dict[str, Any]]:
+        data = self._execute(
+            self._table("runs")
+            .select("*")
+            .eq("tenant_id", int(tenant_id))
+            .eq("status", "running")
+            .order("started_at", desc=True)
+            .limit(max(1, int(limit)))
+        )
+        return list(data or [])
+
+    def list_inflight_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
+        query = (
+            self._table("runs")
+            .select("*")
+            .eq("status", "running")
+            # Oldest-first prevents stale-run starvation when concurrency exceeds batch size.
+            .order("started_at", desc=False)
+        )
+        if offset > 0:
+            end = offset + max(1, int(limit)) - 1
+            query = query.range(offset, end)
+        else:
+            query = query.limit(limit)
+        data = self._execute(query)
+        return list(data or [])
+
     def list_recent_runs(
         self,
         tenant_id: int,
@@ -660,6 +943,8 @@ class SupabaseDatabase:
         tenant_id: int,
         message_id: int | None = None,
         project_name: str | None = None,
+        execution_agent_id: int | None = None,
+        execution_context: str | None = None,
         lease_seconds: int | None = None,
         task_path: str | None = None,
         session_id: str | None = None,
@@ -678,13 +963,27 @@ class SupabaseDatabase:
             "total_cost_usd": None,
             "usage_json": None,
             "project_name": project_name,
+            "execution_agent_id": execution_agent_id,
+            "execution_context": execution_context,
             "task_path": task_path,
             "session_id": session_id,
             "lease_expires_at": lease_expires,
             "last_heartbeat_at": now_dt.isoformat(),
             "last_activity_at": now_dt.isoformat(),
         }
-        data = self._execute(self._table("runs").insert(payload))
+        try:
+            data = self._execute(self._table("runs").insert(payload))
+        except Exception as exc:
+            missing_execution_cols = (
+                self._is_schema_cache_missing(exc, "execution_agent_id")
+                or self._is_schema_cache_missing(exc, "execution_context")
+            )
+            if not missing_execution_cols:
+                raise
+            legacy_payload = dict(payload)
+            legacy_payload.pop("execution_agent_id", None)
+            legacy_payload.pop("execution_context", None)
+            data = self._execute(self._table("runs").insert(legacy_payload))
         if not data:
             raise RuntimeError("run_create_failed")
         return int(data[0]["id"])
@@ -695,15 +994,35 @@ class SupabaseDatabase:
         *,
         task_path: str | None = None,
         session_id: str | None = None,
+        execution_agent_id: int | None = None,
+        execution_context: str | None = None,
     ) -> None:
         updates: dict[str, Any] = {}
         if task_path is not None:
             updates["task_path"] = task_path
         if session_id is not None:
             updates["session_id"] = session_id
+        if execution_agent_id is not None:
+            updates["execution_agent_id"] = int(execution_agent_id)
+        if execution_context is not None:
+            updates["execution_context"] = str(execution_context or "").strip() or None
         if not updates:
             return
-        self._execute(self._table("runs").update(updates).eq("id", run_id))
+        try:
+            self._execute(self._table("runs").update(updates).eq("id", run_id))
+        except Exception as exc:
+            missing_execution_cols = (
+                self._is_schema_cache_missing(exc, "execution_agent_id")
+                or self._is_schema_cache_missing(exc, "execution_context")
+            )
+            if not missing_execution_cols:
+                raise
+            legacy_updates = dict(updates)
+            legacy_updates.pop("execution_agent_id", None)
+            legacy_updates.pop("execution_context", None)
+            if not legacy_updates:
+                return
+            self._execute(self._table("runs").update(legacy_updates).eq("id", run_id))
 
     def update_run_timestamps(
         self,
@@ -841,7 +1160,7 @@ class SupabaseDatabase:
         self,
         *,
         tenant_id: int,
-        project_name: str | None,
+        project_name: str | None = None,
         status: str = "running",
     ) -> int | None:
         payload = {
@@ -907,10 +1226,10 @@ class SupabaseDatabase:
         *,
         tenant_id: int,
         run_id: int,
-        project_name: str | None,
-        message_id: int | None,
-        provider_message_id: str | None,
         text: str,
+        project_name: str | None = None,
+        message_id: int | None = None,
+        provider_message_id: str | None = None,
         assets: list[str] | None = None,
         status: str = "pending",
     ) -> str | None:
@@ -1011,11 +1330,11 @@ class SupabaseDatabase:
         self,
         tenant_id: int,
         run_id: int | None,
-        project_name: str | None,
         source: str,
         provider_message_id: str | None,
         payload: dict[str, Any],
         status: str = "queued",
+        project_name: str | None = None,
     ) -> str:
         now = datetime.now(tz=timezone.utc).isoformat()
         payload_row = {

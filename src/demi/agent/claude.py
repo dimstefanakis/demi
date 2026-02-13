@@ -673,6 +673,41 @@ class ClaudeAgent:
                     _log_subagent_invocations(workspace.tasks_dir, msg)
                     if isinstance(msg, SystemMessage) and msg.subtype == "init":
                         new_session_id = msg.data.get("session_id", new_session_id)
+                        if new_session_id and db is not None and run_id is not None:
+                            try:
+                                db.update_run_context(int(run_id), session_id=str(new_session_id))
+                            except Exception:
+                                pass
+                            try:
+                                run_row = db.get_run(int(run_id))
+                            except Exception:
+                                run_row = None
+                            if isinstance(run_row, dict):
+                                raw_execution_agent_id = run_row.get("execution_agent_id")
+                                try:
+                                    execution_agent_id = (
+                                        int(raw_execution_agent_id)
+                                        if raw_execution_agent_id is not None
+                                        else None
+                                    )
+                                except (TypeError, ValueError):
+                                    execution_agent_id = None
+                                if execution_agent_id is not None:
+                                    try:
+                                        db.update_execution_agent(
+                                            int(execution_agent_id),
+                                            session_id=str(new_session_id),
+                                            last_run_id=int(run_id),
+                                            status="active",
+                                            archived=False,
+                                        )
+                                    except Exception:
+                                        pass
+                            if tenant_id is not None:
+                                try:
+                                    db.update_tenant_session(int(tenant_id), str(new_session_id))
+                                except Exception:
+                                    pass
                     if isinstance(msg, ResultMessage):
                         new_session_id = msg.session_id or new_session_id
                         stop_reason = self._normalize_stop_reason(
@@ -938,6 +973,8 @@ class ClaudeAgent:
                 "Grep",
                 "Glob",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__list_execution_contexts",
+                f"mcp__{CHAT_SERVER_NAME}__upsert_execution_context",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
                 f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
@@ -1118,6 +1155,8 @@ class ClaudeAgent:
                 "Grep",
                 "Glob",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__list_execution_contexts",
+                f"mcp__{CHAT_SERVER_NAME}__upsert_execution_context",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
                 f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
@@ -1439,6 +1478,8 @@ class ClaudeAgent:
                 "Grep",
                 "Glob",
                 f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+                f"mcp__{CHAT_SERVER_NAME}__list_execution_contexts",
+                f"mcp__{CHAT_SERVER_NAME}__upsert_execution_context",
                 f"mcp__{CHAT_SERVER_NAME}__should_send_message",
                 f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
                 f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",
@@ -1566,6 +1607,8 @@ class ClaudeAgent:
                 "properties": {
                     "ok": {"type": "boolean"},
                     "project_name": {"type": ["string", "null"]},
+                    "execution_context": {"type": ["string", "null"]},
+                    "execution_agent_id": {"type": ["number", "null"]},
                     "should_run": {"type": "boolean"},
                     "queue_run": {"type": "boolean"},
                     "supersede_active_run": {"type": "boolean"},
@@ -1887,6 +1930,8 @@ class ClaudeAgent:
         interaction_tools = [
             *default_skill_tools,
             f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+            f"mcp__{CHAT_SERVER_NAME}__list_execution_contexts",
+            f"mcp__{CHAT_SERVER_NAME}__upsert_execution_context",
             f"mcp__{CHAT_SERVER_NAME}__should_send_message",
             f"mcp__{CHAT_SERVER_NAME}__find_execution_agent",
             f"mcp__{CHAT_SERVER_NAME}__stream_to_execution_agent",

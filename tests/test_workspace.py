@@ -6,7 +6,7 @@ def test_workspace_created(tmp_path):
     workspace = manager.ensure_workspace(tenant_key="telegram:987654")
 
     assert workspace.tenant_root == tmp_path / "telegram:987654"
-    assert workspace.project_name == "main"
+    assert workspace.project_name is None
     assert workspace.root.exists()
     assert workspace.tasks_dir.exists()
     assert workspace.assets_dir.exists()

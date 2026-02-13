@@ -217,7 +217,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "message_id": payload.get("message_id"),
             "provider_message_id": message.get("provider_message_id"),
             "assets": message.get("assets") or [],
-            "project_name": payload.get("project_name"),
         }
 
     def _append_inflight_update_file(
@@ -291,26 +290,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 if run_id is not None:
                     payload["run_id"] = run_id
 
-            project_name = payload.get("project_name")
-            if run_id is not None:
-                try:
-                    run_row = context.db.get_run(int(run_id))
-                except Exception:
-                    run_row = None
-                if isinstance(run_row, dict):
-                    project_from_run = str(run_row.get("project_name") or "").strip()
-                    if project_from_run:
-                        project_name = project_from_run
-                        payload["project_name"] = project_name
-
-            if not project_name:
-                project_name = _project_name_from_tasks_dir(context.tasks_dir)
-                if project_name:
-                    payload["project_name"] = project_name
             context.db.enqueue_outbox(
                 tenant_id=tenant_id,
                 run_id=run_id,
-                project_name=project_name,
+                project_name=_project_name_from_tasks_dir(context.tasks_dir),
                 correlation_id=str(correlation_id),
                 payload=payload,
             )
@@ -405,8 +388,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
 
     @tool(
         "check_for_status",
-        "Fetch the current run status and queued inputs for this tenant/project.",
-        {"project_name": str},
+        "Fetch the current run status and queued inputs for this tenant.",
+        {},
     )
     async def check_for_status(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
@@ -417,16 +400,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
-        project_name = str(args.get("project_name") or "").strip() or None
-        run = context.db.get_inflight_run(context.tenant_id, project_name)
-        active = context.db.get_active_run(context.tenant_id, project_name)
-        queued = context.db.count_run_inputs(
-            context.tenant_id, project_name=project_name, status="queued"
-        )
+        run = context.db.get_inflight_run(context.tenant_id, None)
+        queued = context.db.count_run_inputs(context.tenant_id, status="queued")
         payload = {
             "ok": True,
-            "project_name": project_name,
-            "active_run": dict(active) if active else None,
             "inflight_run": dict(run) if run else None,
             "queued_inputs": queued,
         }
@@ -437,9 +414,235 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         }
 
     @tool(
+        "list_execution_contexts",
+        "List saved execution-agent contexts for this tenant.",
+        {"include_inactive": bool},
+    )
+    async def list_execution_contexts(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("list_execution_contexts", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            payload = {"ok": False, "status": "missing_tenant"}
+            _log("list_execution_contexts", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        include_inactive = bool(args.get("include_inactive", False))
+        try:
+            rows = context.db.list_execution_agents(
+                tenant_id,
+                include_inactive=include_inactive,
+                limit=50,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("list_execution_contexts", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if not rows:
+            try:
+                default_row = context.db.ensure_execution_agent(
+                    tenant_id=tenant_id,
+                    context="Main project",
+                )
+            except Exception:
+                default_row = None
+            if isinstance(default_row, dict):
+                rows = [default_row]
+        payload = {
+            "ok": True,
+            "count": len(rows),
+            "agents": [
+                {
+                    "execution_agent_id": row.get("id"),
+                    "context": row.get("context"),
+                    "status": row.get("status"),
+                    "has_session": bool(str(row.get("session_id") or "").strip()),
+                    "last_run_id": row.get("last_run_id"),
+                    "updated_at": row.get("updated_at"),
+                }
+                for row in rows
+                if isinstance(row, dict)
+            ],
+        }
+        _log("list_execution_contexts", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "upsert_execution_context",
+        "Create or update an execution-agent context profile.",
+        {"execution_agent_id": int, "context": str, "status": str, "rename_existing": bool},
+    )
+    async def upsert_execution_context(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("upsert_execution_context", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            payload = {"ok": False, "status": "missing_tenant"}
+            _log("upsert_execution_context", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        execution_agent_id = args.get("execution_agent_id")
+        context_text = str(args.get("context") or "").strip() or None
+        rename_existing = bool(args.get("rename_existing", False))
+        status_text = str(args.get("status") or "").strip().lower()
+        archived: bool | None = None
+        status: str | None = None
+        if status_text in {"archived", "inactive", "disabled"}:
+            archived = True
+            status = "archived"
+        elif status_text in {"active", "enabled"}:
+            archived = False
+            status = "active"
+        row = None
+        if execution_agent_id is not None:
+            try:
+                row = context.db.get_execution_agent(int(execution_agent_id))
+            except Exception:
+                row = None
+            if not isinstance(row, dict):
+                payload = {"ok": False, "status": "not_found"}
+                _log("upsert_execution_context", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            try:
+                row_tenant_id = int(row.get("tenant_id"))
+            except (TypeError, ValueError):
+                row_tenant_id = None
+            if row_tenant_id != int(tenant_id):
+                payload = {"ok": False, "status": "not_found"}
+                _log("upsert_execution_context", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            current_context = str(row.get("context") or "").strip()
+            wants_context_change = (
+                context_text is not None
+                and context_text.casefold() != current_context.casefold()
+            )
+            if wants_context_change and not rename_existing:
+                try:
+                    row = context.db.ensure_execution_agent(
+                        tenant_id=tenant_id,
+                        context=context_text,
+                    )
+                    if status or archived is not None:
+                        row = context.db.update_execution_agent(
+                            int(row.get("id")),
+                            status=status,
+                            archived=archived,
+                        )
+                except Exception as exc:  # noqa: BLE001
+                    payload = {"ok": False, "status": "error", "error": str(exc)}
+                    _log("upsert_execution_context", args, result=payload, start=start)
+                    return {
+                        "content": [{"type": "text", "text": json.dumps(payload)}],
+                        "is_error": True,
+                    }
+                if isinstance(row, dict):
+                    payload = {
+                        "ok": True,
+                        "status": "context_forked",
+                        "forked_from_execution_agent_id": execution_agent_id,
+                        "execution_agent": {
+                            "execution_agent_id": row.get("id"),
+                            "context": row.get("context"),
+                            "status": row.get("status"),
+                            "has_session": bool(str(row.get("session_id") or "").strip()),
+                            "last_run_id": row.get("last_run_id"),
+                            "updated_at": row.get("updated_at"),
+                        },
+                    }
+                    _log("upsert_execution_context", args, result=payload, start=start)
+                    return {
+                        "content": [{"type": "text", "text": json.dumps(payload)}],
+                        "is_error": False,
+                    }
+            try:
+                row = context.db.update_execution_agent(
+                    int(row.get("id")),
+                    context=context_text if context_text is not None else None,
+                    status=status,
+                    archived=archived,
+                )
+            except Exception as exc:  # noqa: BLE001
+                payload = {"ok": False, "status": "error", "error": str(exc)}
+                _log("upsert_execution_context", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+        else:
+            try:
+                row = context.db.ensure_execution_agent(
+                    tenant_id=tenant_id,
+                    context=context_text,
+                )
+                if status or archived is not None:
+                    row = context.db.update_execution_agent(
+                        int(row.get("id")),
+                        status=status,
+                        archived=archived,
+                    )
+            except Exception as exc:  # noqa: BLE001
+                payload = {"ok": False, "status": "error", "error": str(exc)}
+                _log("upsert_execution_context", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+        if not isinstance(row, dict):
+            payload = {"ok": False, "status": "update_failed"}
+            _log("upsert_execution_context", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        payload = {
+            "ok": True,
+            "execution_agent": {
+                "execution_agent_id": row.get("id"),
+                "context": row.get("context"),
+                "status": row.get("status"),
+                "has_session": bool(str(row.get("session_id") or "").strip()),
+                "last_run_id": row.get("last_run_id"),
+                "updated_at": row.get("updated_at"),
+            },
+        }
+        _log("upsert_execution_context", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
         "find_execution_agent",
-        "Find active execution agent runs for this tenant/project.",
-        {"project_name": str},
+        "Find active execution agent runs for this tenant.",
+        {},
     )
     async def find_execution_agent(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
@@ -465,15 +668,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
-        project_name = str(args.get("project_name") or "").strip() or None
-        if not project_name:
-            meta = _interaction_message_meta()
-            project_name = str(meta.get("project_name") or "").strip() or None
         try:
             agents = context.execution_bridge.list_execution_agents(
                 tenant_id=tenant_id,
                 tenant_key=context.tenant_key,
-                project_name=project_name,
             )
         except Exception as exc:  # noqa: BLE001
             payload = {"ok": False, "status": "error", "error": str(exc)}
@@ -494,7 +692,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         "Stream a new user message to an active execution agent.",
         {
             "text": str,
-            "project_name": str,
             "run_id": int,
             "assets": list,
         },
@@ -529,15 +726,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
-        project_name = str(args.get("project_name") or "").strip() or None
         run_id = args.get("run_id")
         try:
             run_id = int(run_id) if run_id is not None else None
         except (TypeError, ValueError):
             run_id = None
-        if not project_name:
-            meta = _interaction_message_meta()
-            project_name = str(meta.get("project_name") or "").strip() or None
         stream_text = _format_stream_text(text, assets)
         tenant_key = context.tenant_key
         if not tenant_key and context.provider and context.tenant_external_id:
@@ -558,28 +751,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 listed = context.execution_bridge.list_execution_agents(
                     tenant_id=tenant_id,
                     tenant_key=tenant_key,
-                    project_name=project_name,
                 )
                 agents = [agent for agent in listed if isinstance(agent, dict)]
             except Exception:
                 agents = []
             candidates = agents
-            if project_name:
-                project_filtered = [
-                    agent
-                    for agent in candidates
-                    if str(agent.get("project_name") or "").strip() == project_name
-                ]
-                if project_filtered:
-                    candidates = project_filtered
             if len(candidates) == 1:
                 candidate = candidates[0]
                 try:
                     run_id = int(candidate.get("run_id"))
                 except (TypeError, ValueError):
                     run_id = None
-                if not project_name:
-                    project_name = str(candidate.get("project_name") or "").strip() or None
             elif len(candidates) > 1:
                 payload = {
                     "ok": False,
@@ -587,7 +769,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "candidates": [
                         {
                             "run_id": agent.get("run_id"),
-                            "project_name": agent.get("project_name"),
+                            "execution_agent_id": agent.get("execution_agent_id"),
+                            "execution_context": agent.get("execution_context"),
                             "status": agent.get("status"),
                         }
                         for agent in candidates
@@ -601,7 +784,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         try:
             result = await context.execution_bridge.stream_to_execution_agent(
                 tenant_key=tenant_key,
-                project_name=project_name,
                 run_id=run_id,
                 text=stream_text,
             )
@@ -642,7 +824,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     @tool(
         "stop_execution_agent",
         "Stop an active execution agent run.",
-        {"run_id": int, "project_name": str, "reason": str, "notify": bool},
+        {"run_id": int, "reason": str, "notify": bool},
     )
     async def stop_execution_agent(args: dict[str, Any]) -> dict[str, Any]:
         start = time.monotonic()
@@ -666,7 +848,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         except (TypeError, ValueError):
             run_id = None
         tenant_id = _resolve_tenant_id()
-        project_name = str(args.get("project_name") or "").strip() or None
         run_row = None
         if run_id is not None:
             if context.db is None or tenant_id is None:
@@ -698,8 +879,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "content": [{"type": "text", "text": json.dumps(payload)}],
                     "is_error": True,
                 }
-            if not project_name:
-                project_name = str(run_row.get("project_name") or "").strip() or None
         if run_id is None:
             if tenant_id is None or context.db is None:
                 payload = {"ok": False, "status": "missing_run"}
@@ -708,19 +887,41 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                     "content": [{"type": "text", "text": json.dumps(payload)}],
                     "is_error": True,
                 }
-            if not project_name:
-                meta = _interaction_message_meta()
-                project_name = str(meta.get("project_name") or "").strip() or None
-            active = context.db.get_active_run(tenant_id, project_name)
-            if active:
+            candidates: list[dict[str, Any]] = []
+            try:
+                listed = context.execution_bridge.list_execution_agents(
+                    tenant_id=tenant_id,
+                    tenant_key=context.tenant_key,
+                )
+                candidates = [item for item in listed if isinstance(item, dict)]
+            except Exception:
+                candidates = []
+            if len(candidates) > 1:
+                payload = {
+                    "ok": False,
+                    "status": "ambiguous_run",
+                    "candidates": [
+                        {
+                            "run_id": candidate.get("run_id"),
+                            "execution_agent_id": candidate.get("execution_agent_id"),
+                            "execution_context": candidate.get("execution_context"),
+                            "status": candidate.get("status"),
+                        }
+                        for candidate in candidates
+                    ],
+                }
+                _log("stop_execution_agent", args, result=payload, start=start)
+                return {
+                    "content": [{"type": "text", "text": json.dumps(payload)}],
+                    "is_error": True,
+                }
+            if len(candidates) == 1:
+                candidate = candidates[0]
                 try:
-                    run_id = int(active["run_id"])
-                except (TypeError, ValueError, KeyError):
+                    run_id = int(candidate.get("run_id"))
+                except (TypeError, ValueError):
                     run_id = None
-                try:
-                    run_row = context.db.get_run(int(run_id)) if run_id is not None else None
-                except Exception:
-                    run_row = None
+                run_row = candidate if run_id is not None else None
         if run_id is None:
             payload = {"ok": False, "status": "not_found"}
             _log("stop_execution_agent", args, result=payload, start=start)
@@ -810,7 +1011,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "reply_to_text": str(args.get("reply_to_text", "")).strip(),
                 "tenant_external_id": context.tenant_external_id,
                 "provider": context.provider,
-                "project_name": _project_name_from_tasks_dir(context.tasks_dir),
                 "run_id": run_id,
             }
             if correlation_id:
@@ -832,6 +1032,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         final = bool(args.get("final", False))
         reply_to_message_id = str(args.get("reply_to_message_id") or "").strip() or None
         reply_to_text = str(args.get("reply_to_text") or "").strip() or None
+        stale_payload = _stale_reply_context_payload(
+            context,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+        )
+        if stale_payload is not None:
+            _log("send_message", args, result=stale_payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(stale_payload)}],
+                "is_error": True,
+            }
         allowed_reply, _ = _reply_context_allowed(
             context, reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text
         )
@@ -1013,7 +1224,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "reply_to_text": str(args.get("reply_to_text") or "").strip(),
                 "tenant_external_id": context.tenant_external_id,
                 "provider": context.provider,
-                "project_name": _project_name_from_tasks_dir(context.tasks_dir),
                 "run_id": run_id,
             }
             if correlation_id:
@@ -1034,6 +1244,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         final = bool(args.get("final", False))
         reply_to_message_id = str(args.get("reply_to_message_id") or "").strip() or None
         reply_to_text = str(args.get("reply_to_text") or "").strip() or None
+        stale_payload = _stale_reply_context_payload(
+            context,
+            reply_to_message_id=reply_to_message_id,
+            reply_to_text=reply_to_text,
+        )
+        if stale_payload is not None:
+            _log("send_payment_link", args, result=stale_payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(stale_payload)}],
+                "is_error": True,
+            }
         allowed_reply, _ = _reply_context_allowed(
             context, reply_to_message_id=reply_to_message_id, reply_to_text=reply_to_text
         )
@@ -2079,6 +2300,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         should_send_message,
         decide_project,
         check_for_status,
+        list_execution_contexts,
+        upsert_execution_context,
         find_execution_agent,
         stream_to_execution_agent,
         stop_execution_agent,
@@ -2217,13 +2440,12 @@ def _current_run_id(context: ChatToolContext) -> int | None:
             return None
     if context.db is None or context.tenant_id is None:
         return None
-    project_name = _project_name_from_tasks_dir(context.tasks_dir)
-    active = context.db.get_active_run(context.tenant_id, project_name)
-    if not active:
+    inflight = context.db.get_inflight_run(context.tenant_id, None)
+    if not inflight:
         return None
     try:
-        return int(active["run_id"])
-    except (TypeError, ValueError, KeyError):
+        return int(inflight.get("id"))
+    except (TypeError, ValueError):
         return None
 
 
@@ -2247,6 +2469,23 @@ def _current_message_row(context: ChatToolContext) -> dict[str, Any] | None:
     if context.db is None:
         return None
     message_id = context.message_id
+    interaction_context_loaded = False
+    if str(context.role or "primary") == "interaction":
+        payload: dict[str, Any] = {}
+        path = context.tasks_dir / "interaction_context.json"
+        if path.exists():
+            interaction_context_loaded = True
+            try:
+                loaded = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    payload = loaded
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+        candidate_id = payload.get("message_id")
+        try:
+            message_id = int(candidate_id) if candidate_id is not None else message_id
+        except (TypeError, ValueError):
+            pass
     if message_id is None and context.run_id is not None:
         try:
             run_row = context.db.get_run(int(context.run_id))
@@ -2256,10 +2495,47 @@ def _current_message_row(context: ChatToolContext) -> dict[str, Any] | None:
             message_id = run_row.get("message_id")
     if message_id is None:
         return None
+    row = None
     try:
-        return context.db.get_message(int(message_id))
+        row = context.db.get_message(int(message_id))
     except Exception:
+        row = None
+    if str(context.role or "primary") == "interaction" and interaction_context_loaded:
+        row = _latest_interaction_message_row(context, row)
+    return row
+
+
+def _latest_interaction_message_row(
+    context: ChatToolContext,
+    row: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if row is None:
         return None
+    if context.db is None or context.tenant_id is None:
+        return row
+    received_at = _parse_datetime_value(row.get("received_at"))
+    if received_at is None:
+        return row
+    try:
+        newer_rows = context.db.list_messages_since(
+            int(context.tenant_id),
+            received_at.isoformat(),
+            limit=25,
+        )
+    except Exception:
+        return row
+    if not newer_rows:
+        return row
+    newest = newer_rows[-1]
+    try:
+        newest_id = int(newest.get("id"))
+    except (AttributeError, TypeError, ValueError):
+        return row
+    try:
+        latest_row = context.db.get_message(newest_id)
+    except Exception:
+        latest_row = None
+    return latest_row if isinstance(latest_row, dict) else row
 
 
 def _normalize_raw_message(raw: Any) -> dict[str, Any] | None:
@@ -2298,6 +2574,39 @@ def _reply_context_allowed(
     if _message_gap_exceeds(context, received_at, threshold=4):
         return True, "message_gap"
     return False, "recent_context"
+
+
+def _stale_reply_context_payload(
+    context: ChatToolContext,
+    *,
+    reply_to_message_id: str | None,
+    reply_to_text: str | None,
+) -> dict[str, Any] | None:
+    if str(context.role or "primary") != "interaction":
+        return None
+    if not reply_to_message_id and not reply_to_text:
+        return None
+    current = _current_message(context)
+    if not current:
+        return None
+    current_id = str(current.get("provider_message_id") or "").strip()
+    current_text = str(current.get("text") or "").strip()
+    matches, reason = _reply_to_matches(
+        context,
+        reply_to_message_id=str(reply_to_message_id or ""),
+        reply_to_text=str(reply_to_text or ""),
+    )
+    if matches:
+        return None
+    if reason not in {"reply_to_message_id_mismatch", "reply_to_text_mismatch"}:
+        return None
+    return {
+        "ok": False,
+        "status": "stale_reply_context",
+        "reason": reason,
+        "latest_provider_message_id": current_id or None,
+        "latest_text": current_text or None,
+    }
 
 
 def _parse_datetime_value(value: Any) -> datetime | None:

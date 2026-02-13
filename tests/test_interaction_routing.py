@@ -142,6 +142,66 @@ class BlockingFailRouteAgent(BlockingRouteAgent):
         raise RuntimeError("routing_failed_after_stream")
 
 
+class BillingRecheckBlockingAgent(FakeAgent):
+    def __init__(self):
+        super().__init__({})
+        self._release = asyncio.Event()
+
+    def release(self) -> None:
+        self._release.set()
+
+    async def route_interaction(
+        self,
+        *,
+        workspace,
+        message,
+        messenger=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        message_id=None,
+        billing_checked=False,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        self.route_calls.append(
+            {
+                "workspace": workspace,
+                "message": message,
+                "tenant_id": tenant_id,
+                "session_id": session_id,
+                "billing_checked": billing_checked,
+            }
+        )
+        if not billing_checked:
+            await self._release.wait()
+            return {
+                "ok": True,
+                "should_run": False,
+                "queue_run": False,
+                "dedupe": True,
+                "ask_questions": [],
+                "purpose": "chat",
+                "plan": None,
+                "billing_check": True,
+                "billing_checked": False,
+            }
+        return {
+            "ok": True,
+            "should_run": False,
+            "queue_run": False,
+            "dedupe": True,
+            "ask_questions": [],
+            "purpose": "chat",
+            "plan": None,
+            "billing_check": False,
+            "billing_checked": True,
+        }
+
+
 class RouteErrorAgent(FakeAgent):
     async def route_interaction(
         self,
@@ -734,6 +794,56 @@ async def test_streamed_message_status_rolls_back_when_routing_fails(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_billing_reroute_uses_merged_streamed_message_snapshot(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = BillingRecheckBlockingAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+    tenant_external_id = unique_external_id("tenant")
+    first = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="bill-stream-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Was thinking about buildin",
+        images=[],
+        raw={},
+    )
+    second = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="bill-stream-2",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="A tic tac toe game",
+        images=[],
+        raw={},
+    )
+
+    first_task = asyncio.create_task(orchestrator.handle_message(first))
+    await asyncio.sleep(0.05)
+    second_result = await orchestrator.handle_message(second)
+    assert second_result.status == "accepted"
+    assert second_result.detail == "interaction_streamed"
+
+    await asyncio.sleep(0.05)
+    agent.release()
+    first_result = await first_task
+    assert first_result.status == "accepted"
+
+    assert len(agent.route_calls) >= 2
+    second_call = agent.route_calls[1]
+    assert second_call["billing_checked"] is True
+    routed = second_call["message"]
+    assert routed.provider_message_id == "bill-stream-2"
+    assert routed.text == "Was thinking about buildin\nA tic tac toe game"
+
+
+@pytest.mark.asyncio
 async def test_interaction_recomputes_assets_after_merge_and_project_switch(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
@@ -811,10 +921,11 @@ async def test_interaction_recomputes_assets_after_merge_and_project_switch(tmp_
     task_content = task_path.read_text()
     assert "img-first" in task_content
     assert "img-second" in task_content
-    assert "projects/beta/assets" in task_content
+    assert "assets/img-first.txt" in task_content
+    assert "assets/img-second.txt" in task_content
 
     assert any(
-        "projects/beta/assets" in assets_dir and {"img-first", "img-second"} <= set(file_ids)
+        assets_dir.endswith("/assets") and {"img-first", "img-second"} <= set(file_ids)
         for assets_dir, file_ids in messenger.download_calls
     )
 

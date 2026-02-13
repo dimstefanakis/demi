@@ -126,7 +126,6 @@ def test_resolve_execution_session_id_prefers_run_session_id():
     session_id = agent_entrypoint._resolve_execution_session_id(
         db=db,
         tenant_id=123,
-        project_name="beta",
         run_session_id="run-session",
     )
 
@@ -134,29 +133,30 @@ def test_resolve_execution_session_id_prefers_run_session_id():
     assert db.calls == []
 
 
-def test_resolve_execution_session_id_uses_project_scoped_kv():
+def test_resolve_execution_session_id_uses_tenant_scoped_kv_first():
     db = _SessionDb(payload={"session_id": "  beta-session  "})
 
     session_id = agent_entrypoint._resolve_execution_session_id(
         db=db,
         tenant_id=123,
-        project_name="beta",
         run_session_id=None,
     )
 
     assert session_id == "beta-session"
-    assert db.calls == [(123, "execution", "claude_session:beta")]
+    assert db.calls == [(123, "execution", "claude_session")]
 
 
-def test_resolve_execution_session_id_returns_none_when_project_session_missing():
+def test_resolve_execution_session_id_returns_none_when_no_session_found():
     db = _SessionDb(payload=None)
 
     session_id = agent_entrypoint._resolve_execution_session_id(
         db=db,
         tenant_id=123,
-        project_name="beta",
         run_session_id=None,
     )
 
     assert session_id is None
-    assert db.calls == [(123, "execution", "claude_session:beta")]
+    assert db.calls == [
+        (123, "execution", "claude_session"),
+        (123, "execution", "claude_session:main"),
+    ]

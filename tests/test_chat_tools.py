@@ -26,20 +26,19 @@ class FakeExecutionBridge:
         self.stream_calls = []
         self.stop_calls = []
 
-    def list_execution_agents(self, tenant_id, tenant_key, project_name=None):
-        del tenant_id, tenant_key, project_name
+    def list_execution_agents(self, tenant_id, tenant_key):
+        del tenant_id, tenant_key
         return list(self._agents)
 
-    async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+    async def stream_to_execution_agent(self, tenant_key, run_id, text):
         self.stream_calls.append(
             {
                 "tenant_key": tenant_key,
-                "project_name": project_name,
                 "run_id": run_id,
                 "text": text,
             }
         )
-        return {"ok": True, "status": "streamed", "run_id": run_id, "project_name": project_name}
+        return {"ok": True, "status": "streamed", "run_id": run_id}
 
     async def stop_execution_agent(self, run_id, reason, notify):
         self.stop_calls.append(
@@ -553,7 +552,7 @@ def test_send_message_keeps_reply_context_after_idle_gap(tmp_path):
     assert messenger.sent[0][2] == "msg-11"
 
 
-def test_stream_to_execution_agent_selects_run_by_project(tmp_path):
+def test_stream_to_execution_agent_selects_run_by_id(tmp_path):
     tasks_dir = tmp_path / "tasks"
     tasks_dir.mkdir(parents=True, exist_ok=True)
     bridge = FakeExecutionBridge(
@@ -575,7 +574,7 @@ def test_stream_to_execution_agent_selects_run_by_project(tmp_path):
     )
     stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
 
-    result = asyncio.run(stream_tool.handler({"text": "keep going", "project_name": "kappa"}))
+    result = asyncio.run(stream_tool.handler({"text": "keep going", "run_id": 42}))
     payload = json.loads(result["content"][0]["text"])
 
     assert payload["ok"] is True
@@ -605,7 +604,7 @@ def test_stream_to_execution_agent_requires_run_id_when_ambiguous(tmp_path):
     )
     stream_tool = next(tool for tool in tools if tool.name == "stream_to_execution_agent")
 
-    result = asyncio.run(stream_tool.handler({"text": "update active run", "project_name": "main"}))
+    result = asyncio.run(stream_tool.handler({"text": "update active run"}))
     payload = json.loads(result["content"][0]["text"])
 
     assert payload["ok"] is False
@@ -618,11 +617,10 @@ def test_stream_to_execution_agent_skips_file_fallback_for_db_stream(tmp_path):
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
     class DbStreamBridge(FakeExecutionBridge):
-        async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+        async def stream_to_execution_agent(self, tenant_key, run_id, text):
             self.stream_calls.append(
                 {
                     "tenant_key": tenant_key,
-                    "project_name": project_name,
                     "run_id": run_id,
                     "text": text,
                 }
@@ -631,7 +629,6 @@ def test_stream_to_execution_agent_skips_file_fallback_for_db_stream(tmp_path):
                 "ok": True,
                 "status": "db_stream",
                 "run_id": run_id,
-                "project_name": project_name,
                 "stream_input_id": "db-1",
             }
 
@@ -663,11 +660,10 @@ def test_stream_to_execution_agent_writes_file_fallback_for_file_stream(tmp_path
     tasks_dir.mkdir(parents=True, exist_ok=True)
 
     class FileStreamBridge(FakeExecutionBridge):
-        async def stream_to_execution_agent(self, tenant_key, project_name, run_id, text):
+        async def stream_to_execution_agent(self, tenant_key, run_id, text):
             self.stream_calls.append(
                 {
                     "tenant_key": tenant_key,
-                    "project_name": project_name,
                     "run_id": run_id,
                     "text": text,
                 }
@@ -676,7 +672,6 @@ def test_stream_to_execution_agent_writes_file_fallback_for_file_stream(tmp_path
                 "ok": True,
                 "status": "file_stream",
                 "run_id": run_id,
-                "project_name": project_name,
             }
 
     bridge = FileStreamBridge(agents=[{"run_id": 91, "project_name": "main", "status": "running"}])
@@ -705,6 +700,94 @@ def test_stream_to_execution_agent_writes_file_fallback_for_file_stream(tmp_path
     record = json.loads(lines[0])
     assert record["text"] == "continue work"
 
+
+def test_upsert_execution_context_forks_instead_of_renaming(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    existing = db.ensure_execution_agent(tenant_id=tenant.id, context="Calculator")
+    assert existing is not None
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant.external_id,
+            tenant_key=tenant.key,
+            provider=tenant.provider,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+        )
+    )
+    upsert_tool = next(tool for tool in tools if tool.name == "upsert_execution_context")
+
+    result = asyncio.run(
+        upsert_tool.handler(
+            {
+                "execution_agent_id": int(existing["id"]),
+                "context": "Tic Tac Toe",
+                "status": "active",
+            }
+        )
+    )
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload["status"] == "context_forked"
+    assert int(payload["forked_from_execution_agent_id"]) == int(existing["id"])
+    forked_id = int(payload["execution_agent"]["execution_agent_id"])
+    assert forked_id != int(existing["id"])
+
+    rows = db.list_execution_agents(tenant.id, include_inactive=True, limit=10)
+    contexts = {str(row.get("context") or "") for row in rows}
+    assert "Calculator" in contexts
+    assert "Tic Tac Toe" in contexts
+
+    original_row = db.get_execution_agent(int(existing["id"]))
+    assert original_row is not None
+    assert original_row["context"] == "Calculator"
+
+
+def test_upsert_execution_context_renames_only_when_explicit(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    existing = db.ensure_execution_agent(tenant_id=tenant.id, context="Calculator")
+    assert existing is not None
+
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=FakeMessenger(),
+            tenant_external_id=tenant.external_id,
+            tenant_key=tenant.key,
+            provider=tenant.provider,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+        )
+    )
+    upsert_tool = next(tool for tool in tools if tool.name == "upsert_execution_context")
+
+    result = asyncio.run(
+        upsert_tool.handler(
+            {
+                "execution_agent_id": int(existing["id"]),
+                "context": "Tic Tac Toe",
+                "status": "active",
+                "rename_existing": True,
+            }
+        )
+    )
+    payload = json.loads(result["content"][0]["text"])
+
+    assert payload["ok"] is True
+    assert payload.get("status") is None
+    assert int(payload["execution_agent"]["execution_agent_id"]) == int(existing["id"])
+    assert payload["execution_agent"]["context"] == "Tic Tac Toe"
 
 def test_stop_execution_agent_rejects_cross_tenant_run(tmp_path):
     db = build_test_db()
