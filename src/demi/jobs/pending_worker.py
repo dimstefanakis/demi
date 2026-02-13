@@ -4,9 +4,12 @@ import asyncio
 from datetime import timedelta
 import time
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from demi.db.core import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -52,39 +55,45 @@ class PendingWorker:
         next_received_recovery_check = 0.0
         try:
             while self._running:
-                groups = await self._db_call(
-                    self.db.fetch_queued_run_input_groups,
-                    self.config.batch_size,
-                )
-                if not groups:
-                    now = time.monotonic()
-                    if now >= next_active_check:
-                        await self._check_inflight_runs()
-                        next_active_check = now + max(
-                            self.config.poll_interval,
-                            self.config.active_check_interval_seconds,
-                        )
-                    if now >= next_received_recovery_check:
-                        await self._recover_stale_received_messages()
-                        next_received_recovery_check = now + max(
-                            self.config.poll_interval,
-                            self.config.active_check_interval_seconds,
-                        )
-                    idle_streak = min(idle_streak + 1, 6)
-                    backoff_sleep = self.config.poll_interval * (2**idle_streak)
-                    max_idle_sleep = max(
-                        self.config.poll_interval,
-                        self.config.active_check_interval_seconds,
+                try:
+                    groups = await self._db_call(
+                        self.db.fetch_queued_run_input_groups,
+                        self.config.batch_size,
                     )
-                    await asyncio.sleep(min(backoff_sleep, max_idle_sleep))
-                    continue
-                idle_streak = 0
-                for group in groups:
-                    try:
-                        await self._handle_group(group)
-                    except Exception:
-                        await asyncio.sleep(self.config.poll_interval)
-                        break
+                    if not groups:
+                        now = time.monotonic()
+                        if now >= next_active_check:
+                            await self._check_inflight_runs()
+                            next_active_check = now + max(
+                                self.config.poll_interval,
+                                self.config.active_check_interval_seconds,
+                            )
+                        if now >= next_received_recovery_check:
+                            await self._recover_stale_received_messages()
+                            next_received_recovery_check = now + max(
+                                self.config.poll_interval,
+                                self.config.active_check_interval_seconds,
+                            )
+                        idle_streak = min(idle_streak + 1, 6)
+                        backoff_sleep = self.config.poll_interval * (2**idle_streak)
+                        max_idle_sleep = max(
+                            self.config.poll_interval,
+                            self.config.active_check_interval_seconds,
+                        )
+                        await asyncio.sleep(min(backoff_sleep, max_idle_sleep))
+                        continue
+                    idle_streak = 0
+                    for group in groups:
+                        try:
+                            await self._handle_group(group)
+                        except Exception:
+                            await asyncio.sleep(self.config.poll_interval)
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("PendingWorker loop failed; continuing")
+                    await asyncio.sleep(max(0.25, float(self.config.poll_interval)))
         except asyncio.CancelledError:
             pass
         finally:

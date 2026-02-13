@@ -4,9 +4,12 @@ import asyncio
 from datetime import datetime, timezone
 import json
 from dataclasses import dataclass
+import logging
 from typing import Any
 
 from demi.db.core import Database
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -30,23 +33,32 @@ class EventWorker:
         idle_streak = 0
         try:
             while self._running:
-                jobs = await self._db_call(
-                    self.db.fetch_pending_event_jobs,
-                    self.config.batch_size,
-                )
-                if not jobs:
+                try:
+                    jobs = await self._db_call(
+                        self.db.fetch_pending_event_jobs,
+                        self.config.batch_size,
+                    )
+                    if not jobs:
+                        idle_streak = min(idle_streak + 1, 6)
+                        await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
+                        continue
+                    idle_streak = 0
+                    for job in jobs:
+                        try:
+                            await self._handle_job(job)
+                        except Exception:
+                            # Keep failure backoff bounded and recover quickly on success.
+                            idle_streak = min(idle_streak + 1, 3)
+                            await asyncio.sleep(self.config.poll_interval)
+                            break
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("EventWorker loop failed; continuing")
                     idle_streak = min(idle_streak + 1, 6)
-                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
-                    continue
-                idle_streak = 0
-                for job in jobs:
-                    try:
-                        await self._handle_job(job)
-                    except Exception:
-                        # Keep failure backoff bounded and recover quickly on success.
-                        idle_streak = min(idle_streak + 1, 3)
-                        await asyncio.sleep(self.config.poll_interval)
-                        break
+                    await asyncio.sleep(
+                        max(0.25, float(self.config.poll_interval)) * (2**idle_streak)
+                    )
         except asyncio.CancelledError:
             pass
         finally:

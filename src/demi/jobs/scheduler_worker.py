@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone
 import hashlib
 import json
+import logging
 import re
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -14,6 +15,7 @@ from demi.db.core import Database
 
 SCHEDULER_NAMESPACE = "scheduler"
 TRIGGER_KEY_PREFIX = "trigger:"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -36,13 +38,22 @@ class SchedulerWorker:
         idle_streak = 0
         try:
             while self._running:
-                fired = await self.process_once()
-                if fired <= 0:
+                try:
+                    fired = await self.process_once()
+                    if fired <= 0:
+                        idle_streak = min(idle_streak + 1, 6)
+                        await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
+                        continue
+                    idle_streak = 0
+                    await asyncio.sleep(self.config.poll_interval)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("SchedulerWorker loop failed; continuing")
                     idle_streak = min(idle_streak + 1, 6)
-                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
-                    continue
-                idle_streak = 0
-                await asyncio.sleep(self.config.poll_interval)
+                    await asyncio.sleep(
+                        max(0.25, float(self.config.poll_interval)) * (2**idle_streak)
+                    )
         except asyncio.CancelledError:
             pass
         finally:

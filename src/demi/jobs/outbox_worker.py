@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
 import time
+import logging
 
 from demi.db.core import Database
 
@@ -13,6 +14,7 @@ INTERACTION_SESSION_NAMESPACE = "interaction"
 # Outbox updates are instruction-mode interaction messages; keep them isolated
 # from routing-mode interaction session continuity.
 INTERACTION_SESSION_KEY = "claude_instruction_session"
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,12 +73,21 @@ class OutboxWorker:
         idle_streak = 0
         try:
             while self._running:
-                processed = await self.process_once()
-                if not processed:
+                try:
+                    processed = await self.process_once()
+                    if not processed:
+                        idle_streak = min(idle_streak + 1, 6)
+                        await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
+                    else:
+                        idle_streak = 0
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("OutboxWorker loop failed; continuing")
                     idle_streak = min(idle_streak + 1, 6)
-                    await asyncio.sleep(self.config.poll_interval * (2**idle_streak))
-                else:
-                    idle_streak = 0
+                    await asyncio.sleep(
+                        max(0.25, float(self.config.poll_interval)) * (2**idle_streak)
+                    )
         except asyncio.CancelledError:
             pass
         finally:

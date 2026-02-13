@@ -550,6 +550,8 @@ Background workers poll the main DB and run in the API process or the worker con
   - `state_change` watches tenant state values (`namespace/key/path`)
   - optional time windows (`start/end/timezone`)
   - optional retry windows/backoff metadata attached to event payloads
+- Worker loop resilience: Event/Pending/Outbox/Scheduler loops treat transient DB/API errors
+  as recoverable, log the exception, back off, and continue polling instead of exiting.
 
 ## Webhook Diagnostics
 
