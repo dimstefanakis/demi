@@ -23,6 +23,7 @@ class FakeAgent:
         session_id=None,
         run_id=None,
         runtime_env=None,
+        execution_context=None,
     ):
         return type("AgentResult", (), {"session_id": None, "summary": "ok"})()
 

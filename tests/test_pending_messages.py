@@ -25,6 +25,7 @@ class FakeAgent:
         session_id=None,
         run_id=None,
         runtime_env=None,
+        execution_context=None,
     ):
         self.messages.append(message)
         return type("AgentResult", (), {"session_id": session_id, "summary": "ok"})()

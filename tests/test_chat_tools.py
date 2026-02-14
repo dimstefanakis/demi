@@ -387,6 +387,7 @@ def test_send_message_primary_enqueues_interaction_update(tmp_path):
             tenant_id=tenant.id,
             provider=tenant.provider,
             run_id=run_id,
+            execution_context=project_name,
         )
     )
     send_tool = next(tool for tool in tools if tool.name == "send_message")

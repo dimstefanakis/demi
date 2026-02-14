@@ -59,6 +59,7 @@ class FakeAgent:
         session_id=None,
         run_id=None,
         runtime_env=None,
+        execution_context=None,
     ):
         self.calls.append((workspace.root, task_path, session_id, runtime_env))
         if db is not None and tenant_id is not None:
@@ -95,6 +96,7 @@ class FailingAgent(FakeAgent):
         session_id=None,
         run_id=None,
         runtime_env=None,
+        execution_context=None,
     ):
         del (
             workspace,
@@ -108,6 +110,7 @@ class FailingAgent(FakeAgent):
             session_id,
             run_id,
             runtime_env,
+            execution_context,
         )
         raise self.error
 
@@ -160,6 +163,7 @@ class EmptyUsageAgent(FakeAgent):
         session_id=None,
         run_id=None,
         runtime_env=None,
+        execution_context=None,
     ):
         del (
             workspace,
@@ -172,6 +176,7 @@ class EmptyUsageAgent(FakeAgent):
             payments,
             run_id,
             runtime_env,
+            execution_context,
         )
         return type(
             "AgentResult",
