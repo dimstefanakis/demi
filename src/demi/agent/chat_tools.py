@@ -40,6 +40,7 @@ class ChatToolContext:
     role: str = "primary"
     run_id: int | None = None
     message_id: int | None = None
+    execution_context: str | None = None
     on_interaction_message_sent: Callable[[], None] | None = None
 
 
@@ -191,7 +192,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 tenant_external_id=context.tenant_external_id,
                 message_type=message_type,
                 text=text,
-                project_name=_project_name_from_tasks_dir(context.tasks_dir),
+                project_name=context.execution_context,
                 run_id=run_id,
                 reply_to_message_id=reply_to_message_id or None,
                 provider_message_id=str(provider_message_id or "") or None,
@@ -293,7 +294,7 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             context.db.enqueue_outbox(
                 tenant_id=tenant_id,
                 run_id=run_id,
-                project_name=_project_name_from_tasks_dir(context.tasks_dir),
+                project_name=context.execution_context,
                 correlation_id=str(correlation_id),
                 payload=payload,
             )
@@ -1842,7 +1843,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "project_name": str(
                 args.get("project_name")
                 or existing.get("project_name")
-                or _project_name_from_tasks_dir(context.tasks_dir)
+                or context.execution_context
+                or ""
             ).strip(),
             "cron": cron_expr or None,
             "event_type": event_type or None,
@@ -2420,15 +2422,6 @@ def _is_duplicate_message(text: str, tasks_dir: Path, max_entries: int = 12) -> 
         if _similar(normalized, previous):
             return True
     return False
-
-
-def _project_name_from_tasks_dir(tasks_dir: Path) -> str | None:
-    try:
-        if tasks_dir.name == "tasks":
-            return tasks_dir.parent.name
-    except Exception:
-        return None
-    return None
 
 
 def _should_send(text: str, context: ChatToolContext) -> tuple[bool, str]:

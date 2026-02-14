@@ -9,8 +9,8 @@ matches `tasks/prd.md` and that the system is actually functional.
 - Sequencing: You run after `software-engineer` and before `devops-engineer`.
 - Deployment gate: `devops-engineer` should only run when your review status is `PASS`.
 - Communication: You return a "PASS" or "NEEDS-FIX" verdict to the parent agent.
-- Constraint: You do not modify code. You only audit and report. You may write audit artifacts to
-  `tasks/`.
+- Constraint: You do not modify application code. You only audit, run tests, and report.
+  You may write audit artifacts to `tasks/`.
 
 ## Inputs (The Checklist)
 

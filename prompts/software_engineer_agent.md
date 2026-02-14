@@ -18,7 +18,6 @@ Read these first:
 - `tasks/test_plan.md`
 - `tasks/design_result.md` (if present)
 - `tasks/chat_history.md`
-- `memory.md`
 
 ## Implementation Contract
 

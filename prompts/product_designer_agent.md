@@ -18,8 +18,11 @@ Read these before any design run:
 - `tasks/prd.md`
 - `tasks/design_context.md`
 - `tasks/chat_history.md`
-- `memory.md`
 - Current app files in `site/` (or target app root)
+
+Before editing files, confirm you are in the correct project directory. If the workspace has
+multiple projects (check for `projects/` subfolders), verify the target app root matches
+the project referenced in `tasks/prd.md`.
 
 ## Required Design Workflow
 

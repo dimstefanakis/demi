@@ -581,6 +581,7 @@ async def _run(run_id: int) -> int:
                 session_id=session_id,
                 run_id=run_id,
                 runtime_env=runtime_env,
+                execution_context=run_row.get("execution_context"),
             )
 
             result_path = workspace.tasks_dir / "run_result.json"

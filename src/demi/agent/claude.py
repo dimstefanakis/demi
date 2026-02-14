@@ -687,6 +687,7 @@ class ClaudeAgent:
         session_id: str | None = None,
         run_id: int | None = None,
         runtime_env: dict[str, str] | None = None,
+        execution_context: str | None = None,
     ) -> AgentResult:
         chat_server = build_chat_server(
             ChatToolContext(
@@ -700,6 +701,7 @@ class ClaudeAgent:
                 payments=payments,
                 role="primary",
                 run_id=run_id,
+                execution_context=execution_context,
             )
         )
         settings = Settings()

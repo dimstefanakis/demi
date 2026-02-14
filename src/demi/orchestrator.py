@@ -1739,6 +1739,7 @@ class Orchestrator:
                 session_id=run_session_id,
                 run_id=run_id,
                 runtime_env=runtime_env,
+                execution_context=run_execution_context,
             )
             result_total_cost = getattr(agent_result, "total_cost_usd", None)
             result_usage = getattr(agent_result, "usage", None)

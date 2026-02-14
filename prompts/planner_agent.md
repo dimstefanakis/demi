@@ -13,12 +13,10 @@ buildable spec.
 
 ## Environment & Capability References
 
-Before writing the PRD or test plan, read these files and plan within their constraints:
+Before writing the PRD or test plan, read these if present and plan within their constraints:
 
-- `AGENTS.md` (Repo guidelines + tooling policy)
-- `docs/SPEC.md` (Architecture + message flow + workspace layout)
-- `prompts/claude_agent.md` (Runtime environment + tool availability)
-- `docs/BILLING.md` and `docs/backend_pricing.md` (Billing gates and pricing truth)
+- `docs/BILLING.md` and `docs/backend_pricing.md` (billing gates and pricing — read only when the
+  task involves payment, pricing, or managed backend work)
 
 ## Inputs (Source of Truth)
 
