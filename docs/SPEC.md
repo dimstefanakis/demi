@@ -48,7 +48,8 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
 │ interaction_session_inputs,  │   │                                         │
 │ execution_stream_inputs,     │   │                                         │
 │ tenant_state, tenant_events, │   │                                         │
-│ event_jobs                   │   │                                         │
+│ event_jobs, pm_heartbeats,   │   │                                         │
+│ pm_actions                   │   │                                         │
 └───────────────┬──────────────┘   └────────────────────────────────────────┘
                 │
         ┌───────▼────────────────────────────────────────────────────────────┐
@@ -101,6 +102,7 @@ Background workers (poll main DB):
 - PendingWorker -> drains run_inputs into next run
 - OutboxWorker -> sends deferred Telegram messages with retry/backoff and stale-send reclaim
 - SchedulerWorker -> evaluates trigger mesh and enqueues event_jobs
+- PMWorker -> consumes `pm_trigger` jobs for proactive PM triage/actions
 ```
 
 ### Technology Stack
@@ -225,6 +227,18 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   - `SCHEDULER_WORKER_ENABLED`
   - `SCHEDULER_WORKER_POLL_INTERVAL`
   - `SCHEDULER_WORKER_BATCH_SIZE`
+- PM worker controls:
+  - `PM_WORKER_ENABLED`
+  - `PM_WORKER_POLL_INTERVAL`
+  - `PM_WORKER_BATCH_SIZE`
+  - `PM_HEARTBEAT_CRON`
+  - `PM_IDLE_CHECK_CRON`
+  - `PM_HEALTH_CHECK_CRON`
+  - `PM_FIRST_HEARTBEAT_CRON`
+  - `PM_TIMEZONE`
+  - `PM_MESSAGE_COOLDOWN_SECONDS`
+  - `PM_IDLE_THRESHOLD_HOURS`
+  - `PM_FIRST_HEARTBEAT_MIN_MESSAGES`
 - Outbox retry controls:
   - `OUTBOX_SEND_TIMEOUT_SECONDS` (default `600`)
   - `OUTBOX_MAX_ATTEMPTS` (default `12`)
@@ -475,14 +489,17 @@ Run selection when streaming to execution:
    status no longer creates assistant orders by default; the agent explicitly requests payment links.
    If tenant testing mode is enabled, this status is treated as authorized and payment prompts are bypassed.
 7. The orchestrator merges any attachments for the current interaction turn, saves them under `assets/`, writes
-   `tasks/interaction_context.json`, and calls the interaction agent in routing mode.
+   `tasks/interaction_context.json`, and calls the interaction agent in routing mode with an explicit,
+   authoritative incoming-message snapshot (message id, provider message id, timestamp, text, image count).
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
    - Interaction routing avoids implicit project switching; execution flow performs project-fit checks
      by reading per-project markdown context.
    - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
    - GitHub repo linkage is recovered from `github_repo.json` and, if missing, from local `site/.git` origin
      before creating a new repo name.
-9. If no run is needed, the messages included in the turn are marked processed. The interaction agent already replied.
+9. If no run is needed, the messages included in the turn are marked processed.
+   If the routing decision reports `reply_sent=false`, the orchestrator verifies whether any outbound message
+   was actually persisted for that turn and sends a fallback interaction reply when needed to avoid silent drops.
 10. If routing decides `queue_run=true`, messages included in the turn are queued in `run_inputs`
    for the selected active run. The interaction agent handles the queued ack (orchestrator only
    falls back if no reply was sent).
@@ -544,13 +561,31 @@ Background workers poll the main DB and run in the API process or the worker con
   head-of-line stalls and excessive polling.
 - SchedulerWorker: Evaluates tenant trigger definitions stored in
   `tenant_state(namespace='scheduler', key='trigger:*')` and enqueues `event_jobs`.
+  Triggers with `output_event_type='pm_trigger'` are enqueued with `job_type='pm_trigger'`
+  so PM processing can be isolated from normal event execution.
+  When PM worker is disabled, scheduler suppresses `pm_trigger` enqueues so unclaimed
+  PM jobs do not accumulate indefinitely.
   Trigger mesh supports:
   - `cron` schedules
   - `webhook_condition` matches against `tenant_events` payloads
   - `state_change` watches tenant state values (`namespace/key/path`)
   - optional time windows (`start/end/timezone`)
   - optional retry windows/backoff metadata attached to event payloads
-- Worker loop resilience: Event/Pending/Outbox/Scheduler loops treat transient DB/API errors
+- PMWorker: Claims `event_jobs` with `job_type='pm_trigger'`, performs low-cost PM triage,
+  records heartbeats/actions (`pm_heartbeats`, `pm_actions`), updates tenant `pm_state.json`,
+  auto-fixes conversation health issues, and enqueues proactive PM suggestions via outbox.
+  API/worker startup also runs an idempotent PM backfill for tenants with existing deploy URLs.
+  PM webhook-condition triggers are initialized with the current tenant event cursor so enabling
+  PM does not replay historical `tenant_events` backlog.
+  First-heartbeat onboarding does not require a user message-count threshold.
+  Deploy-related triggers always request a QA action; URL/timestamp freshness suppression is not hardcoded.
+  First-heartbeat onboarding trigger is only disabled after successful onboarding actions
+  (for example QA pass and suggestion enqueue), so failed onboarding attempts keep retrying.
+  PM suggestion enqueue failures fail the trigger job so the scheduler retry path can recover.
+  Outbox health requeue skips terminal failures (invalid payload errors and exhausted attempts)
+  to avoid endless retry churn.
+  Health checks are constrained to the PM trigger time window.
+- Worker loop resilience: Event/Pending/Outbox/Scheduler/PM loops treat transient DB/API errors
   as recoverable, log the exception, back off, and continue polling instead of exiting.
 
 ## Webhook Diagnostics

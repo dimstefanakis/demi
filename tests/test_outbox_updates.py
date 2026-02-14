@@ -148,6 +148,53 @@ async def test_outbox_worker_routes_interaction_updates(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_outbox_worker_routes_pm_suggestions(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace_manager.ensure_workspace(tenant.key, project_name="main")
+
+    outbox_id = db.enqueue_outbox(
+        tenant_id=tenant.id,
+        run_id=None,
+        project_name="main",
+        correlation_id="pm-suggestion-1",
+        payload={
+            "type": "pm_suggestion",
+            "action": "pm_suggestion",
+            "text": "i checked your site and noticed missing testimonials. want me to add them?",
+            "priority": "medium",
+            "pm_action_type": "suggest_feature",
+            "autonomy_tier": "suggest",
+            "tenant_external_id": tenant.external_id,
+            "provider": "telegram",
+        },
+    )
+
+    agent = FakeInteractionAgent()
+    worker = OutboxWorker(
+        db=db,
+        messenger=FakeMessenger(),
+        config=OutboxWorkerConfig(poll_interval=0.01, batch_size=5),
+        interaction_agent=agent,
+        workspace_manager=workspace_manager,
+    )
+
+    await worker.process_once()
+
+    assert agent.instructions
+    instruction = agent.instructions[0]["instruction"]
+    assert "Proactive suggestion for the user" in instruction
+    assert "pm_action_type" not in instruction
+    assert "Autonomy tier" not in instruction
+    assert "Correlation ID: pm-suggestion-1" in instruction
+    rows = db.list_outbox(tenant.id, limit=5)
+    row = next((item for item in rows if str(item.get("id")) == str(outbox_id)), None)
+    assert row is not None
+    assert row["status"] == "sent"
+
+
+@pytest.mark.asyncio
 async def test_outbox_worker_records_interaction_usage(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")

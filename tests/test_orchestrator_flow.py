@@ -238,6 +238,149 @@ async def test_orchestrator_new_site_flow(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_auto_activates_pm_after_first_deploy(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_WORKER_ENABLED", "true")
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="pm-activate-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a quick portfolio site",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    enabled = db.get_tenant_kv(int(tenant.id), "pm", "enabled") or {}
+    assert enabled.get("enabled") is True
+    triggers = db.list_tenant_kv_namespace(
+        int(tenant.id),
+        "scheduler",
+        key_prefix="trigger:pm-",
+        limit=20,
+    )
+    trigger_ids = {str(row.get("key")) for row in triggers}
+    assert "trigger:pm-heartbeat" in trigger_ids
+    assert "trigger:pm-first-heartbeat" in trigger_ids
+    health_trigger = db.get_tenant_kv(int(tenant.id), "scheduler", "trigger:pm-health-check")
+    assert isinstance(health_trigger, dict)
+    time_window = health_trigger.get("time_window")
+    assert isinstance(time_window, dict)
+    assert str(time_window.get("start")) == "09:00"
+    assert str(time_window.get("end")) == "18:00"
+    assert str(time_window.get("timezone") or "").strip()
+
+
+def test_orchestrator_seeds_pm_webhook_triggers_with_current_event_cursor(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_WORKER_ENABLED", "true")
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+    tenant = create_test_tenant(db, external_id=unique_external_id("tenant"))
+    db.update_tenant_deploy_url(int(tenant.id), "https://deployed.example.com")
+    old_a = db.record_tenant_event(int(tenant.id), "run_completed", {"summary": "old-completed"})
+    old_b = db.record_tenant_event(int(tenant.id), "deploy_completed", {"summary": "old-deploy"})
+    expected_cursor = max(int(old_a), int(old_b))
+
+    orchestrator._maybe_activate_pm_after_success(int(tenant.id))
+
+    for key in (
+        "trigger:pm-post-run-completed",
+        "trigger:pm-post-run-failed",
+        "trigger:pm-deploy-completed",
+    ):
+        trigger = db.get_tenant_kv(int(tenant.id), "scheduler", key) or {}
+        state = trigger.get("state")
+        assert isinstance(state, dict)
+        assert int(state.get("last_event_id") or 0) == expected_cursor
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_does_not_activate_pm_when_worker_disabled(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_WORKER_ENABLED", "false")
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="pm-activate-disabled-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Build a quick portfolio site",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    assert db.get_tenant_kv(int(tenant.id), "pm", "enabled") is None
+    triggers = db.list_tenant_kv_namespace(
+        int(tenant.id),
+        "scheduler",
+        key_prefix="trigger:pm-",
+        limit=20,
+    )
+    assert triggers == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_backfills_pm_for_existing_deployed_tenants(tmp_path, monkeypatch):
+    monkeypatch.setenv("PM_WORKER_ENABLED", "true")
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+    deployed = create_test_tenant(db, external_id=unique_external_id("tenant"))
+    db.update_tenant_deploy_url(deployed.id, "https://deployed.example.com")
+    no_deploy = create_test_tenant(db, external_id=unique_external_id("tenant"))
+    opted_out = create_test_tenant(db, external_id=unique_external_id("tenant"))
+    db.update_tenant_deploy_url(opted_out.id, "https://opted-out.example.com")
+    db.set_tenant_kv(opted_out.id, "pm", "enabled", {"enabled": False})
+
+    activated = orchestrator.backfill_pm_for_existing_tenants()
+
+    assert activated >= 1
+    enabled = db.get_tenant_kv(deployed.id, "pm", "enabled") or {}
+    assert enabled.get("enabled") is True
+    assert db.get_tenant_kv(no_deploy.id, "pm", "enabled") is None
+    opted_out_enabled = db.get_tenant_kv(opted_out.id, "pm", "enabled") or {}
+    assert opted_out_enabled.get("enabled") is False
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_passes_github_runtime_env(tmp_path, monkeypatch):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
@@ -1255,6 +1398,133 @@ async def test_orchestrator_queues_run_inputs_when_active(tmp_path):
     assert not agent.calls
     queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
     assert queued
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_no_run_without_reply_sends_fallback_instruction(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    class SilentNoRunAgent(FakeAgent):
+        def __init__(self):
+            super().__init__()
+            self.instructions: list[dict[str, object]] = []
+
+        async def route_interaction(
+            self,
+            *,
+            workspace,
+            message,
+            messenger=None,
+            tenant_id=None,
+            db=None,
+            payments=None,
+            session_id=None,
+            provider=None,
+            tenant_external_id=None,
+            message_id=None,
+            billing_checked=False,
+            asset_paths=None,
+            execution_bridge=None,
+        ):
+            del (
+                workspace,
+                message,
+                messenger,
+                tenant_id,
+                db,
+                payments,
+                session_id,
+                provider,
+                tenant_external_id,
+                message_id,
+                billing_checked,
+                asset_paths,
+                execution_bridge,
+            )
+            return {
+                "ok": True,
+                "should_run": False,
+                "queue_run": False,
+                "dedupe": True,
+                "reply_sent": False,
+                "purpose": "dedupe",
+            }
+
+        async def send_interaction_instruction(
+            self,
+            workspace,
+            instruction,
+            messenger,
+            tenant_id=None,
+            db=None,
+            payments=None,
+            session_id=None,
+            provider=None,
+            tenant_external_id=None,
+            run_id=None,
+            message_id=None,
+            asset_paths=None,
+            execution_bridge=None,
+        ):
+            del (
+                workspace,
+                messenger,
+                tenant_id,
+                db,
+                payments,
+                session_id,
+                provider,
+                tenant_external_id,
+                run_id,
+                asset_paths,
+                execution_bridge,
+            )
+            self.instructions.append(
+                {
+                    "instruction": instruction,
+                    "message_id": message_id,
+                }
+            )
+            return type(
+                "AgentResult",
+                (),
+                {
+                    "session_id": "instruction-session-1",
+                    "summary": "ok",
+                    "total_cost_usd": 0.01,
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                },
+            )()
+
+    agent = SilentNoRunAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="silent-no-run-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Proceed with any pending adjustments",
+        images=[],
+        raw={},
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    row = db.get_message_by_provider_id(tenant.id, "silent-no-run-1")
+    assert row is not None
+    assert str(row.get("status")) == "processed"
+    assert agent.instructions
+    assert int(agent.instructions[-1]["message_id"]) == int(row["id"])
+    assert db.get_inflight_run(tenant.id, None) is None
 
 
 @pytest.mark.asyncio

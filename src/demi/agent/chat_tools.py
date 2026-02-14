@@ -1380,6 +1380,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             pass
         if context.db and context.tenant_id is not None:
             context.db.update_tenant_deploy_url(context.tenant_id, deploy_url)
+            try:
+                context.db.record_tenant_event(
+                    int(context.tenant_id),
+                    "deploy_completed",
+                    {
+                        "deploy_url": deploy_url,
+                        "summary": "Deployment completed",
+                    },
+                )
+            except Exception:
+                pass
         payload = {
             "ok": True,
             "deploy_url": deploy_url,

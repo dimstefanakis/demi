@@ -21,6 +21,13 @@ from demi.memory.logs import append_log, write_chat_history
 from demi.failure_guard import clear_block, get_block, record_hard_failure
 from demi.domains.github_app import GitHubAppConfig, GitHubRepoManager, MAX_REPO_NAME_LENGTH
 from demi.config import Settings
+from demi.pm.constants import (
+    PM_ENABLED_KEY,
+    PM_LAST_HEARTBEAT_KEY,
+    PM_NAMESPACE,
+    PM_NEEDS_ONBOARDING_KEY,
+    SCHEDULER_NAMESPACE,
+)
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
 # Keep routing and instruction sessions separate so prior instruction-mode
@@ -34,6 +41,27 @@ EXECUTION_SESSION_NAMESPACE = "execution"
 EXECUTION_SESSION_KEY = "claude_session"
 EXECUTION_SESSION_KEY_PREFIX = "claude_session:"
 DEFAULT_EXECUTION_CONTEXT = "Main project"
+
+
+@dataclass(frozen=True)
+class PMConfig:
+    heartbeat_cron: str = "0 10 * * *"
+    idle_check_cron: str = "0 */6 * * *"
+    health_check_cron: str = "30 * * * *"
+    first_heartbeat_cron: str = "0 */2 * * *"
+    timezone: str = "America/New_York"
+
+    @classmethod
+    def from_settings(cls, settings: Settings) -> PMConfig:
+        return cls(
+            heartbeat_cron=str(settings.pm_heartbeat_cron).strip() or cls.heartbeat_cron,
+            idle_check_cron=str(settings.pm_idle_check_cron).strip() or cls.idle_check_cron,
+            health_check_cron=str(settings.pm_health_check_cron).strip() or cls.health_check_cron,
+            first_heartbeat_cron=(
+                str(settings.pm_first_heartbeat_cron).strip() or cls.first_heartbeat_cron
+            ),
+            timezone=str(settings.pm_timezone).strip() or cls.timezone,
+        )
 
 
 @dataclass
@@ -184,6 +212,236 @@ class Orchestrator:
             )
         except Exception:
             pass
+
+    @staticmethod
+    def _pm_trigger_payload(
+        *,
+        trigger_id: str,
+        name: str,
+        trigger_type: str,
+        intent: str,
+        output_event_type: str,
+        payload: dict[str, Any],
+        project_name: str | None = None,
+        cron: str | None = None,
+        event_type: str | None = None,
+        condition: dict[str, Any] | None = None,
+        allow_multiple: bool = False,
+        time_window: dict[str, Any] | None = None,
+        state: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        return {
+            "id": trigger_id,
+            "name": name,
+            "enabled": True,
+            "trigger_type": trigger_type,
+            "project_name": project_name,
+            "cron": cron,
+            "event_type": event_type,
+            "condition": condition,
+            "intent": intent,
+            "output_event_type": output_event_type,
+            "payload": payload,
+            "allow_multiple": allow_multiple,
+            "retry_window_seconds": 900,
+            "retry_backoff_seconds": 30,
+            "time_window": time_window,
+            "state": dict(state or {}),
+            "created_at": now,
+            "updated_at": now,
+        }
+
+    def _current_tenant_event_cursor(self, tenant_id: int) -> int:
+        after_id = 0
+        latest_id = 0
+        page_size = 500
+        while True:
+            try:
+                rows = self.db.list_tenant_events(
+                    int(tenant_id),
+                    event_type=None,
+                    after_id=after_id,
+                    limit=page_size,
+                )
+            except Exception:
+                return latest_id
+            if not rows:
+                return latest_id
+            last_row_id = latest_id
+            for row in rows:
+                try:
+                    event_id = int(row.get("id") if hasattr(row, "get") else row["id"])
+                except Exception:
+                    continue
+                if event_id > last_row_id:
+                    last_row_id = event_id
+            if last_row_id <= after_id:
+                return latest_id
+            latest_id = max(latest_id, last_row_id)
+            if len(rows) < page_size:
+                return latest_id
+            after_id = last_row_id
+
+    def register_pm_triggers(
+        self,
+        tenant_id: int,
+        config: PMConfig,
+    ) -> None:
+        timezone_name = str(config.timezone or "America/New_York").strip() or "America/New_York"
+        time_window = {"start": "09:00", "end": "18:00", "timezone": timezone_name}
+        webhook_state = {"last_event_id": self._current_tenant_event_cursor(int(tenant_id))}
+
+        trigger_rows = {
+            "trigger:pm-heartbeat": self._pm_trigger_payload(
+                trigger_id="pm-heartbeat",
+                name="PM Agent Daily Heartbeat",
+                trigger_type="cron",
+                cron=config.heartbeat_cron,
+                intent="pm_heartbeat",
+                output_event_type="pm_trigger",
+                payload={"trigger": "daily_heartbeat"},
+                time_window=time_window,
+            ),
+            "trigger:pm-post-run-completed": self._pm_trigger_payload(
+                trigger_id="pm-post-run-completed",
+                name="PM Post Run Completed",
+                trigger_type="webhook_condition",
+                event_type="run_completed",
+                intent="pm_post_run_completed",
+                output_event_type="pm_trigger",
+                payload={"trigger": "run_completed"},
+                state=webhook_state,
+            ),
+            "trigger:pm-post-run-failed": self._pm_trigger_payload(
+                trigger_id="pm-post-run-failed",
+                name="PM Post Run Failed",
+                trigger_type="webhook_condition",
+                event_type="run_failed",
+                intent="pm_post_run_failed",
+                output_event_type="pm_trigger",
+                payload={"trigger": "run_failed"},
+                state=webhook_state,
+            ),
+            "trigger:pm-deploy-completed": self._pm_trigger_payload(
+                trigger_id="pm-deploy-completed",
+                name="PM Deploy Completed",
+                trigger_type="webhook_condition",
+                event_type="deploy_completed",
+                intent="pm_deploy_completed",
+                output_event_type="pm_trigger",
+                payload={"trigger": "deploy_completed"},
+                state=webhook_state,
+            ),
+            "trigger:pm-idle-check": self._pm_trigger_payload(
+                trigger_id="pm-idle-check",
+                name="PM User Idle Check",
+                trigger_type="cron",
+                cron=config.idle_check_cron,
+                intent="pm_idle_check",
+                output_event_type="pm_trigger",
+                payload={"trigger": "idle_check"},
+                time_window=time_window,
+            ),
+            "trigger:pm-health-check": self._pm_trigger_payload(
+                trigger_id="pm-health-check",
+                name="PM Health Check",
+                trigger_type="cron",
+                cron=config.health_check_cron,
+                intent="pm_health_check",
+                output_event_type="pm_trigger",
+                payload={"trigger": "health_check"},
+                time_window=time_window,
+            ),
+            "trigger:pm-first-heartbeat": self._pm_trigger_payload(
+                trigger_id="pm-first-heartbeat",
+                name="PM First Heartbeat",
+                trigger_type="cron",
+                cron=config.first_heartbeat_cron,
+                intent="pm_first_heartbeat",
+                output_event_type="pm_trigger",
+                payload={"trigger": "first_heartbeat"},
+                time_window=time_window,
+            ),
+        }
+        for key, value in trigger_rows.items():
+            self.db.set_tenant_kv(int(tenant_id), SCHEDULER_NAMESPACE, key, value)
+
+    def _pm_enabled_payload(self, tenant_id: int) -> dict[str, Any] | None:
+        try:
+            payload = self.db.get_tenant_kv(int(tenant_id), PM_NAMESPACE, PM_ENABLED_KEY)
+        except Exception:
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _pm_is_enabled(self, tenant_id: int) -> bool:
+        payload = self._pm_enabled_payload(tenant_id)
+        if payload is None:
+            return False
+        if "enabled" not in payload:
+            return True
+        return bool(payload.get("enabled"))
+
+    def _maybe_activate_pm_after_success(self, tenant_id: int) -> None:
+        if self._pm_is_enabled(tenant_id):
+            return
+        existing = self._pm_enabled_payload(tenant_id)
+        if isinstance(existing, dict) and existing.get("enabled") is False:
+            # Respect explicit tenant opt-out; do not auto-reactivate.
+            return
+        tenant = self.db.get_tenant_by_id(int(tenant_id))
+        if tenant is None:
+            return
+        deploy_url = str(getattr(tenant, "last_deploy_url", "") or "").strip()
+        if not deploy_url:
+            return
+        settings = Settings()
+        if not bool(settings.pm_worker_enabled):
+            return
+        config = PMConfig.from_settings(settings)
+        self.register_pm_triggers(int(tenant_id), config)
+        now = self._now().isoformat()
+        self.db.set_tenant_kv(
+            int(tenant_id),
+            PM_NAMESPACE,
+            PM_ENABLED_KEY,
+            {"enabled": True, "updated_at": now},
+        )
+        self.db.set_tenant_kv(
+            int(tenant_id),
+            PM_NAMESPACE,
+            PM_NEEDS_ONBOARDING_KEY,
+            {"enabled": True, "updated_at": now},
+        )
+        self.db.set_tenant_kv(
+            int(tenant_id),
+            PM_NAMESPACE,
+            PM_LAST_HEARTBEAT_KEY,
+            {"at": None, "updated_at": now},
+        )
+
+    def backfill_pm_for_existing_tenants(self) -> int:
+        settings = Settings()
+        if not bool(settings.pm_worker_enabled):
+            return 0
+        try:
+            tenants = self.db.list_tenants()
+        except Exception:
+            return 0
+        activated = 0
+        for tenant in tenants or []:
+            try:
+                tenant_id = int(getattr(tenant, "id"))
+            except (TypeError, ValueError):
+                continue
+            if self._pm_is_enabled(tenant_id):
+                continue
+            if not str(getattr(tenant, "last_deploy_url", "") or "").strip():
+                continue
+            self._maybe_activate_pm_after_success(tenant_id)
+            if self._pm_is_enabled(tenant_id):
+                activated += 1
+        return activated
 
     @staticmethod
     def _normalize_execution_context(context: Any | None) -> str:
@@ -571,6 +829,20 @@ class Orchestrator:
         tenant = self.db.get_or_create_tenant(msg.provider, msg.tenant_external_id)
 
         message_id, inserted = self.db.record_message(tenant.id, msg)
+        if inserted:
+            try:
+                self.db.record_tenant_event(
+                    int(tenant.id),
+                    "message_received",
+                    {
+                        "provider": msg.provider,
+                        "provider_message_id": msg.provider_message_id,
+                        "summary": "User message received",
+                        "text_preview": str((msg.text or "").strip())[:180],
+                    },
+                )
+            except Exception:
+                pass
         if not inserted:
             if not allow_existing_received:
                 return OrchestratorResult(status="duplicate", detail="message already processed")
@@ -875,6 +1147,28 @@ class Orchestrator:
 
                 if decision.get("dedupe") or not decision.get("should_run"):
                     self.db.update_message_statuses(message_ids, "processed")
+                    if not decision.get("reply_sent"):
+                        since = combined_msg.received_at.isoformat()
+                        try:
+                            has_outbound = self.db.has_outbound_message_event_since(
+                                tenant.id, since
+                            )
+                        except Exception:
+                            has_outbound = False
+                        if not has_outbound:
+                            await self._send_interaction_instruction(
+                                workspace=workspace,
+                                tenant=tenant,
+                                msg=combined_msg,
+                                instruction=(
+                                    "Acknowledge the user's latest message and give a concise next "
+                                    "step. If there is nothing pending, say that explicitly and ask "
+                                    "what they'd like to do next."
+                                ),
+                                run_id=None,
+                                message_id=latest_message_id,
+                                asset_paths=asset_paths,
+                            )
                     interaction_session_status = "completed"
                     return OrchestratorResult(status="accepted", detail="no_run")
 
@@ -1491,6 +1785,26 @@ class Orchestrator:
                 tool_summary=tool_summary,
             )
             self.db.finish_run(run_id, status="completed")
+            try:
+                self.db.record_tenant_event(
+                    int(tenant.id),
+                    "run_completed",
+                    {
+                        "run_id": int(run_id),
+                        "message_id": int(message_id) if message_id else None,
+                        "execution_agent_id": run_execution_agent_id,
+                        "execution_context": run_execution_context,
+                        "summary": "Execution run completed",
+                        "result_summary": getattr(agent_result, "summary", None),
+                        "total_cost_usd": result_total_cost,
+                    },
+                )
+            except Exception:
+                pass
+            try:
+                self._maybe_activate_pm_after_success(int(tenant.id))
+            except Exception:
+                pass
             if message_ids and manage_message_status:
                 self.db.update_message_statuses(message_ids, "processed")
             if run_input_ids:
@@ -1525,6 +1839,21 @@ class Orchestrator:
                 except Exception:
                     pass
             self.db.finish_run(run_id, status="failed", error=str(exc))
+            try:
+                self.db.record_tenant_event(
+                    int(tenant.id),
+                    "run_failed",
+                    {
+                        "run_id": int(run_id),
+                        "message_id": int(message_id) if message_id else None,
+                        "execution_agent_id": run_execution_agent_id,
+                        "execution_context": run_execution_context,
+                        "summary": "Execution run failed",
+                        "error": str(exc),
+                    },
+                )
+            except Exception:
+                pass
             if message_ids and manage_message_status:
                 self.db.update_message_statuses(message_ids, "failed")
             if run_input_ids:
@@ -1564,15 +1893,27 @@ class Orchestrator:
                 except Exception:
                     pass
 
-    async def _drain_run_inputs(self, tenant) -> None:
+    async def _drain_run_inputs(
+        self,
+        tenant,
+        *,
+        max_inputs: int | None = None,
+    ) -> int:
+        drained = 0
         while True:
+            limit = 10
+            if max_inputs is not None:
+                remaining = int(max_inputs) - drained
+                if remaining <= 0:
+                    return drained
+                limit = max(1, min(10, remaining))
             rows = self.db.claim_run_inputs_for_project(
                 tenant.id,
                 None,
-                limit=10,
+                limit=limit,
             )
             if not rows:
-                return
+                return drained
             grouped_rows: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
                 run_key = str(row.get("run_id") or "")
@@ -1593,6 +1934,7 @@ class Orchestrator:
                     process_queue=False,
                     routing_decision=routing_decision,
                 )
+                drained += len(run_input_ids)
 
     def _should_send_failure_notice(
         self,

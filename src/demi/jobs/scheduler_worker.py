@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class SchedulerWorkerConfig:
     poll_interval: float = 5.0
     batch_size: int = 50
+    pm_worker_enabled: bool = True
 
 
 @dataclass
@@ -336,10 +337,18 @@ class SchedulerWorker:
             "event_type": event_type,
             "payload": event_payload,
         }
+        if event_type == "pm_trigger" and not self.config.pm_worker_enabled:
+            logger.info(
+                "Skipping pm_trigger enqueue for tenant_id=%s trigger_id=%s: PM worker disabled",
+                tenant_id,
+                trigger_id,
+            )
+            return
+        job_type = "pm_trigger" if event_type == "pm_trigger" else "event"
         await self._db_call(
             self.db.create_event_job,
             tenant_id,
-            "event",
+            job_type,
             job_payload,
             run_after.isoformat(),
         )

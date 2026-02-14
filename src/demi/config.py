@@ -132,6 +132,17 @@ class Settings(BaseSettings):
     scheduler_worker_enabled: bool = True
     scheduler_worker_poll_interval: float = 5.0
     scheduler_worker_batch_size: int = 50
+    pm_worker_enabled: bool = True
+    pm_worker_poll_interval: float = 5.0
+    pm_worker_batch_size: int = 10
+    pm_heartbeat_cron: str = "0 10 * * *"
+    pm_idle_check_cron: str = "0 */6 * * *"
+    pm_health_check_cron: str = "30 * * * *"
+    pm_first_heartbeat_cron: str = "0 */2 * * *"
+    pm_timezone: str = "America/New_York"
+    pm_message_cooldown_seconds: int = 3600
+    pm_idle_threshold_hours: int = 48
+    pm_first_heartbeat_min_messages: int = 5
 
     run_lease_seconds: int = 300
     run_activity_poll_interval: float = 2.5

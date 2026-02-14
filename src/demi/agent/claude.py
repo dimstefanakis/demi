@@ -1413,11 +1413,29 @@ class ClaudeAgent:
             query_task: asyncio.Task[None] | None = None
             query_error: Exception | None = None
             try:
+                message_text = str(message.text or "").strip()
+                if not message_text and message.images:
+                    message_text = "(attachment only)"
+                if not message_text:
+                    message_text = "(empty)"
+                incoming_snapshot = {
+                    "message_id": message_id,
+                    "provider": provider or message.provider,
+                    "provider_message_id": message.provider_message_id,
+                    "received_at": message.received_at.isoformat(),
+                    "text": message_text,
+                    "image_count": len(message.images),
+                }
                 prompt = (
                     "ROUTING MODE\n"
                     "Handle the incoming user message. "
                     "Send any user reply if needed, then output only the routing JSON decision.\n"
-                    "Use the interaction context files and tools as needed.\n\n"
+                    "Use the interaction context files and tools as needed.\n"
+                    "Incoming message for this turn (authoritative):\n"
+                    f"{json.dumps(incoming_snapshot, ensure_ascii=False)}\n"
+                    "Treat this message snapshot as ground truth for this decision.\n"
+                    "Do not dedupe because of older context unless this exact "
+                    "provider_message_id was already fully handled.\n\n"
                     f"Billing check already performed: {billing_checked}.\n"
                 )
                 if retry_note:

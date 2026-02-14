@@ -434,9 +434,13 @@ class SupabaseDatabase:
             raise RuntimeError("event_job_create_failed")
         return int(data[0]["id"])
 
-    def fetch_pending_event_jobs(self, limit: int = 25) -> list[dict[str, Any]]:
+    def fetch_pending_event_jobs(
+        self,
+        limit: int = 25,
+        job_type_filter: str | list[str] | None = None,
+    ) -> list[dict[str, Any]]:
         now = datetime.now(tz=timezone.utc).isoformat()
-        data = self._execute(
+        query = (
             self._table("event_jobs")
             .select("*")
             .eq("status", "pending")
@@ -444,6 +448,15 @@ class SupabaseDatabase:
             .order("id", desc=False)
             .limit(limit)
         )
+        if isinstance(job_type_filter, str):
+            job_type = job_type_filter.strip()
+            if job_type:
+                query = query.eq("job_type", job_type)
+        elif isinstance(job_type_filter, list):
+            values = [str(item).strip() for item in job_type_filter if str(item).strip()]
+            if values:
+                query = query.in_("job_type", values)
+        data = self._execute(query)
         return list(data or [])
 
     def list_event_jobs(
@@ -686,6 +699,35 @@ class SupabaseDatabase:
         value = data[0].get("received_at")
         return str(value) if value else None
 
+    def get_latest_user_message(self, tenant_id: int) -> dict[str, Any] | None:
+        query = (
+            self._table("messages")
+            .select("id, provider, provider_message_id, received_at, text, status")
+            .eq("tenant_id", int(tenant_id))
+            .neq("provider", "event")
+            .order("received_at", desc=True)
+            .limit(1)
+        )
+        data = self._execute(query)
+        if not data:
+            return None
+        row = data[0]
+        return dict(row) if isinstance(row, dict) else None
+
+    def count_tenant_messages(
+        self,
+        tenant_id: int,
+        *,
+        statuses: list[str] | None = None,
+    ) -> int:
+        query = self._table("messages").select("id").eq("tenant_id", int(tenant_id))
+        if statuses:
+            normalized = [str(item).strip() for item in statuses if str(item).strip()]
+            if normalized:
+                query = query.in_("status", normalized)
+        data = self._execute(query)
+        return len(data or [])
+
     def get_latest_message_event_at(self, tenant_id: int) -> str | None:
         query = (
             self._table("message_events")
@@ -741,17 +783,19 @@ class SupabaseDatabase:
     def fetch_stale_received_messages(
         self,
         *,
+        tenant_id: int | None = None,
         before: datetime,
         limit: int = 25,
     ) -> list[dict[str, Any]]:
-        data = self._execute(
+        query = (
             self._table("messages")
             .select("*")
             .eq("status", "received")
             .lt("received_at", before.isoformat())
-            .order("received_at", desc=True)
-            .limit(limit)
         )
+        if tenant_id is not None:
+            query = query.eq("tenant_id", int(tenant_id))
+        data = self._execute(query.order("received_at", desc=True).limit(limit))
         return list(data or [])
 
     def fetch_processing_message_groups(self, limit: int = 25) -> list[dict[str, Any]]:
@@ -1953,3 +1997,159 @@ class SupabaseDatabase:
 
     def get_supabase_project(self, tenant_id: int) -> dict[str, Any] | None:
         return self._select_one("supabase_projects", tenant_id=tenant_id)
+
+    def create_pm_heartbeat(
+        self,
+        *,
+        tenant_id: int,
+        trigger_type: str,
+        trigger_event_id: int | None = None,
+        triage_result: dict[str, Any] | None = None,
+        action_needed: bool = False,
+        triage_cost_usd: float | None = None,
+        triage_model: str | None = None,
+        action_result: dict[str, Any] | None = None,
+        action_cost_usd: float | None = None,
+        action_model: str | None = None,
+        total_cost_usd: float | None = None,
+        completed_at: str | None = None,
+    ) -> int | None:
+        payload = {
+            "tenant_id": int(tenant_id),
+            "trigger_type": str(trigger_type or "").strip() or "unknown",
+            "trigger_event_id": trigger_event_id,
+            "triage_result": triage_result,
+            "action_needed": bool(action_needed),
+            "triage_cost_usd": triage_cost_usd,
+            "triage_model": triage_model,
+            "action_result": action_result,
+            "action_cost_usd": action_cost_usd,
+            "action_model": action_model,
+            "total_cost_usd": float(total_cost_usd or 0.0),
+            "completed_at": completed_at,
+        }
+        try:
+            data = self._execute(self._table("pm_heartbeats").insert(payload))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "pm_heartbeats"):
+                return None
+            raise
+        if not data:
+            return None
+        try:
+            return int(data[0]["id"])
+        except Exception:
+            return None
+
+    def update_pm_heartbeat(
+        self,
+        heartbeat_id: int,
+        *,
+        triage_result: dict[str, Any] | None = None,
+        action_needed: bool | None = None,
+        triage_cost_usd: float | None = None,
+        triage_model: str | None = None,
+        action_result: dict[str, Any] | None = None,
+        action_cost_usd: float | None = None,
+        action_model: str | None = None,
+        total_cost_usd: float | None = None,
+        completed_at: str | None = None,
+    ) -> None:
+        updates: dict[str, Any] = {}
+        if triage_result is not None:
+            updates["triage_result"] = triage_result
+        if action_needed is not None:
+            updates["action_needed"] = bool(action_needed)
+        if triage_cost_usd is not None:
+            updates["triage_cost_usd"] = triage_cost_usd
+        if triage_model is not None:
+            updates["triage_model"] = triage_model
+        if action_result is not None:
+            updates["action_result"] = action_result
+        if action_cost_usd is not None:
+            updates["action_cost_usd"] = action_cost_usd
+        if action_model is not None:
+            updates["action_model"] = action_model
+        if total_cost_usd is not None:
+            updates["total_cost_usd"] = total_cost_usd
+        if completed_at is not None:
+            updates["completed_at"] = completed_at
+        if not updates:
+            return
+        try:
+            self._execute(self._table("pm_heartbeats").update(updates).eq("id", int(heartbeat_id)))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "pm_heartbeats"):
+                return
+            raise
+
+    def create_pm_action(
+        self,
+        *,
+        tenant_id: int,
+        heartbeat_id: int | None,
+        action_type: str,
+        autonomy_tier: str,
+        description: str,
+        execution_run_id: int | None = None,
+        outbox_id: str | None = None,
+        status: str = "pending",
+        result_summary: str | None = None,
+    ) -> int | None:
+        now = datetime.now(tz=timezone.utc).isoformat()
+        payload = {
+            "tenant_id": int(tenant_id),
+            "heartbeat_id": heartbeat_id,
+            "action_type": str(action_type or "").strip() or "unknown",
+            "autonomy_tier": str(autonomy_tier or "").strip() or "auto",
+            "description": str(description or "").strip(),
+            "execution_run_id": execution_run_id,
+            "outbox_id": outbox_id,
+            "status": str(status or "pending").strip() or "pending",
+            "result_summary": result_summary,
+            "created_at": now,
+            "updated_at": now,
+        }
+        try:
+            data = self._execute(self._table("pm_actions").insert(payload))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "pm_actions"):
+                return None
+            raise
+        if not data:
+            return None
+        try:
+            return int(data[0]["id"])
+        except Exception:
+            return None
+
+    def update_pm_action(
+        self,
+        action_id: int,
+        *,
+        status: str | None = None,
+        result_summary: str | None = None,
+        user_response: str | None = None,
+        user_response_at: str | None = None,
+        execution_run_id: int | None = None,
+        outbox_id: str | None = None,
+    ) -> None:
+        updates: dict[str, Any] = {"updated_at": datetime.now(tz=timezone.utc).isoformat()}
+        if status is not None:
+            updates["status"] = str(status).strip() or "pending"
+        if result_summary is not None:
+            updates["result_summary"] = result_summary
+        if user_response is not None:
+            updates["user_response"] = user_response
+        if user_response_at is not None:
+            updates["user_response_at"] = user_response_at
+        if execution_run_id is not None:
+            updates["execution_run_id"] = int(execution_run_id)
+        if outbox_id is not None:
+            updates["outbox_id"] = outbox_id
+        try:
+            self._execute(self._table("pm_actions").update(updates).eq("id", int(action_id)))
+        except Exception as exc:
+            if self._is_missing_relation(exc, "pm_actions"):
+                return
+            raise

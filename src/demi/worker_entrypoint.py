@@ -12,6 +12,7 @@ from demi.db.factory import build_database
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
+from demi.jobs.pm_worker import PMWorker, PMWorkerConfig
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.messaging.telegram import TelegramClient, TelegramConfig
 from demi.observability import initialize_laminar
@@ -20,6 +21,8 @@ from demi.payments.stripe import StripeClient, build_stripe_config
 from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
 from demi.workspace.core import WorkspaceManager
+
+logger = logging.getLogger(__name__)
 
 
 async def _run_workers() -> None:
@@ -72,6 +75,12 @@ async def _run_workers() -> None:
         payments=stripe_client,
         workspace_allocator=workspace_allocator,
     )
+    try:
+        activated = await asyncio.to_thread(orchestrator.backfill_pm_for_existing_tenants)
+        if activated:
+            logger.info("PM backfill activated for %s tenant(s)", activated)
+    except Exception:
+        logger.exception("PM backfill failed")
 
     tasks: list[asyncio.Task] = []
     workers: list[Any] = []
@@ -131,6 +140,7 @@ async def _run_workers() -> None:
             config=SchedulerWorkerConfig(
                 poll_interval=settings.scheduler_worker_poll_interval,
                 batch_size=settings.scheduler_worker_batch_size,
+                pm_worker_enabled=settings.pm_worker_enabled,
             ),
         )
         workers.append(scheduler_worker)
@@ -138,10 +148,28 @@ async def _run_workers() -> None:
             asyncio.create_task(scheduler_worker.run_forever(), name="scheduler-worker")
         )
 
+    if settings.pm_worker_enabled:
+        pm_worker = PMWorker(
+            db=db,
+            orchestrator=orchestrator,
+            workspace_manager=workspace_manager,
+            config=PMWorkerConfig(
+                poll_interval=settings.pm_worker_poll_interval,
+                batch_size=settings.pm_worker_batch_size,
+                cooldown_between_user_messages_seconds=settings.pm_message_cooldown_seconds,
+                idle_threshold_hours=settings.pm_idle_threshold_hours,
+                first_heartbeat_min_messages=settings.pm_first_heartbeat_min_messages,
+                default_trigger_timezone=settings.pm_timezone,
+                outbox_max_attempts=settings.outbox_max_attempts,
+            ),
+        )
+        workers.append(pm_worker)
+        tasks.append(asyncio.create_task(pm_worker.run_forever(), name="pm-worker"))
+
     if not tasks:
         raise RuntimeError(
             "No workers enabled. Set EVENTS_WORKER_ENABLED, PENDING_WORKER_ENABLED, "
-            "OUTBOX_WORKER_ENABLED, or SCHEDULER_WORKER_ENABLED"
+            "OUTBOX_WORKER_ENABLED, SCHEDULER_WORKER_ENABLED, or PM_WORKER_ENABLED"
         )
 
     stop_event = asyncio.Event()

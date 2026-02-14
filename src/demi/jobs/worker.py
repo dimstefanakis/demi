@@ -37,6 +37,7 @@ class EventWorker:
                     jobs = await self._db_call(
                         self.db.fetch_pending_event_jobs,
                         self.config.batch_size,
+                        "event",
                     )
                     if not jobs:
                         idle_streak = min(idle_streak + 1, 6)

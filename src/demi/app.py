@@ -23,6 +23,7 @@ from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.jobs.pending_worker import PendingWorker, PendingWorkerConfig
 from demi.jobs.outbox_worker import OutboxWorker, OutboxWorkerConfig
 from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
+from demi.jobs.pm_worker import PMWorker, PMWorkerConfig
 from demi.observability import initialize_laminar
 from demi.runtime.docker_agent import DockerAgent, load_env_file_values
 from demi.runtime.docker_pool import DockerPool, DockerPoolConfig
@@ -77,6 +78,7 @@ def create_app() -> FastAPI:
     pending_worker: PendingWorker | None = None
     outbox_worker: OutboxWorker | None = None
     scheduler_worker: SchedulerWorker | None = None
+    pm_worker: PMWorker | None = None
     orchestrator = Orchestrator(
         db=db,
         workspace_manager=workspace_manager,
@@ -128,6 +130,22 @@ def create_app() -> FastAPI:
             config=SchedulerWorkerConfig(
                 poll_interval=settings.scheduler_worker_poll_interval,
                 batch_size=settings.scheduler_worker_batch_size,
+                pm_worker_enabled=settings.pm_worker_enabled,
+            ),
+        )
+    if embedded_workers_enabled and settings.pm_worker_enabled:
+        pm_worker = PMWorker(
+            db=db,
+            orchestrator=orchestrator,
+            workspace_manager=workspace_manager,
+            config=PMWorkerConfig(
+                poll_interval=settings.pm_worker_poll_interval,
+                batch_size=settings.pm_worker_batch_size,
+                cooldown_between_user_messages_seconds=settings.pm_message_cooldown_seconds,
+                idle_threshold_hours=settings.pm_idle_threshold_hours,
+                first_heartbeat_min_messages=settings.pm_first_heartbeat_min_messages,
+                default_trigger_timezone=settings.pm_timezone,
+                outbox_max_attempts=settings.outbox_max_attempts,
             ),
         )
 
@@ -162,6 +180,15 @@ def create_app() -> FastAPI:
                 logger.info("Migrated %s legacy queued messages to run_inputs", migrated)
         except Exception:  # noqa: BLE001
             logger.exception("Legacy queue migration failed")
+
+    @app.on_event("startup")
+    async def _backfill_pm_agents() -> None:
+        try:
+            activated = await asyncio.to_thread(orchestrator.backfill_pm_for_existing_tenants)
+            if activated:
+                logger.info("PM backfill activated for %s tenant(s)", activated)
+        except Exception:  # noqa: BLE001
+            logger.exception("PM backfill failed")
 
     if pool is not None and settings.docker_pool_size > 0:
         async def _warm_pool_background() -> None:
@@ -256,6 +283,23 @@ def create_app() -> FastAPI:
         async def _stop_scheduler_worker() -> None:
             scheduler_worker.stop()
             task = getattr(app.state, "scheduler_worker_task", None)
+            if task is not None:
+                task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await task
+
+    if pm_worker is not None:
+        @app.on_event("startup")
+        async def _start_pm_worker() -> None:
+            app.state.pm_worker_task = asyncio.create_task(
+                pm_worker.run_forever(),
+                name="pm-worker",
+            )
+
+        @app.on_event("shutdown")
+        async def _stop_pm_worker() -> None:
+            pm_worker.stop()
+            task = getattr(app.state, "pm_worker_task", None)
             if task is not None:
                 task.cancel()
                 with suppress(asyncio.CancelledError):

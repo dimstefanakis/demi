@@ -121,7 +121,7 @@ class OutboxWorker:
             if not isinstance(payload, dict):
                 payload = {}
             payload_type = str(payload.get("type") or "user_message").strip().lower()
-            if payload_type != "interaction_update":
+            if payload_type not in {"interaction_update", "pm_suggestion"}:
                 text = str(payload.get("text") or "").strip()
                 tenant_external_id = str(payload.get("tenant_external_id") or "").strip()
                 if not text or not tenant_external_id:
@@ -141,6 +141,18 @@ class OutboxWorker:
                     "tenant_external_id": tenant_external_id,
                 }
                 payload_type = "interaction_update"
+            if payload_type == "pm_suggestion":
+                text = str(payload.get("text") or "").strip()
+                tenant_external_id = str(payload.get("tenant_external_id") or "").strip()
+                if not text or not tenant_external_id:
+                    await self._db_call(
+                        self.db.update_outbox_status,
+                        row_id,
+                        "failed",
+                        "invalid_pm_suggestion_missing_text_or_tenant",
+                        None,
+                    )
+                    continue
             ok, error = await self._handle_interaction_update(row, payload)
             if ok:
                 await self._db_call(self.db.update_outbox_status, row_id, "sent", None, None)
@@ -435,7 +447,22 @@ class OutboxWorker:
             action = str(payload.get("action") or "send_message").strip().lower()
         instruction = ""
         correlation_id = str(payload.get("correlation_id") or "").strip()
-        if action == "send_payment_link":
+        if action == "pm_suggestion":
+            priority = str(payload.get("priority") or "medium").strip().lower()
+            pm_action_type = str(payload.get("pm_action_type") or "").strip() or "suggestion"
+            autonomy_tier = str(payload.get("autonomy_tier") or "suggest").strip().lower()
+            lines = [
+                "Proactive suggestion for the user based on background analysis.",
+                "Rewrite this into a short, natural Telegram message and send only if useful.",
+                "It should be one idea, phrased as a helpful question — not pushy.",
+                f"Category: {pm_action_type}",
+                f"Urgency: {priority}",
+                f"Correlation ID: {correlation_id or 'n/a'} (include as correlation_id if you send)",
+                "",
+                f"SUGGESTION:\n{payload.get('text')}",
+            ]
+            instruction = "\n".join(lines)
+        elif action == "send_payment_link":
             reply_to_message_id = str(payload.get("reply_to_message_id") or "").strip()
             reply_to_text = str(payload.get("reply_to_text") or "").strip()
             lines = [

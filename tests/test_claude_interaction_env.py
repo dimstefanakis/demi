@@ -303,6 +303,95 @@ async def test_route_interaction_retries_until_valid_output(tmp_path, monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_route_interaction_prompt_includes_authoritative_message_snapshot(
+    tmp_path, monkeypatch
+):
+    captured_prompt = {"content": None}
+
+    class FakeSystemMessage:
+        def __init__(self, subtype: str, data: dict | None = None):
+            self.subtype = subtype
+            self.data = data or {}
+
+    class FakeResultMessage:
+        def __init__(self):
+            self.stop_reason = "end_turn"
+            self.subtype = "success"
+            self.result = '{"should_run": false, "billing_check": false, "billing_checked": true}'
+            self.structured_output = {
+                "should_run": False,
+                "billing_check": False,
+                "billing_checked": True,
+            }
+            self.total_cost_usd = 0.01
+            self.usage = {"output_tokens": 1}
+            self.session_id = "interaction-session-snapshot"
+
+    class FakeClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            return None
+
+        async def query(self, prompt_stream, session_id=None):
+            del session_id
+            async for event in prompt_stream:
+                captured_prompt["content"] = event["message"]["content"]
+                break
+            return None
+
+        async def receive_messages(self):
+            yield FakeSystemMessage("init", {"session_id": "interaction-session-snapshot"})
+            yield FakeResultMessage()
+
+        async def receive_response(self):
+            async for msg in self.receive_messages():
+                yield msg
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_module, "SystemMessage", FakeSystemMessage)
+    monkeypatch.setattr(claude_module, "ResultMessage", FakeResultMessage)
+    monkeypatch.setattr(claude_module, "ClaudeSDKClient", FakeClient)
+
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key, project_name="main")
+    message = NormalizedMessage(
+        provider=tenant.provider,
+        provider_message_id="261",
+        tenant_external_id=tenant.external_id,
+        received_at=__import__("datetime").datetime.now(tz=__import__("datetime").timezone.utc),
+        text="Proceed with any pending adjustments",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    agent = ClaudeAgent()
+
+    await agent.route_interaction(
+        workspace=workspace,
+        message=message,
+        messenger=DummyMessenger(),
+        tenant_id=tenant.id,
+        db=db,
+        provider=tenant.provider,
+        tenant_external_id=tenant.external_id,
+        message_id=138,
+        billing_checked=True,
+    )
+
+    prompt_content = str(captured_prompt.get("content") or "")
+    assert "Incoming message for this turn (authoritative)" in prompt_content
+    assert '"message_id": 138' in prompt_content
+    assert '"provider_message_id": "261"' in prompt_content
+    assert "Proceed with any pending adjustments" in prompt_content
+
+
+@pytest.mark.asyncio
 async def test_route_interaction_raises_after_retry_exhaustion(
     tmp_path, monkeypatch
 ):

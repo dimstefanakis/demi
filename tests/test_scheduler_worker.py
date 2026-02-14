@@ -208,3 +208,61 @@ def test_scheduler_worker_applies_time_window_to_run_after():
 
     assert fired == 1
     assert run_after > now
+
+
+def test_scheduler_worker_routes_pm_trigger_to_pm_job_type():
+    db = _FakeDB()
+    now = datetime.now(tz=timezone.utc)
+    db.set_tenant_kv(
+        1,
+        "scheduler",
+        "trigger:pm-a",
+        {
+            "id": "pm-a",
+            "enabled": True,
+            "trigger_type": "cron",
+            "cron": "* * * * *",
+            "output_event_type": "pm_trigger",
+            "state": {"next_run_at": (now - timedelta(minutes=1)).isoformat()},
+            "payload": {"trigger": "daily_heartbeat"},
+        },
+    )
+    worker = SchedulerWorker(db=db, config=SchedulerWorkerConfig(poll_interval=0.01, batch_size=20))
+
+    fired = _run(worker)
+
+    assert fired == 1
+    assert len(db.event_jobs) == 1
+    assert db.event_jobs[0]["job_type"] == "pm_trigger"
+
+
+def test_scheduler_worker_skips_pm_trigger_when_pm_worker_disabled():
+    db = _FakeDB()
+    now = datetime.now(tz=timezone.utc)
+    db.set_tenant_kv(
+        1,
+        "scheduler",
+        "trigger:pm-disabled",
+        {
+            "id": "pm-disabled",
+            "enabled": True,
+            "trigger_type": "cron",
+            "cron": "* * * * *",
+            "output_event_type": "pm_trigger",
+            "state": {"next_run_at": (now - timedelta(minutes=1)).isoformat()},
+            "payload": {"trigger": "daily_heartbeat"},
+        },
+    )
+    worker = SchedulerWorker(
+        db=db,
+        config=SchedulerWorkerConfig(
+            poll_interval=0.01,
+            batch_size=20,
+            pm_worker_enabled=False,
+        ),
+    )
+
+    fired = _run(worker)
+
+    assert fired == 1
+    assert len(db.event_jobs) == 0
