@@ -379,9 +379,8 @@ data/<tenant_key>/
 
 Execution and interaction sessions are tracked separately:
 - Execution session IDs: `tenants.session_id` (used by `prepare_context` runs).
-- Interaction routing session IDs: `tenant_state(namespace='interaction', key='claude_route_session')`.
-- Interaction instruction/update session IDs:
-  `tenant_state(namespace='interaction', key='claude_instruction_session')`.
+- Interaction session IDs (routing and instruction unified):
+  `tenant_state(namespace='interaction', key='claude_session')`.
 - Execution session cache files are written under `<tenant_root>/.execution_home/` by setting
   `HOME` for execution runs. In Docker, this resolves to `/workspace/.execution_home/` and is
   persisted via the tenant workspace bind mount so SDK `resume` works across fresh containers.
@@ -390,10 +389,10 @@ Execution and interaction sessions are tracked separately:
 
 Flow:
 1. The orchestrator passes execution `session_id` into `ClaudeAgent.prepare_context`.
-2. Interaction routing and instruction/update delivery each use their own interaction
-   session ID with SDK `resume`.
+2. Interaction routing and instruction/update delivery share a single unified
+   interaction session ID with SDK `resume`.
 3. Both execution and interaction agents return updated session IDs.
-4. The orchestrator/workers persist each session ID in its own scope.
+4. The orchestrator/workers persist each session ID under its unified key.
 5. If interaction resume fails (stale/missing session), interaction session state is cleared and retried fresh once.
 6. If execution returns result subtype `error_during_execution`, execution is retried once with a fresh
    SDK session before surfacing the failure.

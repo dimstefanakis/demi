@@ -243,7 +243,7 @@ async def test_outbox_worker_uses_and_updates_interaction_session_state(tmp_path
     db.set_tenant_kv(
         tenant.id,
         "interaction",
-        "claude_instruction_session",
+        "claude_session",
         {"session_id": "interaction-session-prev"},
     )
 
@@ -274,7 +274,7 @@ async def test_outbox_worker_uses_and_updates_interaction_session_state(tmp_path
     await worker.process_once()
 
     assert agent.received_session_ids == ["interaction-session-prev"]
-    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_instruction_session") or {}
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
     assert payload.get("session_id") == "interaction-session-next"
 
 

@@ -12,9 +12,7 @@ from demi.config import Settings
 from demi.runtime.docker_pool import DockerPool
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-# Forwarded execution updates are instruction-mode interaction messages, so
-# they should not reuse routing-mode session context.
-INTERACTION_SESSION_KEY = "claude_instruction_session"
+INTERACTION_SESSION_KEY = "claude_session"
 
 
 def load_env_file_values(settings: Settings) -> dict[str, str]:

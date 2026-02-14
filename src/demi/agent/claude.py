@@ -52,8 +52,7 @@ from demi.workspace.core import Workspace
 
 INTERACTION_IMAGE_MAX_BYTES = 5 * 1024 * 1024
 INTERACTION_SESSION_NAMESPACE = "interaction"
-INTERACTION_ROUTE_SESSION_KEY = "claude_route_session"
-INTERACTION_INSTRUCTION_SESSION_KEY = "claude_instruction_session"
+INTERACTION_SESSION_KEY = "claude_session"
 TOOL_SEARCH_ENV_KEY = "ENABLE_TOOL_SEARCH"
 MEMORY_TOOL_ENABLED_ENV_KEY = "CLAUDE_CODE_ENABLE_MEMORY_TOOL"
 MEMORY_TOOL_PATH_ENV_KEY = "CLAUDE_CODE_MEMORY_FILE_PATH"
@@ -520,7 +519,7 @@ class ClaudeAgent:
     ) -> None:
         if db is None or tenant_id is None:
             return
-        for key in (INTERACTION_ROUTE_SESSION_KEY, INTERACTION_INSTRUCTION_SESSION_KEY):
+        for key in (INTERACTION_SESSION_KEY, "claude_route_session", "claude_instruction_session"):
             try:
                 db.set_tenant_kv(
                     int(tenant_id),

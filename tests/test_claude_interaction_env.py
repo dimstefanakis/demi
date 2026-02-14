@@ -771,7 +771,7 @@ async def test_route_interaction_recovers_from_terminated_process_resume(
     db.set_tenant_kv(
         tenant.id,
         "interaction",
-        "claude_route_session",
+        "claude_session",
         {"session_id": "stale-interaction-session"},
     )
     message = NormalizedMessage(
@@ -801,4 +801,4 @@ async def test_route_interaction_recovers_from_terminated_process_resume(
     assert result.decision["should_run"] is False
     assert captured_resumes[0] == "stale-interaction-session"
     assert captured_resumes[-1] is None
-    assert db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") is None
+    assert db.get_tenant_kv(tenant.id, "interaction", "claude_session") is None

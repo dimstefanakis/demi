@@ -11,9 +11,7 @@ import logging
 from demi.db.core import Database
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-# Outbox updates are instruction-mode interaction messages; keep them isolated
-# from routing-mode interaction session continuity.
-INTERACTION_SESSION_KEY = "claude_instruction_session"
+INTERACTION_SESSION_KEY = "claude_session"
 logger = logging.getLogger(__name__)
 
 

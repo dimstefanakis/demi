@@ -460,7 +460,7 @@ async def test_interaction_routing_uses_interaction_session_state(tmp_path):
     db.set_tenant_kv(
         tenant.id,
         "interaction",
-        "claude_route_session",
+        "claude_session",
         {"session_id": "interaction-session-1"},
     )
 
@@ -517,12 +517,12 @@ async def test_interaction_routing_persists_returned_session_id(tmp_path):
     assert result.status == "accepted"
     tenant = db.get_tenant_by_external("telegram", tenant_external_id)
     assert tenant is not None
-    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") or {}
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
     assert payload.get("session_id") == "interaction-session-2"
 
 
 @pytest.mark.asyncio
-async def test_instruction_session_state_isolated_from_route_state(tmp_path):
+async def test_instruction_and_route_share_unified_session(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
     decision = {
@@ -547,14 +547,8 @@ async def test_instruction_session_state_isolated_from_route_state(tmp_path):
     db.set_tenant_kv(
         tenant.id,
         "interaction",
-        "claude_route_session",
-        {"session_id": "interaction-session-route-prev"},
-    )
-    db.set_tenant_kv(
-        tenant.id,
-        "interaction",
-        "claude_instruction_session",
-        {"session_id": "interaction-session-instruction-prev"},
+        "claude_session",
+        {"session_id": "interaction-session-prev"},
     )
 
     msg = NormalizedMessage(
@@ -578,13 +572,11 @@ async def test_instruction_session_state_isolated_from_route_state(tmp_path):
     )
 
     assert sent is True
-    assert agent.instruction_calls == ["interaction-session-instruction-prev"]
-    route_payload = db.get_tenant_kv(tenant.id, "interaction", "claude_route_session") or {}
-    assert route_payload.get("session_id") == "interaction-session-route-prev"
-    instruction_payload = (
-        db.get_tenant_kv(tenant.id, "interaction", "claude_instruction_session") or {}
-    )
-    assert instruction_payload.get("session_id") == "interaction-session-instruction-next"
+    # Instruction call receives the same unified session used by routing
+    assert agent.instruction_calls == ["interaction-session-prev"]
+    # Updated session is stored under the unified key, available for next route call
+    payload = db.get_tenant_kv(tenant.id, "interaction", "claude_session") or {}
+    assert payload.get("session_id") == "interaction-session-instruction-next"
 
 
 @pytest.mark.asyncio

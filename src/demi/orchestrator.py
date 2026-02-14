@@ -30,10 +30,8 @@ from demi.pm.constants import (
 )
 
 INTERACTION_SESSION_NAMESPACE = "interaction"
-# Keep routing and instruction sessions separate so prior instruction-mode
-# messages cannot leak into routing decisions for new user input.
-INTERACTION_ROUTE_SESSION_KEY = "claude_route_session"
-INTERACTION_INSTRUCTION_SESSION_KEY = "claude_instruction_session"
+# Single unified session for all interaction-mode turns (routing + instruction).
+INTERACTION_SESSION_KEY = "claude_session"
 
 EXECUTION_SESSION_NAMESPACE = "execution"
 # New tenant-scoped session key. Legacy per-project keys used
@@ -109,40 +107,45 @@ class Orchestrator:
             self.interaction_route_sessions = {}
         self.interaction_route_sessions[session.tenant_id] = session
 
-    @staticmethod
-    def _interaction_session_key(mode: str) -> str:
-        if mode == "instruction":
-            return INTERACTION_INSTRUCTION_SESSION_KEY
-        return INTERACTION_ROUTE_SESSION_KEY
-
-    def _get_interaction_session_id(self, tenant_id: int, *, mode: str = "route") -> str | None:
+    def _get_interaction_session_id(self, tenant_id: int) -> str | None:
         try:
             payload = self.db.get_tenant_kv(
                 int(tenant_id),
                 INTERACTION_SESSION_NAMESPACE,
-                self._interaction_session_key(mode),
+                INTERACTION_SESSION_KEY,
             ) or {}
         except Exception:
-            return None
+            payload = {}
         value = str(payload.get("session_id") or "").strip()
-        return value or None
+        if value:
+            return value
+        # Migration fallback: check legacy keys for existing tenants.
+        for legacy_key in ("claude_route_session", "claude_instruction_session"):
+            try:
+                legacy = self.db.get_tenant_kv(
+                    int(tenant_id),
+                    INTERACTION_SESSION_NAMESPACE,
+                    legacy_key,
+                ) or {}
+            except Exception:
+                continue
+            legacy_value = str(legacy.get("session_id") or "").strip()
+            if legacy_value:
+                return legacy_value
+        return None
 
     def _set_interaction_session_id(
         self,
         tenant_id: int,
         session_id: str | None,
-        *,
-        mode: str = "route",
     ) -> None:
-        # Interaction and execution sessions must be tracked independently so a stale
-        # execution resume token cannot contaminate user-facing interaction routing.
         cleaned = str(session_id or "").strip()
         payload = {"session_id": cleaned} if cleaned else None
         try:
             self.db.set_tenant_kv(
                 int(tenant_id),
                 INTERACTION_SESSION_NAMESPACE,
-                self._interaction_session_key(mode),
+                INTERACTION_SESSION_KEY,
                 payload,
             )
         except Exception:
@@ -2132,7 +2135,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id), mode="route"),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=msg.provider,
                 tenant_external_id=msg.tenant_external_id,
                 message_id=message_id,
@@ -2155,7 +2158,6 @@ class Orchestrator:
                 self._set_interaction_session_id(
                     int(tenant.id),
                     session_from_result,
-                    mode="route",
                 )
             return result
         except Exception as exc:  # noqa: BLE001
@@ -2581,7 +2583,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id), mode="instruction"),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -2596,7 +2598,6 @@ class Orchestrator:
                 self._set_interaction_session_id(
                     int(tenant.id),
                     session_from_result,
-                    mode="instruction",
                 )
             return True
         except Exception as exc:  # noqa: BLE001
@@ -2631,7 +2632,7 @@ class Orchestrator:
                 tenant_id=tenant.id,
                 db=self.db,
                 payments=self.payments,
-                session_id=self._get_interaction_session_id(int(tenant.id), mode="instruction"),
+                session_id=self._get_interaction_session_id(int(tenant.id)),
                 provider=getattr(msg, "provider", None) or getattr(tenant, "provider", None),
                 tenant_external_id=getattr(msg, "tenant_external_id", None)
                 or getattr(tenant, "external_id", None),
@@ -2646,7 +2647,6 @@ class Orchestrator:
                 self._set_interaction_session_id(
                     int(tenant.id),
                     session_from_result,
-                    mode="instruction",
                 )
         except Exception as exc:  # noqa: BLE001
             try:
