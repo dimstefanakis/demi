@@ -431,10 +431,12 @@ def _load_runtime_env_from_process() -> dict[str, str] | None:
     return runtime_env or None
 
 
-def _write_run_result_error(tasks_dir: Path, exc: Exception) -> None:
+def _write_run_result_error(tasks_dir: Path, run_id: int | None, exc: Exception) -> None:
     try:
         error_path = tasks_dir / "run_result.json"
         error_payload = {"error": str(exc)}
+        if run_id is not None:
+            error_payload["run_id"] = int(run_id)
         error_path.write_text(json.dumps(error_payload, indent=2))
     except OSError:
         return
@@ -586,6 +588,7 @@ async def _run(run_id: int) -> int:
 
             result_path = workspace.tasks_dir / "run_result.json"
             result_payload = asdict(result)
+            result_payload["run_id"] = int(run_id)
             result_path.write_text(json.dumps(result_payload, indent=2))
             return 0
         finally:
@@ -599,7 +602,7 @@ async def _run(run_id: int) -> int:
                 await inflight_task
     except Exception as exc:  # noqa: BLE001
         if tasks_dir is not None:
-            _write_run_result_error(tasks_dir, exc)
+            _write_run_result_error(tasks_dir, run_id, exc)
         raise
 
 

@@ -219,6 +219,8 @@ Rules:
 
 - Read `tasks/chat_summary.md` first when present, then read the most recent relevant window
   from `tasks/chat_history.md`.
+- Prefer targeted file reads. Avoid repeatedly scanning long unchanged docs/artifacts when
+  the needed fact is already in summary/memory/context files.
 - Assume context can be compacted at any time. Keep continuity artifacts current in the workspace:
   `tasks/chat_summary.md`, `tasks/result_summary.md`, and `memory.md`.
 - When writing summaries, preserve:

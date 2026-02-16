@@ -224,6 +224,13 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   for SDK `resume` continuity (default `data/interaction_sessions`)
 - `CLAUDE_ENABLE_TOOL_SEARCH=true` enables MCP tool search inside Claude Code sessions
 - `CLAUDE_ENABLE_MEMORY_TOOL=true` enables Claude Code memory tool (persisted to project `memory.md`)
+- Context compaction controls:
+  - `CHAT_HISTORY_MAX_ENTRY_CHARS` (default `1200`) caps per-entry payload length in
+    `tasks/chat_history.md` while keeping full raw events in `tasks/chat_log.jsonl`
+  - `INTERACTION_CONTEXT_RECENT_RUNS_LIMIT` (default `5`)
+  - `INTERACTION_CONTEXT_RESULT_SUMMARY_MAX_CHARS` (default `500`)
+  - `INTERACTION_CONTEXT_ERROR_MAX_CHARS` (default `300`)
+  - `INTERACTION_CONTEXT_TOOL_SUMMARY_MAX_TOOLS` (default `12`)
 - Tenant tooling bootstrap controls:
   - `TENANT_TOOLING_ENABLED`
   - `TENANT_TOOLING_PACKAGES`
@@ -361,10 +368,13 @@ data/<tenant_key>/
 - `CONTEXT.md` (project root, optional) stores the current working brief for the project.
 - `memory.md` stores durable business facts and decisions.
 - `chat_log.jsonl` captures conversation events.
-- `chat_history.md` keeps a short recent transcript.
+- `chat_history.md` keeps a short recent transcript with per-entry truncation to keep
+  interaction turns bounded while preserving full text in `chat_log.jsonl`.
 - `chat_summary.md` is a rolling compact summary that execution updates directly when needed.
 - Compaction is handled by Claude session compaction + workspace continuity files; the orchestrator
   no longer generates `summary_prompt.md` / `memory_prompt.md`.
+- `interaction_context.json` is compact by design: run snapshots include routing-critical fields
+  (status, ids, context, timestamps, compact summaries) and omit heavy payload columns.
 - `tenant.sqlite` is an execution-agent scratchpad database. It is not used for orchestration or queues.
 - Execution runs bootstrap tenant CLI tooling from `tooling.lock` into `tooling/` and prepend
   `tooling/node_modules/.bin` to PATH. This keeps tenant CLI dependencies deterministic across runs.
@@ -502,7 +512,7 @@ Run selection when streaming to execution:
    status no longer creates assistant orders by default; the agent explicitly requests payment links.
    If tenant testing mode is enabled, this status is treated as authorized and payment prompts are bypassed.
 7. The orchestrator merges any attachments for the current interaction turn, saves them under `assets/`, writes
-   `tasks/interaction_context.json`, and calls the interaction agent in routing mode with an explicit,
+   a compact `tasks/interaction_context.json` snapshot, and calls the interaction agent in routing mode with an explicit,
    authoritative incoming-message snapshot (message id, provider message id, timestamp, text, image count).
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
    - Interaction routing avoids implicit project switching; execution flow performs project-fit checks

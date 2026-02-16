@@ -121,26 +121,26 @@ Rules:
 
 ## Required Context Reads
 
-Before responding, read:
+Always read first:
 
-- `tasks/chat_history.md`
-- `tasks/chat_summary.md` (if present)
-- `tasks/interaction_context.json` (if present)
-- `tasks/billing_status.json` (if present, for payment/pricing/hire topics)
-- `memory.md` (durable user/project facts — use to identify what projects exist and what the user calls them)
-- `DESCRIPTION.md` (project description — use to understand what the user is building)
-- `docs/interaction/capabilities.md`
-- `docs/interaction/billing.md`
-- `docs/interaction/constraints.md`
-- `docs/BILLING.md` for payment policy/pricing rules
+- `tasks/interaction_context.json` (if present) — source of truth for latest user message + reply context
+- `tasks/chat_summary.md` (if present) — compact continuity
+- `tasks/billing_status.json` (if present) — only for payment/pricing/hire decisions
 
-For project disambiguation in ROUTING MODE, also scan:
+Read conditionally (not every turn):
 
-- `projects/*/DESCRIPTION.md` — each subfolder is a project; read descriptions to match user intent
-- `projects/*/CONTEXT.md` — working brief for each project (if present)
-- `projects/*/memory.md` — project-specific stored facts
+- `tasks/chat_history.md` — start with recent lines only; expand only when summary/context is insufficient
+- `memory.md` and `DESCRIPTION.md` — when project mapping is unclear, user intent changed, or context may be stale
+- `docs/interaction/capabilities.md`, `docs/interaction/billing.md`, `docs/interaction/constraints.md`, and `docs/BILLING.md`
+  only when the decision touches policy/billing/constraints or you're unsure
 
-Use `tasks/interaction_context.json` as source of truth for latest user message and reply context.
+For project disambiguation in ROUTING MODE, scan project folders only when needed:
+
+- `projects/*/DESCRIPTION.md` — map user wording to a project
+- `projects/*/CONTEXT.md` — current project status
+- `projects/*/memory.md` — project-specific durable facts
+
+Do not rescan every project on every small follow-up when the target project is already clear.
 
 After these reads, check: are `memory.md` or `DESCRIPTION.md` empty/placeholder while you
 already know real facts about this user's projects? If so, write those facts now (see
@@ -163,6 +163,8 @@ Context File Maintenance below) before continuing with your routing decision.
   2. `tasks/billing_status.json`,
   3. `tasks/chat_summary.md` (if present),
   4. recent relevant turns in `tasks/chat_history.md`.
+- Prefer targeted reads over full rescans. Expand scope only when ambiguity remains.
+- If a file is very long, read the most recent/relevant section first instead of the whole file.
 - Do not rely on distant, implicit context if it is not present in summary/history files.
 - If old context conflicts with latest explicit user instruction, follow the latest instruction.
 - If context is ambiguous after compaction, ask one short clarifying question instead of guessing.

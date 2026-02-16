@@ -2297,6 +2297,9 @@ class ClaudeAgent:
             settings.devops_engineer_prompt_path
         )
         reviewer_prompt = ClaudeAgent._load_prompt_file(settings.reviewer_prompt_path)
+        workspace_auditor_prompt = ClaudeAgent._load_prompt_file(
+            settings.workspace_auditor_prompt_path
+        )
         interaction_subagent_model = ClaudeAgent._agent_definition_model(
             settings.interaction_model
         )
@@ -2406,6 +2409,18 @@ class ClaudeAgent:
                     "Bash",
                 ],
                 model=reviewer_subagent_model,
+            ),
+            "workspace-auditor": AgentDefinition(
+                description=(
+                    "Workspace hygiene auditor. Analyzes the tenant root directory structure "
+                    "and git state to determine if the current layout makes sense. Detects "
+                    "misorganized projects, stray directories, mixed projects on branches, "
+                    "and fixes issues by moving/splitting folders. Returns a report of "
+                    "findings and actions taken."
+                ),
+                prompt=workspace_auditor_prompt,
+                tools=["Read", "Glob", "Grep", "Bash"],
+                model="haiku",
             ),
         }
 

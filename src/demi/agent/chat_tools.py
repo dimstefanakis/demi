@@ -86,6 +86,44 @@ def _db_ensure_execution_agent_with_role(
         )
 
 
+def _truncate_chat_tool_text(value: Any, *, max_chars: int) -> str | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars].rstrip()
+    omitted = max(0, len(text) - len(truncated))
+    return f"{truncated} ...[truncated {omitted} chars]"
+
+
+def _compact_run_snapshot(run: Any) -> dict[str, Any] | None:
+    if not isinstance(run, dict):
+        return None
+    payload: dict[str, Any] = {}
+    for key in (
+        "id",
+        "message_id",
+        "status",
+        "run_role",
+        "execution_context",
+        "execution_agent_id",
+        "project_name",
+        "started_at",
+        "finished_at",
+        "last_activity_at",
+        "last_heartbeat_at",
+        "lease_expires_at",
+    ):
+        value = run.get(key)
+        if value is not None:
+            payload[key] = value
+    error = _truncate_chat_tool_text(run.get("error"), max_chars=280)
+    if error:
+        payload["error"] = error
+    return payload or None
+
+
 @dataclass(frozen=True)
 class ChatToolContext:
     messenger: Any
@@ -108,10 +146,11 @@ class ChatToolContext:
 def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
     import time
 
+    settings = Settings()
+
     def _resolve_payments() -> StripeClient | None:
         if context.payments is not None:
             return context.payments
-        settings = Settings()
         config = build_stripe_config(settings)
         if config is None:
             return None
@@ -486,7 +525,9 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         queued = context.db.count_run_inputs(context.tenant_id, status="queued")
         payload = {
             "ok": True,
-            "inflight_run": dict(run) if run else None,
+            "inflight_run": _compact_run_snapshot(dict(run))
+            if isinstance(run, dict)
+            else None,
             "queued_inputs": queued,
         }
         _log("check_for_status", args, result=payload, start=start)
@@ -1335,7 +1376,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
 
         append_log(context.tasks_dir, "assistant_message", text)
-        write_chat_history(context.tasks_dir)
+        write_chat_history(
+            context.tasks_dir,
+            max_entry_chars=max(200, int(settings.chat_history_max_entry_chars)),
+        )
         if final and run_id:
             _set_final_sent(context, run_id)
         if str(context.role or "primary") == "interaction" and context.on_interaction_message_sent:
@@ -1587,7 +1631,10 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
 
         append_log(context.tasks_dir, "assistant_message", message)
-        write_chat_history(context.tasks_dir)
+        write_chat_history(
+            context.tasks_dir,
+            max_entry_chars=max(200, int(settings.chat_history_max_entry_chars)),
+        )
         run_id = _current_run_id(context)
         if final and run_id:
             _set_final_sent(context, run_id)

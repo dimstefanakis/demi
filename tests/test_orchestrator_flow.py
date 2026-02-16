@@ -849,6 +849,7 @@ async def test_orchestrator_reconciles_run_result(tmp_path):
     )
 
     result_payload = {
+        "run_id": run_id,
         "session_id": "session-1",
         "summary": "ok",
         "total_cost_usd": 1.23,
@@ -907,6 +908,7 @@ async def test_orchestrator_reconciles_run_result_before_expiring_stale_run(tmp_
     )
 
     result_payload = {
+        "run_id": run_id,
         "session_id": "session-stale-reconcile",
         "summary": "ok",
         "total_cost_usd": 0.42,
@@ -962,6 +964,7 @@ async def test_orchestrator_reconciles_run_result_stop_sequence_completed(tmp_pa
     )
 
     result_payload = {
+        "run_id": run_id,
         "session_id": "session-stop-seq",
         "summary": "ok",
         "total_cost_usd": 1.23,
@@ -1018,6 +1021,7 @@ async def test_orchestrator_reconciles_run_result_error_subtype_fails(tmp_path):
     )
 
     result_payload = {
+        "run_id": run_id,
         "session_id": "session-stop-err",
         "summary": "ok",
         "total_cost_usd": 1.23,
@@ -1294,6 +1298,7 @@ async def test_orchestrator_reconcile_does_not_double_count_usage(tmp_path):
     )
 
     result_payload = {
+        "run_id": run_id,
         "session_id": "session-1",
         "summary": "ok",
         "total_cost_usd": 1.23,
@@ -1317,6 +1322,76 @@ async def test_orchestrator_reconcile_does_not_double_count_usage(tmp_path):
     assert float(run_row["total_cost_usd"]) == 1.23
     usage = run_row["usage_json"]
     assert len(usage.get("primary", [])) == 1
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_reconcile_ignores_mismatched_run_result_payload(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    stale_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="mismatch-old",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="old run",
+        images=[],
+        raw={},
+    )
+    stale_message_id, _ = db.record_message(tenant.id, stale_msg)
+    db.update_message_status(stale_message_id, "processing")
+    stale_run_id = db.create_run(
+        tenant.id,
+        message_id=stale_message_id,
+        project_name=workspace.project_name,
+    )
+    db.finish_run(stale_run_id, status="completed")
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="mismatch-active",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="active run",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id,
+        message_id=message_id,
+        project_name=workspace.project_name,
+    )
+
+    payload = {
+        "run_id": stale_run_id,
+        "session_id": "stale-session",
+        "summary": "wrong payload",
+        "total_cost_usd": 3.14,
+        "usage": {"input_tokens": 99},
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(payload))
+    run_row = db.get_run(run_id)
+    assert run_row is not None
+    reconciled = orchestrator._reconcile_inflight_run(tenant, run_row, workspace)
+    assert reconciled is False
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "running"
+    assert run_row["error"] is None
+    usage = run_row["usage_json"] or {}
+    primary = usage.get("primary") or []
+    assert not any(isinstance(item, dict) and item.get("input_tokens") == 99 for item in primary)
 
 
 @pytest.mark.asyncio

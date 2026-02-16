@@ -109,6 +109,13 @@ class DockerAgent:
         result = self._read_result(result_path)
         if not result:
             raise RuntimeError("agent_result_missing")
+        result_run_id = result.get("run_id")
+        if result_run_id is not None:
+            try:
+                if int(result_run_id) != int(run_id):
+                    raise RuntimeError("agent_result_stale_run_result")
+            except (TypeError, ValueError):
+                raise RuntimeError("agent_result_invalid_run_result")
         if result.get("error"):
             raise RuntimeError(str(result.get("error")))
         self._maybe_update_deploy(db, tenant_id, workspace.tasks_dir)
@@ -488,9 +495,12 @@ class DockerAgent:
         if not path.exists():
             return {}
         try:
-            return json.loads(path.read_text())
+            payload = json.loads(path.read_text())
         except json.JSONDecodeError:
             return {}
+        if not isinstance(payload, dict):
+            return {}
+        return payload
 
     @staticmethod
     def _maybe_update_deploy(db: Any | None, tenant_id: int | None, tasks_dir: Path) -> None:

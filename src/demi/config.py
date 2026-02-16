@@ -26,6 +26,7 @@ class Settings(BaseSettings):
     software_engineer_prompt_path: Path = Path("prompts/software_engineer_agent.md")
     devops_engineer_prompt_path: Path = Path("prompts/devops_engineer_agent.md")
     reviewer_prompt_path: Path = Path("prompts/reviewer_agent.md")
+    workspace_auditor_prompt_path: Path = Path("prompts/workspace_auditor_agent.md")
     interaction_agent_routing_prompt_path: Path | None = None
     # Legacy alias kept for backward compatibility.
     interaction_router_prompt_path: Path | None = None
@@ -47,6 +48,11 @@ class Settings(BaseSettings):
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
     claude_enable_tool_search: bool = True
     claude_enable_memory_tool: bool = True
+    chat_history_max_entry_chars: int = 1200
+    interaction_context_recent_runs_limit: int = 5
+    interaction_context_result_summary_max_chars: int = 500
+    interaction_context_error_max_chars: int = 300
+    interaction_context_tool_summary_max_tools: int = 12
     agent_email: str | None = None
 
     chrome_devtools_mcp_enabled: bool = False

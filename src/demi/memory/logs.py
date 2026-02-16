@@ -62,7 +62,7 @@ def rewrite_logs(tasks_dir: Path, entries: Iterable[LogEntry]) -> None:
         for entry in entries:
             handle.write(json.dumps(entry.__dict__) + "\n")
 
-def write_chat_history(tasks_dir: Path, last_n: int = 12) -> None:
+def write_chat_history(tasks_dir: Path, last_n: int = 12, max_entry_chars: int = 1200) -> None:
     entries = read_logs(tasks_dir)
     history_path = tasks_dir / "chat_history.md"
     if not entries:
@@ -71,7 +71,10 @@ def write_chat_history(tasks_dir: Path, last_n: int = 12) -> None:
     recent = entries[-last_n:]
     lines = ["# Recent Messages", ""]
     for entry in recent:
-        lines.append(f"[{entry.timestamp}] {entry.tag}: {entry.payload}")
+        lines.append(
+            f"[{entry.timestamp}] {entry.tag}: "
+            f"{_truncate_history_payload(entry.payload, max_chars=max_entry_chars)}"
+        )
     history_path.write_text("\n".join(lines) + "\n")
 
 
@@ -79,3 +82,12 @@ def _count_lines(path: Path) -> int:
     if not path.exists():
         return 0
     return len(path.read_text(encoding="utf-8").splitlines())
+
+
+def _truncate_history_payload(payload: str, *, max_chars: int) -> str:
+    text = str(payload or "").strip()
+    if max_chars <= 0 or len(text) <= max_chars:
+        return text
+    truncated = text[:max_chars].rstrip()
+    omitted = max(0, len(text) - len(truncated))
+    return f"{truncated} ...[truncated {omitted} chars]"

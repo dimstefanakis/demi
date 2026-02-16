@@ -984,7 +984,10 @@ class Orchestrator:
             if any(self._is_reset_command((m.text or "").strip()) for _mid, m in batched_messages):
                 for payload, received_at in user_payloads:
                     self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
-                write_chat_history(workspace.tasks_dir)
+                write_chat_history(
+                    workspace.tasks_dir,
+                    max_entry_chars=max(200, int(settings.chat_history_max_entry_chars)),
+                )
                 self._reset_state(workspace, tenant)
                 self.db.update_message_statuses(message_ids, "processed")
                 await self._send_interaction_instruction(
@@ -1041,7 +1044,10 @@ class Orchestrator:
             ):
                 for payload, received_at in user_payloads:
                     self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
-                write_chat_history(workspace.tasks_dir)
+                write_chat_history(
+                    workspace.tasks_dir,
+                    max_entry_chars=max(200, int(settings.chat_history_max_entry_chars)),
+                )
                 self.db.update_message_statuses(message_ids, "processed")
                 return OrchestratorResult(status="blocked", detail="system_blocked")
 
@@ -1198,7 +1204,10 @@ class Orchestrator:
 
                 for payload, received_at in user_payloads:
                     self._append_chat_log(workspace.tasks_dir, "user", payload, received_at)
-                write_chat_history(workspace.tasks_dir)
+                write_chat_history(
+                    workspace.tasks_dir,
+                    max_entry_chars=max(200, int(settings.chat_history_max_entry_chars)),
+                )
 
                 if decision.get("repo_name") and decision.get("should_run"):
                     self._write_repo_name(workspace.tasks_dir, str(decision.get("repo_name")))
@@ -2597,6 +2606,113 @@ class Orchestrator:
             return False
         return isinstance(payload.get("should_run"), bool)
 
+    @staticmethod
+    def _truncate_interaction_context_text(value: Any, *, max_chars: int) -> str | None:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        if max_chars <= 0 or len(text) <= max_chars:
+            return text
+        truncated = text[:max_chars].rstrip()
+        omitted = max(0, len(text) - len(truncated))
+        return f"{truncated} ...[truncated {omitted} chars]"
+
+    @classmethod
+    def _compact_tool_summary_for_interaction_context(
+        cls,
+        value: Any,
+        *,
+        max_tools: int,
+    ) -> dict[str, Any] | None:
+        payload = value
+        if isinstance(value, str):
+            stripped = value.strip()
+            if not stripped:
+                return None
+            try:
+                payload = json.loads(stripped)
+            except json.JSONDecodeError:
+                return {
+                    "raw": cls._truncate_interaction_context_text(
+                        stripped,
+                        max_chars=400,
+                    )
+                }
+        if not isinstance(payload, dict):
+            return None
+        compact: dict[str, Any] = {}
+        count = payload.get("count")
+        if count is not None:
+            compact["count"] = count
+        tools = payload.get("tools")
+        if isinstance(tools, dict) and max_tools != 0:
+            compact_tools: dict[str, Any] = {}
+            limit = max_tools if max_tools > 0 else len(tools)
+            for idx, (tool_name, tool_payload) in enumerate(tools.items()):
+                if idx >= limit:
+                    break
+                if isinstance(tool_payload, dict):
+                    compact_tools[str(tool_name)] = {
+                        "count": tool_payload.get("count"),
+                        "error_count": tool_payload.get("error_count"),
+                    }
+                else:
+                    compact_tools[str(tool_name)] = tool_payload
+            compact["tools"] = compact_tools
+            if len(tools) > limit:
+                compact["tools_truncated"] = len(tools) - limit
+        return compact or None
+
+    @classmethod
+    def _compact_run_for_interaction_context(
+        cls,
+        run: Any,
+        *,
+        max_result_summary_chars: int,
+        max_error_chars: int,
+        max_tool_summary_tools: int,
+    ) -> dict[str, Any] | None:
+        if not isinstance(run, dict):
+            return None
+        payload: dict[str, Any] = {}
+        for key in (
+            "id",
+            "message_id",
+            "status",
+            "run_role",
+            "execution_context",
+            "execution_agent_id",
+            "project_name",
+            "started_at",
+            "finished_at",
+            "last_activity_at",
+            "last_heartbeat_at",
+            "lease_expires_at",
+            "total_cost_usd",
+        ):
+            value = run.get(key)
+            if value is not None:
+                payload[key] = value
+        error_text = cls._truncate_interaction_context_text(
+            run.get("error"),
+            max_chars=max_error_chars,
+        )
+        if error_text:
+            payload["error"] = error_text
+        result_summary = cls._truncate_interaction_context_text(
+            run.get("result_summary"),
+            max_chars=max_result_summary_chars,
+        )
+        if result_summary:
+            payload["result_summary"] = result_summary
+        tool_summary = cls._compact_tool_summary_for_interaction_context(
+            run.get("tool_summary_json"),
+            max_tools=max_tool_summary_tools,
+        )
+        if tool_summary is not None:
+            payload["tool_summary"] = tool_summary
+        return payload or None
+
     def _write_interaction_context(
         self,
         *,
@@ -2610,6 +2726,26 @@ class Orchestrator:
         billing_checked_at: str | None,
         asset_paths: list[str] | None = None,
     ) -> None:
+        settings = Settings()
+        try:
+            recent_runs_limit = max(1, int(settings.interaction_context_recent_runs_limit))
+        except (TypeError, ValueError):
+            recent_runs_limit = 5
+        try:
+            max_result_summary_chars = max(
+                120,
+                int(settings.interaction_context_result_summary_max_chars),
+            )
+        except (TypeError, ValueError):
+            max_result_summary_chars = 500
+        try:
+            max_error_chars = max(80, int(settings.interaction_context_error_max_chars))
+        except (TypeError, ValueError):
+            max_error_chars = 300
+        try:
+            max_tool_summary_tools = int(settings.interaction_context_tool_summary_max_tools)
+        except (TypeError, ValueError):
+            max_tool_summary_tools = 12
         try:
             queued = self.db.count_run_inputs(tenant.id, status="queued")
         except Exception:
@@ -2617,9 +2753,18 @@ class Orchestrator:
         try:
             rows = self.db.list_recent_runs(
                 tenant.id,
-                limit=5,
+                limit=recent_runs_limit,
             )
-            recent_runs = [dict(row) for row in rows or []]
+            recent_runs: list[dict[str, Any]] = []
+            for row in rows or []:
+                compacted = self._compact_run_for_interaction_context(
+                    dict(row),
+                    max_result_summary_chars=max_result_summary_chars,
+                    max_error_chars=max_error_chars,
+                    max_tool_summary_tools=max_tool_summary_tools,
+                )
+                if compacted is not None:
+                    recent_runs.append(compacted)
         except Exception:
             recent_runs = []
         try:
@@ -2659,8 +2804,22 @@ class Orchestrator:
                 ],
                 "assets": asset_paths or [],
             },
-            "active_run": dict(active_run) if active_run else None,
-            "inflight_run": dict(inflight_run) if inflight_run else None,
+            "active_run": self._compact_run_for_interaction_context(
+                dict(active_run),
+                max_result_summary_chars=max_result_summary_chars,
+                max_error_chars=max_error_chars,
+                max_tool_summary_tools=max_tool_summary_tools,
+            )
+            if isinstance(active_run, dict)
+            else None,
+            "inflight_run": self._compact_run_for_interaction_context(
+                dict(inflight_run),
+                max_result_summary_chars=max_result_summary_chars,
+                max_error_chars=max_error_chars,
+                max_tool_summary_tools=max_tool_summary_tools,
+            )
+            if isinstance(inflight_run, dict)
+            else None,
             "queued_inputs": queued,
             "recent_runs": recent_runs,
             "billing_status": billing_status,
@@ -3605,6 +3764,11 @@ class Orchestrator:
         result_path = workspace.tasks_dir / "run_result.json"
         if not result_path.exists():
             return False
+        run_id = run["id"] if hasattr(run, "keys") else run.get("id")
+        try:
+            expected_run_id = int(run_id) if run_id is not None else None
+        except (TypeError, ValueError):
+            expected_run_id = None
         try:
             started_raw = run["started_at"]
         except (KeyError, TypeError):
@@ -3625,6 +3789,13 @@ class Orchestrator:
             payload = json.loads(result_path.read_text())
         except (OSError, json.JSONDecodeError):
             return False
+        payload_run_id = payload.get("run_id")
+        if payload_run_id is not None and expected_run_id is not None:
+            try:
+                if int(payload_run_id) != int(expected_run_id):
+                    return False
+            except (TypeError, ValueError):
+                return False
         error = payload.get("error")
         stop_reason = str(payload.get("stop_reason") or "").strip() or None
         result_subtype = str(payload.get("result_subtype") or "").strip() or None
@@ -3646,7 +3817,6 @@ class Orchestrator:
         if not error and stop_reason and stop_reason not in {"end_turn", "stop_sequence"}:
             error = f"agent_stop_reason:{stop_reason}"
         status = "failed" if error else "completed"
-        run_id = run["id"] if hasattr(run, "keys") else run.get("id")
         total_cost = payload.get("total_cost_usd")
         usage = payload.get("usage")
         summary = payload.get("summary")
@@ -4148,6 +4318,7 @@ class Orchestrator:
             "user_reply.txt",
             "result_summary.md",
             "tool_runs.jsonl",
+            "run_result.json",
         ):
             if name in preserved:
                 continue
