@@ -141,10 +141,6 @@ def create_app() -> FastAPI:
             config=PMWorkerConfig(
                 poll_interval=settings.pm_worker_poll_interval,
                 batch_size=settings.pm_worker_batch_size,
-                cooldown_between_user_messages_seconds=settings.pm_message_cooldown_seconds,
-                idle_threshold_hours=settings.pm_idle_threshold_hours,
-                first_heartbeat_min_messages=settings.pm_first_heartbeat_min_messages,
-                default_trigger_timezone=settings.pm_timezone,
                 outbox_max_attempts=settings.outbox_max_attempts,
             ),
         )

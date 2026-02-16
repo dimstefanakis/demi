@@ -19,6 +19,8 @@ class Settings(BaseSettings):
     design_prompt_path: Path = Path("docs/DESIGN.md")
     claude_prompt_path: Path = Path("prompts/claude_agent.md")
     interaction_prompt_path: Path = Path("prompts/interaction_agent.md")
+    project_manager_prompt_path: Path = Path("prompts/project_manager_agent.md")
+    lead_project_manager_prompt_path: Path = Path("prompts/lead_project_manager_agent.md")
     planner_prompt_path: Path = Path("prompts/planner_agent.md")
     product_designer_prompt_path: Path = Path("prompts/product_designer_agent.md")
     software_engineer_prompt_path: Path = Path("prompts/software_engineer_agent.md")
@@ -30,6 +32,10 @@ class Settings(BaseSettings):
     interaction_helper_prompt_path: Path = Path("prompts/interaction_helper.md")
     execution_model: str = "claude-sonnet-4-5-20250929"
     execution_max_thinking_tokens: int | None = 2048
+    project_manager_model: str = "claude-sonnet-4-5-20250929"
+    project_manager_max_thinking_tokens: int | None = 10000
+    lead_project_manager_model: str = "claude-opus-4-6"
+    lead_project_manager_max_thinking_tokens: int | None = 10000
     interaction_model: str = "claude-opus-4-6"
     interaction_max_thinking_tokens: int | None = 4096
     interaction_agent_routing_max_retries: int | None = None
@@ -140,9 +146,6 @@ class Settings(BaseSettings):
     pm_health_check_cron: str = "30 * * * *"
     pm_first_heartbeat_cron: str = "0 */2 * * *"
     pm_timezone: str = "America/New_York"
-    pm_message_cooldown_seconds: int = 3600
-    pm_idle_threshold_hours: int = 48
-    pm_first_heartbeat_min_messages: int = 5
 
     run_lease_seconds: int = 300
     run_activity_poll_interval: float = 2.5
@@ -185,6 +188,18 @@ class Settings(BaseSettings):
 
     def resolved_interaction_prompt_path(self) -> Path:
         path = self.interaction_prompt_path
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
+
+    def resolved_project_manager_prompt_path(self) -> Path:
+        path = self.project_manager_prompt_path
+        if path.is_absolute():
+            return path
+        return (self.root_dir / path).resolve()
+
+    def resolved_lead_project_manager_prompt_path(self) -> Path:
+        path = self.lead_project_manager_prompt_path
         if path.is_absolute():
             return path
         return (self.root_dir / path).resolve()
@@ -235,6 +250,30 @@ class Settings(BaseSettings):
         if parsed <= 0:
             return None
         # Anthropic extended-thinking budgets must be >= 1024 when enabled.
+        return max(1024, parsed)
+
+    def project_manager_thinking_max_tokens(self) -> int | None:
+        value = self.project_manager_max_thinking_tokens
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
+        return max(1024, parsed)
+
+    def lead_project_manager_thinking_max_tokens(self) -> int | None:
+        value = self.lead_project_manager_max_thinking_tokens
+        if value is None:
+            return None
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed <= 0:
+            return None
         return max(1024, parsed)
 
     def resolved_interaction_session_cache_dir(self) -> Path:

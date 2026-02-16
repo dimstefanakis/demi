@@ -12,6 +12,14 @@ from postgrest.exceptions import APIError
 from demi.models import NormalizedMessage, Tenant
 
 DEFAULT_EXECUTION_CONTEXT = "Main project"
+DEFAULT_EXECUTION_AGENT_ROLE = "execution"
+DEFAULT_RUN_ROLE = "execution"
+VALID_EXECUTION_AGENT_ROLES = {
+    "execution",
+    "project_manager",
+    "lead_project_manager",
+}
+VALID_RUN_ROLES = set(VALID_EXECUTION_AGENT_ROLES)
 
 
 @dataclass
@@ -63,19 +71,50 @@ class SupabaseDatabase:
 
     @staticmethod
     def _is_schema_cache_missing(exc: Exception, token: str | None = None) -> bool:
+        lowered = str(exc).lower()
         if isinstance(exc, APIError):
             try:
                 if exc.code == "PGRST204":
+                    if token:
+                        return token.lower() in lowered
                     return True
             except Exception:
                 pass
-        message = str(exc)
-        lowered = message.lower()
         if "schema cache" not in lowered:
             return False
         if token:
             return token.lower() in lowered
         return True
+
+    @staticmethod
+    def _is_missing_column(exc: Exception, column: str | None = None) -> bool:
+        if isinstance(exc, APIError):
+            try:
+                if exc.code == "42703":
+                    if not column:
+                        return True
+            except Exception:
+                pass
+        lowered = str(exc).lower()
+        if "does not exist" not in lowered or "column" not in lowered:
+            return False
+        if not column:
+            return True
+        needle = str(column or "").strip().lower()
+        if not needle:
+            return True
+        if f"column {needle} does not exist" in lowered:
+            return True
+        if f'column "{needle}" does not exist' in lowered:
+            return True
+        short = needle.split(".")[-1]
+        if f"column {short} does not exist" in lowered:
+            return True
+        if f'column "{short}" does not exist' in lowered:
+            return True
+        if f".{short} does not exist" in lowered:
+            return True
+        return False
 
     @staticmethod
     def _is_missing_relation(exc: Exception, relation: str) -> bool:
@@ -98,11 +137,31 @@ class SupabaseDatabase:
         return False
 
     @staticmethod
-    def _legacy_execution_agent_row(tenant_id: int, context: str | None = None) -> dict[str, Any]:
+    def _normalize_execution_agent_role(role: Any | None) -> str:
+        value = str(role or "").strip().lower()
+        if value in VALID_EXECUTION_AGENT_ROLES:
+            return value
+        return DEFAULT_EXECUTION_AGENT_ROLE
+
+    @staticmethod
+    def _normalize_run_role(role: Any | None) -> str:
+        value = str(role or "").strip().lower()
+        if value in VALID_RUN_ROLES:
+            return value
+        return DEFAULT_RUN_ROLE
+
+    @staticmethod
+    def _legacy_execution_agent_row(
+        tenant_id: int,
+        context: str | None = None,
+        role: Any | None = None,
+    ) -> dict[str, Any]:
+        normalized_role = SupabaseDatabase._normalize_execution_agent_role(role)
         return {
             "id": None,
             "tenant_id": int(tenant_id),
             "context": str(context or "").strip() or DEFAULT_EXECUTION_CONTEXT,
+            "role": normalized_role,
             "status": "active",
             "session_id": None,
             "last_run_id": None,
@@ -235,7 +294,13 @@ class SupabaseDatabase:
         *,
         include_inactive: bool = False,
         limit: int = 50,
+        role: str | None = None,
     ) -> list[dict[str, Any]]:
+        normalized_role = (
+            self._normalize_execution_agent_role(role)
+            if role is not None
+            else None
+        )
         try:
             query = (
                 self._table("execution_agents")
@@ -244,44 +309,91 @@ class SupabaseDatabase:
                 .order("updated_at", desc=True)
                 .limit(max(1, int(limit)))
             )
+            if normalized_role is not None:
+                query = query.eq("role", normalized_role)
             if not include_inactive:
                 query = query.eq("status", "active")
             data = self._execute(query)
-            return list(data or [])
+            rows = [dict(row) for row in list(data or [])]
+            for row in rows:
+                row.setdefault("role", DEFAULT_EXECUTION_AGENT_ROLE)
+            return rows
         except Exception as exc:
+            if normalized_role is not None and (
+                self._is_schema_cache_missing(exc, "role")
+                or self._is_missing_column(exc, "execution_agents.role")
+            ):
+                if normalized_role != DEFAULT_EXECUTION_AGENT_ROLE:
+                    return []
+                return self.list_execution_agents(
+                    int(tenant_id),
+                    include_inactive=include_inactive,
+                    limit=limit,
+                    role=None,
+                )
             if self._is_missing_relation(exc, "execution_agents"):
                 return []
             raise
 
     def get_execution_agent(self, execution_agent_id: int) -> dict[str, Any] | None:
         try:
-            return self._select_one("execution_agents", id=int(execution_agent_id))
+            row = self._select_one("execution_agents", id=int(execution_agent_id))
         except Exception as exc:
             if self._is_missing_relation(exc, "execution_agents"):
                 return None
             raise
+        if isinstance(row, dict) and "role" not in row:
+            row = dict(row)
+            row["role"] = DEFAULT_EXECUTION_AGENT_ROLE
+        return row
 
     def get_execution_agent_by_context(
         self,
         tenant_id: int,
         context: str | None,
+        role: str = DEFAULT_EXECUTION_AGENT_ROLE,
     ) -> dict[str, Any] | None:
         normalized = self._normalize_execution_context(context)
+        normalized_role = self._normalize_execution_agent_role(role)
         try:
             data = self._execute(
                 self._table("execution_agents")
                 .select("*")
                 .eq("tenant_id", int(tenant_id))
                 .eq("context", normalized)
+                .eq("role", normalized_role)
                 .order("updated_at", desc=True)
                 .limit(1)
             )
         except Exception as exc:
-            if self._is_missing_relation(exc, "execution_agents"):
+            if self._is_schema_cache_missing(exc, "role") or self._is_missing_column(
+                exc,
+                "execution_agents.role",
+            ):
+                if normalized_role != DEFAULT_EXECUTION_AGENT_ROLE:
+                    return None
+                try:
+                    data = self._execute(
+                        self._table("execution_agents")
+                        .select("*")
+                        .eq("tenant_id", int(tenant_id))
+                        .eq("context", normalized)
+                        .order("updated_at", desc=True)
+                        .limit(1)
+                    )
+                except Exception as fallback_exc:
+                    if self._is_missing_relation(fallback_exc, "execution_agents"):
+                        return None
+                    raise
+            elif self._is_missing_relation(exc, "execution_agents"):
                 return None
-            raise
+            else:
+                raise
         if data:
-            return data[0]
+            row = dict(data[0])
+            if "role" not in row:
+                row["role"] = DEFAULT_EXECUTION_AGENT_ROLE
+            return row
         return None
 
     def create_execution_agent(
@@ -289,14 +401,17 @@ class SupabaseDatabase:
         *,
         tenant_id: int,
         context: str | None,
+        role: str = DEFAULT_EXECUTION_AGENT_ROLE,
         session_id: str | None = None,
         status: str = "active",
         metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        normalized_role = self._normalize_execution_agent_role(role)
         now = datetime.now(tz=timezone.utc).isoformat()
         payload = {
             "tenant_id": int(tenant_id),
             "context": self._normalize_execution_context(context),
+            "role": normalized_role,
             "status": str(status or "active").strip() or "active",
             "session_id": str(session_id or "").strip() or None,
             "metadata_json": metadata,
@@ -308,24 +423,50 @@ class SupabaseDatabase:
         try:
             data = self._execute(self._table("execution_agents").insert(payload))
         except Exception as exc:
-            if self._is_missing_relation(exc, "execution_agents"):
-                return self._legacy_execution_agent_row(int(tenant_id), payload["context"])
-            raise
+            if self._is_schema_cache_missing(exc, "role") or self._is_missing_column(
+                exc,
+                "execution_agents.role",
+            ):
+                if normalized_role != DEFAULT_EXECUTION_AGENT_ROLE:
+                    raise RuntimeError("execution_agent_role_column_missing") from exc
+                legacy_payload = dict(payload)
+                legacy_payload.pop("role", None)
+                data = self._execute(self._table("execution_agents").insert(legacy_payload))
+            elif self._is_missing_relation(exc, "execution_agents"):
+                return self._legacy_execution_agent_row(
+                    int(tenant_id),
+                    payload["context"],
+                    role=normalized_role,
+                )
+            else:
+                raise
         if not data:
             raise RuntimeError("execution_agent_create_failed")
-        return dict(data[0])
+        row = dict(data[0])
+        if "role" not in row:
+            row["role"] = normalized_role
+        return row
 
     def ensure_execution_agent(
         self,
         *,
         tenant_id: int,
         context: str | None = None,
+        role: str = DEFAULT_EXECUTION_AGENT_ROLE,
     ) -> dict[str, Any]:
         normalized = self._normalize_execution_context(context)
+        normalized_role = self._normalize_execution_agent_role(role)
         fallback_session_id: str | None = None
-        if normalized == DEFAULT_EXECUTION_CONTEXT:
+        if (
+            normalized == DEFAULT_EXECUTION_CONTEXT
+            and normalized_role == DEFAULT_EXECUTION_AGENT_ROLE
+        ):
             fallback_session_id = self._read_default_execution_session_from_kv(int(tenant_id))
-        existing = self.get_execution_agent_by_context(int(tenant_id), normalized)
+        existing = self.get_execution_agent_by_context(
+            int(tenant_id),
+            normalized,
+            role=normalized_role,
+        )
         if existing:
             status = str(existing.get("status") or "").strip().lower()
             archived_at = existing.get("archived_at")
@@ -355,13 +496,22 @@ class SupabaseDatabase:
             return self.create_execution_agent(
                 tenant_id=int(tenant_id),
                 context=normalized,
+                role=normalized_role,
                 session_id=fallback_session_id,
                 status="active",
             )
         except Exception as exc:
             if self._is_missing_relation(exc, "execution_agents"):
-                return self._legacy_execution_agent_row(int(tenant_id), normalized)
-            existing = self.get_execution_agent_by_context(int(tenant_id), normalized)
+                return self._legacy_execution_agent_row(
+                    int(tenant_id),
+                    normalized,
+                    role=normalized_role,
+                )
+            existing = self.get_execution_agent_by_context(
+                int(tenant_id),
+                normalized,
+                role=normalized_role,
+            )
             if existing:
                 return existing
             raise
@@ -881,6 +1031,24 @@ class SupabaseDatabase:
         return list(data or [])
 
     def has_inflight_run(self, tenant_id: int, project_name: str | None = None) -> bool:
+        return self.has_inflight_run_for_role(
+            tenant_id=tenant_id,
+            project_name=project_name,
+            run_role=None,
+        )
+
+    def has_inflight_run_for_role(
+        self,
+        tenant_id: int,
+        *,
+        project_name: str | None = None,
+        run_role: str | None = None,
+    ) -> bool:
+        normalized_run_role = (
+            self._normalize_run_role(run_role)
+            if run_role is not None
+            else None
+        )
         query = (
             self._table("runs")
             .select("id")
@@ -889,15 +1057,39 @@ class SupabaseDatabase:
         )
         if project_name:
             query = query.eq("project_name", project_name)
-        data = self._execute(query.limit(1))
+        if normalized_run_role is not None:
+            query = query.eq("run_role", normalized_run_role)
+        try:
+            data = self._execute(query.limit(1))
+        except Exception as exc:
+            if normalized_run_role is not None and (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            ):
+                if normalized_run_role != DEFAULT_RUN_ROLE:
+                    return False
+                return self.has_inflight_run_for_role(
+                    tenant_id=tenant_id,
+                    project_name=project_name,
+                    run_role=None,
+                )
+            raise
         return bool(data)
 
     def get_run(self, run_id: int) -> dict[str, Any] | None:
         return self._select_one("runs", id=run_id)
 
     def get_inflight_run(
-        self, tenant_id: int, project_name: str | None = None
+        self,
+        tenant_id: int,
+        project_name: str | None = None,
+        run_role: str | None = None,
     ) -> dict[str, Any] | None:
+        normalized_run_role = (
+            self._normalize_run_role(run_role)
+            if run_role is not None
+            else None
+        )
         query = (
             self._table("runs")
             .select("*")
@@ -908,7 +1100,23 @@ class SupabaseDatabase:
         )
         if project_name:
             query = query.eq("project_name", project_name)
-        data = self._execute(query)
+        if normalized_run_role is not None:
+            query = query.eq("run_role", normalized_run_role)
+        try:
+            data = self._execute(query)
+        except Exception as exc:
+            if normalized_run_role is not None and (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            ):
+                if normalized_run_role != DEFAULT_RUN_ROLE:
+                    return None
+                return self.get_inflight_run(
+                    tenant_id=tenant_id,
+                    project_name=project_name,
+                    run_role=None,
+                )
+            raise
         return data[0] if data else None
 
     def list_tenant_inflight_runs(
@@ -916,8 +1124,14 @@ class SupabaseDatabase:
         tenant_id: int,
         *,
         limit: int = 20,
+        run_role: str | None = None,
     ) -> list[dict[str, Any]]:
-        data = self._execute(
+        normalized_run_role = (
+            self._normalize_run_role(run_role)
+            if run_role is not None
+            else None
+        )
+        query = (
             self._table("runs")
             .select("*")
             .eq("tenant_id", int(tenant_id))
@@ -925,6 +1139,23 @@ class SupabaseDatabase:
             .order("started_at", desc=True)
             .limit(max(1, int(limit)))
         )
+        if normalized_run_role is not None:
+            query = query.eq("run_role", normalized_run_role)
+        try:
+            data = self._execute(query)
+        except Exception as exc:
+            if normalized_run_role is not None and (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            ):
+                if normalized_run_role != DEFAULT_RUN_ROLE:
+                    return []
+                return self.list_tenant_inflight_runs(
+                    int(tenant_id),
+                    limit=limit,
+                    run_role=None,
+                )
+            raise
         return list(data or [])
 
     def list_inflight_runs(self, limit: int = 50, offset: int = 0) -> list[dict[str, Any]]:
@@ -989,10 +1220,12 @@ class SupabaseDatabase:
         project_name: str | None = None,
         execution_agent_id: int | None = None,
         execution_context: str | None = None,
+        run_role: str = DEFAULT_RUN_ROLE,
         lease_seconds: int | None = None,
         task_path: str | None = None,
         session_id: str | None = None,
     ) -> int:
+        normalized_run_role = self._normalize_run_role(run_role)
         now_dt = datetime.now(tz=timezone.utc)
         lease_expires = None
         if lease_seconds is not None:
@@ -1009,6 +1242,7 @@ class SupabaseDatabase:
             "project_name": project_name,
             "execution_agent_id": execution_agent_id,
             "execution_context": execution_context,
+            "run_role": normalized_run_role,
             "task_path": task_path,
             "session_id": session_id,
             "lease_expires_at": lease_expires,
@@ -1018,15 +1252,27 @@ class SupabaseDatabase:
         try:
             data = self._execute(self._table("runs").insert(payload))
         except Exception as exc:
-            missing_execution_cols = (
+            missing_execution_agent_id = (
                 self._is_schema_cache_missing(exc, "execution_agent_id")
-                or self._is_schema_cache_missing(exc, "execution_context")
+                or self._is_missing_column(exc, "runs.execution_agent_id")
             )
-            if not missing_execution_cols:
+            missing_execution_context = (
+                self._is_schema_cache_missing(exc, "execution_context")
+                or self._is_missing_column(exc, "runs.execution_context")
+            )
+            missing_run_role = (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            )
+            if not (missing_execution_agent_id or missing_execution_context or missing_run_role):
                 raise
             legacy_payload = dict(payload)
-            legacy_payload.pop("execution_agent_id", None)
-            legacy_payload.pop("execution_context", None)
+            if missing_execution_agent_id:
+                legacy_payload.pop("execution_agent_id", None)
+            if missing_execution_context:
+                legacy_payload.pop("execution_context", None)
+            if missing_run_role:
+                legacy_payload.pop("run_role", None)
             data = self._execute(self._table("runs").insert(legacy_payload))
         if not data:
             raise RuntimeError("run_create_failed")
@@ -1040,6 +1286,7 @@ class SupabaseDatabase:
         session_id: str | None = None,
         execution_agent_id: int | None = None,
         execution_context: str | None = None,
+        run_role: str | None = None,
     ) -> None:
         updates: dict[str, Any] = {}
         if task_path is not None:
@@ -1050,20 +1297,34 @@ class SupabaseDatabase:
             updates["execution_agent_id"] = int(execution_agent_id)
         if execution_context is not None:
             updates["execution_context"] = str(execution_context or "").strip() or None
+        if run_role is not None:
+            updates["run_role"] = self._normalize_run_role(run_role)
         if not updates:
             return
         try:
             self._execute(self._table("runs").update(updates).eq("id", run_id))
         except Exception as exc:
-            missing_execution_cols = (
+            missing_execution_agent_id = (
                 self._is_schema_cache_missing(exc, "execution_agent_id")
-                or self._is_schema_cache_missing(exc, "execution_context")
+                or self._is_missing_column(exc, "runs.execution_agent_id")
             )
-            if not missing_execution_cols:
+            missing_execution_context = (
+                self._is_schema_cache_missing(exc, "execution_context")
+                or self._is_missing_column(exc, "runs.execution_context")
+            )
+            missing_run_role = (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            )
+            if not (missing_execution_agent_id or missing_execution_context or missing_run_role):
                 raise
             legacy_updates = dict(updates)
-            legacy_updates.pop("execution_agent_id", None)
-            legacy_updates.pop("execution_context", None)
+            if missing_execution_agent_id:
+                legacy_updates.pop("execution_agent_id", None)
+            if missing_execution_context:
+                legacy_updates.pop("execution_context", None)
+            if missing_run_role:
+                legacy_updates.pop("run_role", None)
             if not legacy_updates:
                 return
             self._execute(self._table("runs").update(legacy_updates).eq("id", run_id))
@@ -1665,7 +1926,18 @@ class SupabaseDatabase:
             payload["last_heartbeat_at"] = last_heartbeat_at
         self._execute(self._table("runs").update(payload).eq("id", run_id))
 
-    def expire_stale_runs(self, tenant_id: int, project_name: str | None, now: datetime) -> int:
+    def expire_stale_runs(
+        self,
+        tenant_id: int,
+        project_name: str | None,
+        now: datetime,
+        run_role: str | None = None,
+    ) -> int:
+        normalized_run_role = (
+            self._normalize_run_role(run_role)
+            if run_role is not None
+            else None
+        )
         now_str = now.isoformat()
         query = (
             self._table("runs")
@@ -1676,7 +1948,24 @@ class SupabaseDatabase:
         )
         if project_name:
             query = query.eq("project_name", project_name)
-        data = self._execute(query)
+        if normalized_run_role is not None:
+            query = query.eq("run_role", normalized_run_role)
+        try:
+            data = self._execute(query)
+        except Exception as exc:
+            if normalized_run_role is not None and (
+                self._is_schema_cache_missing(exc, "run_role")
+                or self._is_missing_column(exc, "runs.run_role")
+            ):
+                if normalized_run_role != DEFAULT_RUN_ROLE:
+                    return 0
+                return self.expire_stale_runs(
+                    tenant_id=tenant_id,
+                    project_name=project_name,
+                    now=now,
+                    run_role=None,
+                )
+            raise
         return len(data or [])
 
     def finish_run(self, run_id: int, status: str = "completed", error: str | None = None) -> None:

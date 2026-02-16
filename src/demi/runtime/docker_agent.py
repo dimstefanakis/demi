@@ -386,6 +386,10 @@ class DockerAgent:
             "EXECUTION_MODEL",
             "INTERACTION_MODEL",
             "INTERACTION_MAX_THINKING_TOKENS",
+            "PROJECT_MANAGER_MODEL",
+            "PROJECT_MANAGER_MAX_THINKING_TOKENS",
+            "LEAD_PROJECT_MANAGER_MODEL",
+            "LEAD_PROJECT_MANAGER_MAX_THINKING_TOKENS",
             "CLAUDE_ENABLE_TOOL_SEARCH",
             "CLAUDE_ENABLE_MEMORY_TOOL",
             "EXECUTION_STREAM_REALTIME_ENABLED",
@@ -456,6 +460,14 @@ class DockerAgent:
             "EXECUTION_MODEL": self.settings.execution_model,
             "INTERACTION_MODEL": self.settings.interaction_model,
             "INTERACTION_MAX_THINKING_TOKENS": self.settings.interaction_max_thinking_tokens,
+            "PROJECT_MANAGER_MODEL": self.settings.project_manager_model,
+            "PROJECT_MANAGER_MAX_THINKING_TOKENS": (
+                self.settings.project_manager_max_thinking_tokens
+            ),
+            "LEAD_PROJECT_MANAGER_MODEL": self.settings.lead_project_manager_model,
+            "LEAD_PROJECT_MANAGER_MAX_THINKING_TOKENS": (
+                self.settings.lead_project_manager_max_thinking_tokens
+            ),
             "CLAUDE_ENABLE_TOOL_SEARCH": self.settings.claude_enable_tool_search,
             "CLAUDE_ENABLE_MEMORY_TOOL": self.settings.claude_enable_memory_tool,
             "EXECUTION_STREAM_REALTIME_ENABLED": self.settings.execution_stream_realtime_enabled,

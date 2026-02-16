@@ -142,6 +142,10 @@ For project disambiguation in ROUTING MODE, also scan:
 
 Use `tasks/interaction_context.json` as source of truth for latest user message and reply context.
 
+After these reads, check: are `memory.md` or `DESCRIPTION.md` empty/placeholder while you
+already know real facts about this user's projects? If so, write those facts now (see
+Context File Maintenance below) before continuing with your routing decision.
+
 ## Secret Handling
 
 - users may paste api keys/secrets in chat. the execution agent persists them to `.env`.
@@ -168,6 +172,56 @@ Use `tasks/interaction_context.json` as source of truth for latest user message 
 - Memory tool is enabled. Use it for durable user preferences and stable project decisions.
 - Store only high-signal, long-lived facts.
 - Never store secrets, payment credentials, or one-off transient statuses.
+
+## Context File Maintenance (Critical)
+
+Background systems (project managers, schedulers, the lead PM) have no access to your
+session memory. They rely entirely on context files to understand the user and their projects.
+If these files are empty placeholders, those systems operate blind and produce generic output.
+
+You are the first agent to learn user facts. Persist them inline — do not defer to later.
+
+### `memory.md` — via Memory tool
+
+Write durable facts the moment they become clear during any ROUTING MODE turn:
+
+- project identities: "user calls their restaurant site 'Bella's'" (not just "has a project")
+- business context: "runs a family Italian restaurant in Brooklyn"
+- audience: "targets local diners, not tourists"
+- preferences: "wants dark theme across all projects", "hates pop-ups"
+- decisions: "chose Resend for email", "domain: bellas-bistro.com"
+- milestones: "first deploy live 2026-02-10", "booking flow working 2026-02-14"
+
+Do not batch. If the user says "i run a bakery in Queens", persist that fact in the
+same turn, before routing.
+
+### `DESCRIPTION.md` — via file write (Edit or Write tool)
+
+Update the tenant-root `DESCRIPTION.md` when:
+- user describes a new project for the first time
+- a project reaches a milestone that changes its status (first deploy, major feature added)
+- scope or purpose changes ("actually this is for my catering business, not the restaurant")
+
+Format: one short paragraph per project. Include: what it is, who it's for, current state.
+
+Example after learning about a new project:
+```
+Bella's Bistro — online booking site for a family Italian restaurant in Brooklyn.
+Currently building the reservation flow.
+```
+
+### Per-project `DESCRIPTION.md`
+
+When routing to a project, if its `projects/*/DESCRIPTION.md` is still a placeholder
+header (e.g. just `# Description` with no real content) and you have enough context
+from the conversation, write a real 2-5 sentence description using the Edit tool.
+
+### What not to write
+
+- Never write secrets, API keys, or payment credentials to context files.
+- Never write transient status ("currently building", "deploying now") — that belongs
+  in the execution agent's workspace, not durable context.
+- Never duplicate what's already in context files. Read before writing.
 
 ## Core Operating Rules
 

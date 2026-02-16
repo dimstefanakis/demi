@@ -39,6 +39,14 @@ EXECUTION_SESSION_NAMESPACE = "execution"
 EXECUTION_SESSION_KEY = "claude_session"
 EXECUTION_SESSION_KEY_PREFIX = "claude_session:"
 DEFAULT_EXECUTION_CONTEXT = "Main project"
+DEFAULT_EXECUTION_ROLE = "execution"
+PROJECT_MANAGER_ROLE = "project_manager"
+LEAD_PROJECT_MANAGER_ROLE = "lead_project_manager"
+VALID_EXECUTION_ROLES = {
+    DEFAULT_EXECUTION_ROLE,
+    PROJECT_MANAGER_ROLE,
+    LEAD_PROJECT_MANAGER_ROLE,
+}
 
 
 @dataclass(frozen=True)
@@ -451,6 +459,13 @@ class Orchestrator:
         value = str(context or "").strip()
         return value or DEFAULT_EXECUTION_CONTEXT
 
+    @staticmethod
+    def _normalize_execution_role(role: Any | None) -> str:
+        value = str(role or "").strip().lower()
+        if value in VALID_EXECUTION_ROLES:
+            return value
+        return DEFAULT_EXECUTION_ROLE
+
     def _resolve_execution_agent_for_decision(
         self,
         *,
@@ -459,6 +474,7 @@ class Orchestrator:
     ) -> dict[str, Any] | None:
         payload = dict(decision or {})
         desired_context = self._normalize_execution_context(payload.get("execution_context"))
+        desired_role = self._normalize_execution_role(payload.get("role"))
         desired_agent_id = payload.get("execution_agent_id")
 
         agent: dict[str, Any] | None = None
@@ -470,7 +486,11 @@ class Orchestrator:
                 candidate = None
             if isinstance(candidate, dict):
                 try:
-                    if int(candidate.get("tenant_id")) == int(tenant_id):
+                    candidate_role = self._normalize_execution_role(candidate.get("role"))
+                    if int(candidate.get("tenant_id")) == int(tenant_id) and (
+                        candidate_role == desired_role
+                    ):
+                        candidate["role"] = candidate_role
                         agent = candidate
                         resolved_from_id = True
                 except (TypeError, ValueError):
@@ -481,6 +501,7 @@ class Orchestrator:
                 agent = self.db.ensure_execution_agent(
                     tenant_id=int(tenant_id),
                     context=desired_context,
+                    role=desired_role,
                 )
             except Exception:
                 agent = None
@@ -489,7 +510,9 @@ class Orchestrator:
             return None
 
         current_context = self._normalize_execution_context(agent.get("context"))
-        if current_context != desired_context:
+        current_role = self._normalize_execution_role(agent.get("role"))
+        agent["role"] = current_role
+        if current_context != desired_context or current_role != desired_role:
             # Never mutate an existing execution-agent context during routing.
             # If decision context differs from a selected execution_agent_id,
             # resolve (or create) a separate execution agent for that context.
@@ -498,19 +521,23 @@ class Orchestrator:
                     replacement = self.db.ensure_execution_agent(
                         tenant_id=int(tenant_id),
                         context=desired_context,
+                        role=desired_role,
                     )
                 except Exception:
                     replacement = None
                 if isinstance(replacement, dict):
+                    replacement["role"] = self._normalize_execution_role(replacement.get("role"))
                     return replacement
             try:
                 fallback = self.db.ensure_execution_agent(
                     tenant_id=int(tenant_id),
                     context=desired_context,
+                    role=desired_role,
                 )
             except Exception:
                 fallback = None
             if isinstance(fallback, dict):
+                fallback["role"] = self._normalize_execution_role(fallback.get("role"))
                 return fallback
         return agent
 
@@ -520,17 +547,29 @@ class Orchestrator:
         tenant_id: int,
         execution_agent_id: int | None,
         execution_context: str | None,
+        role: str | None = None,
     ) -> int | None:
+        desired_role = self._normalize_execution_role(role)
         if execution_agent_id is not None:
             try:
-                return int(execution_agent_id)
+                candidate = self.db.get_execution_agent(int(execution_agent_id))
+            except Exception:
+                return None
+            if not isinstance(candidate, dict):
+                return None
+            try:
+                row_tenant_id = int(candidate.get("tenant_id"))
             except (TypeError, ValueError):
                 return None
+            row_role = self._normalize_execution_role(candidate.get("role"))
+            if row_tenant_id == int(tenant_id) and row_role == desired_role:
+                return int(execution_agent_id)
         context = self._normalize_execution_context(execution_context)
         try:
             agent = self.db.ensure_execution_agent(
                 tenant_id=int(tenant_id),
                 context=context,
+                role=desired_role,
             )
         except Exception:
             return None
@@ -1003,14 +1042,27 @@ class Orchestrator:
                 self.db.update_message_statuses(message_ids, "processed")
                 return OrchestratorResult(status="blocked", detail="system_blocked")
 
-            inflight_run = self.db.get_inflight_run(tenant.id, None)
+            inflight_run = self.db.get_inflight_run(
+                tenant.id,
+                None,
+                run_role=DEFAULT_EXECUTION_ROLE,
+            )
             if inflight_run:
                 if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                     inflight_run = None
             # Reconciliation must run before stale-expiration so completed runs
             # with persisted run_result.json are not mislabeled as lease_expired.
-            self.db.expire_stale_runs(tenant.id, None, self._now())
-            inflight_run = self.db.get_inflight_run(tenant.id, None)
+            self.db.expire_stale_runs(
+                tenant.id,
+                None,
+                self._now(),
+                run_role=DEFAULT_EXECUTION_ROLE,
+            )
+            inflight_run = self.db.get_inflight_run(
+                tenant.id,
+                None,
+                run_role=DEFAULT_EXECUTION_ROLE,
+            )
             if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
                 await self._finalize_stale_run(tenant, inflight_run, notify=False)
                 inflight_run = None
@@ -1263,6 +1315,7 @@ class Orchestrator:
                 )
                 execution_agent_id = None
                 execution_context = DEFAULT_EXECUTION_CONTEXT
+                execution_role = DEFAULT_EXECUTION_ROLE
                 execution_session_id = self._get_execution_session_id(tenant.id)
                 if isinstance(execution_agent, dict):
                     try:
@@ -1272,16 +1325,19 @@ class Orchestrator:
                     execution_context = self._normalize_execution_context(
                         execution_agent.get("context")
                     )
+                    execution_role = self._normalize_execution_role(execution_agent.get("role"))
                     candidate_session_id = str(execution_agent.get("session_id") or "").strip()
                     if candidate_session_id:
                         execution_session_id = candidate_session_id
                 decision["execution_agent_id"] = execution_agent_id
                 decision["execution_context"] = execution_context
+                decision["role"] = execution_role
                 run_id = self.db.create_run(
                     tenant.id,
                     message_id=latest_message_id,
                     execution_agent_id=execution_agent_id,
                     execution_context=execution_context,
+                    run_role=execution_role,
                     lease_seconds=settings.run_lease_seconds,
                     session_id=execution_session_id,
                 )
@@ -1319,11 +1375,13 @@ class Orchestrator:
                         parallel_decision["parallel_runs"] = []
                         parallel_decision["execution_context"] = parallel_context
                         parallel_decision["execution_agent_id"] = None
+                        parallel_decision["role"] = DEFAULT_EXECUTION_ROLE
                         parallel_execution_agent = self._resolve_execution_agent_for_decision(
                             tenant_id=int(tenant.id),
                             decision=parallel_decision,
                         )
                         parallel_execution_agent_id = None
+                        parallel_execution_role = DEFAULT_EXECUTION_ROLE
                         parallel_session_id = self._get_execution_session_id(tenant.id)
                         if isinstance(parallel_execution_agent, dict):
                             try:
@@ -1340,12 +1398,17 @@ class Orchestrator:
                             parallel_decision["execution_context"] = self._normalize_execution_context(
                                 parallel_execution_agent.get("context")
                             )
+                            parallel_execution_role = self._normalize_execution_role(
+                                parallel_execution_agent.get("role")
+                            )
+                        parallel_decision["role"] = parallel_execution_role
                         parallel_decision["execution_agent_id"] = parallel_execution_agent_id
                         parallel_run_id = self.db.create_run(
                             tenant.id,
                             message_id=latest_message_id,
                             execution_agent_id=parallel_execution_agent_id,
                             execution_context=parallel_decision["execution_context"],
+                            run_role=parallel_execution_role,
                             lease_seconds=settings.run_lease_seconds,
                             session_id=parallel_session_id,
                         )
@@ -1459,14 +1522,28 @@ class Orchestrator:
         else:
             if await self._handle_blocked(workspace.tasks_dir, tenant, notify=False):
                 return OrchestratorResult(status="blocked", detail="system_blocked")
-        inflight_run = self.db.get_inflight_run(tenant.id, None)
+        requested_role = self._normalize_execution_role(payload.get("role"))
+        inflight_run = self.db.get_inflight_run(
+            tenant.id,
+            None,
+            run_role=requested_role,
+        )
         if inflight_run:
             if self._reconcile_inflight_run(tenant, inflight_run, workspace):
                 inflight_run = None
         # Reconcile first, then expire stale rows so completed runs are not
         # incorrectly transitioned to lease_expired.
-        self.db.expire_stale_runs(tenant.id, None, self._now())
-        inflight_run = self.db.get_inflight_run(tenant.id, None)
+        self.db.expire_stale_runs(
+            tenant.id,
+            None,
+            self._now(),
+            run_role=requested_role,
+        )
+        inflight_run = self.db.get_inflight_run(
+            tenant.id,
+            None,
+            run_role=requested_role,
+        )
         if inflight_run and self._is_run_stale(inflight_run, max_age_seconds=900):
             await self._finalize_stale_run(tenant, inflight_run, notify=False)
             inflight_run = None
@@ -1505,10 +1582,12 @@ class Orchestrator:
             decision={
                 "execution_context": payload.get("execution_context"),
                 "execution_agent_id": payload.get("execution_agent_id"),
+                "role": requested_role,
             },
         )
         execution_agent_id = None
         execution_context = DEFAULT_EXECUTION_CONTEXT
+        execution_role = requested_role
         execution_session_id = self._get_execution_session_id(tenant.id)
         if isinstance(execution_agent, dict):
             try:
@@ -1516,6 +1595,7 @@ class Orchestrator:
             except (TypeError, ValueError):
                 execution_agent_id = None
             execution_context = self._normalize_execution_context(execution_agent.get("context"))
+            execution_role = self._normalize_execution_role(execution_agent.get("role"))
             candidate_session_id = str(execution_agent.get("session_id") or "").strip()
             if candidate_session_id:
                 execution_session_id = candidate_session_id
@@ -1524,6 +1604,7 @@ class Orchestrator:
             message_id=message_id,
             execution_agent_id=execution_agent_id,
             execution_context=execution_context,
+            run_role=execution_role,
             lease_seconds=settings.run_lease_seconds,
             session_id=execution_session_id,
         )
@@ -1631,13 +1712,11 @@ class Orchestrator:
             billing_status,
             routing_decision=routing_decision,
         )
-        task_path = workspace.write_task(task_content)
-
-        self._clear_run_artifacts(workspace.tasks_dir)
 
         settings = Settings()
         run_execution_agent_id: int | None = None
         run_execution_context = DEFAULT_EXECUTION_CONTEXT
+        run_execution_role = DEFAULT_EXECUTION_ROLE
         run_session_id = self._get_execution_session_id(tenant.id)
         if run_id is None:
             execution_agent = self._resolve_execution_agent_for_decision(
@@ -1652,6 +1731,7 @@ class Orchestrator:
                 run_execution_context = self._normalize_execution_context(
                     execution_agent.get("context")
                 )
+                run_execution_role = self._normalize_execution_role(execution_agent.get("role"))
                 candidate_session_id = str(execution_agent.get("session_id") or "").strip()
                 if candidate_session_id:
                     run_session_id = candidate_session_id
@@ -1660,6 +1740,7 @@ class Orchestrator:
                 message_id=message_id,
                 execution_agent_id=run_execution_agent_id,
                 execution_context=run_execution_context,
+                run_role=run_execution_role,
                 lease_seconds=settings.run_lease_seconds,
                 session_id=run_session_id,
             )
@@ -1677,11 +1758,27 @@ class Orchestrator:
             run_execution_context = self._normalize_execution_context(
                 run_row.get("execution_context")
             )
+            run_execution_role = self._normalize_execution_role(run_row.get("run_role"))
             row_session_id = str(run_row.get("session_id") or "").strip()
             if row_session_id:
                 run_session_id = row_session_id
+        workspace = self._workspace_for_run_role(
+            workspace=workspace,
+            run_role=run_execution_role,
+            execution_context=run_execution_context,
+        )
+        task_path = workspace.write_task(task_content)
+        preserve_artifacts: set[str] | None = None
+        if run_execution_role != DEFAULT_EXECUTION_ROLE:
+            # PM runs may need previous execution summaries/deploy markers to keep context files fresh.
+            preserve_artifacts = {"result_summary.md", "deploy_url.txt"}
+        self._clear_run_artifacts(workspace.tasks_dir, preserve=preserve_artifacts)
         can_update_billing_status = True
-        inflight_run = self.db.get_inflight_run(tenant.id, None)
+        inflight_run = self.db.get_inflight_run(
+            tenant.id,
+            None,
+            run_role=run_execution_role,
+        )
         if inflight_run:
             inflight_id = None
             try:
@@ -1714,6 +1811,7 @@ class Orchestrator:
                 session_id=run_session_id,
                 execution_agent_id=run_execution_agent_id,
                 execution_context=run_execution_context,
+                run_role=run_execution_role,
             )
         except Exception:
             pass
@@ -1754,6 +1852,7 @@ class Orchestrator:
                     tenant_id=int(tenant.id),
                     execution_agent_id=run_execution_agent_id,
                     execution_context=run_execution_context,
+                    role=run_execution_role,
                 )
                 if resolved_execution_agent_id is not None:
                     run_execution_agent_id = resolved_execution_agent_id
@@ -1768,9 +1867,13 @@ class Orchestrator:
                         )
                     except Exception:
                         pass
-                if run_execution_context == DEFAULT_EXECUTION_CONTEXT:
+                if (
+                    run_execution_role == DEFAULT_EXECUTION_ROLE
+                    and run_execution_context == DEFAULT_EXECUTION_CONTEXT
+                ):
                     self._set_execution_session_id(tenant.id, agent_result.session_id)
-                self.db.update_tenant_session(tenant.id, agent_result.session_id)
+                if run_execution_role == DEFAULT_EXECUTION_ROLE:
+                    self.db.update_tenant_session(tenant.id, agent_result.session_id)
             self.db.add_run_usage(
                 run_id,
                 total_cost_usd=result_total_cost,
@@ -1798,6 +1901,7 @@ class Orchestrator:
                         "message_id": int(message_id) if message_id else None,
                         "execution_agent_id": run_execution_agent_id,
                         "execution_context": run_execution_context,
+                        "run_role": run_execution_role,
                         "summary": "Execution run completed",
                         "result_summary": getattr(agent_result, "summary", None),
                         "total_cost_usd": result_total_cost,
@@ -1825,6 +1929,7 @@ class Orchestrator:
                     tenant_id=int(tenant.id),
                     execution_agent_id=run_execution_agent_id,
                     execution_context=run_execution_context,
+                    role=run_execution_role,
                 )
                 if resolved_execution_agent_id is not None:
                     run_execution_agent_id = resolved_execution_agent_id
@@ -1836,12 +1941,16 @@ class Orchestrator:
                         )
                     except Exception:
                         pass
-                if run_execution_context == DEFAULT_EXECUTION_CONTEXT:
+                if (
+                    run_execution_role == DEFAULT_EXECUTION_ROLE
+                    and run_execution_context == DEFAULT_EXECUTION_CONTEXT
+                ):
                     self._set_execution_session_id(tenant.id, None)
-                try:
-                    self.db.update_tenant_session(tenant.id, "")
-                except Exception:
-                    pass
+                if run_execution_role == DEFAULT_EXECUTION_ROLE:
+                    try:
+                        self.db.update_tenant_session(tenant.id, "")
+                    except Exception:
+                        pass
             self.db.finish_run(run_id, status="failed", error=str(exc))
             try:
                 self.db.record_tenant_event(
@@ -1852,6 +1961,7 @@ class Orchestrator:
                         "message_id": int(message_id) if message_id else None,
                         "execution_agent_id": run_execution_agent_id,
                         "execution_context": run_execution_context,
+                        "run_role": run_execution_role,
                         "summary": "Execution run failed",
                         "error": str(exc),
                     },
@@ -2226,6 +2336,7 @@ class Orchestrator:
         decision.setdefault("facts_only", False)
         decision.setdefault("execution_context", None)
         decision.setdefault("execution_agent_id", None)
+        decision.setdefault("role", DEFAULT_EXECUTION_ROLE)
         decision["parallel_runs"] = self._normalize_parallel_runs(
             decision.get("parallel_runs"),
             fallback_text=str(decision.get("plan") or "").strip(),
@@ -2310,6 +2421,7 @@ class Orchestrator:
                 tenant.id,
                 include_inactive=True,
                 limit=25,
+                role=DEFAULT_EXECUTION_ROLE,
             )
         except Exception:
             execution_agents = []
@@ -2318,6 +2430,7 @@ class Orchestrator:
                 default_agent = self.db.ensure_execution_agent(
                     tenant_id=int(tenant.id),
                     context=DEFAULT_EXECUTION_CONTEXT,
+                    role=DEFAULT_EXECUTION_ROLE,
                 )
             except Exception:
                 default_agent = None
@@ -2750,8 +2863,17 @@ class Orchestrator:
             )
             if not rows:
                 continue
-            self.db.expire_stale_runs(tenant.id, None, now)
-            inflight = self.db.get_inflight_run(tenant.id, None)
+            self.db.expire_stale_runs(
+                tenant.id,
+                None,
+                now,
+                run_role=DEFAULT_EXECUTION_ROLE,
+            )
+            inflight = self.db.get_inflight_run(
+                tenant.id,
+                None,
+                run_role=DEFAULT_EXECUTION_ROLE,
+            )
             if inflight:
                 continue
             self.db.finish_running_runs(tenant.id, None, error="migrated")
@@ -2983,6 +3105,32 @@ class Orchestrator:
 
     def _inflight_updates_path(self, tasks_dir: Path) -> Path:
         return tasks_dir / "inflight_updates.jsonl"
+
+    def _workspace_for_run_role(
+        self,
+        *,
+        workspace: Workspace,
+        run_role: str,
+        execution_context: str | None,
+    ) -> Workspace:
+        role = self._normalize_execution_role(run_role)
+        if role == PROJECT_MANAGER_ROLE:
+            try:
+                return self.workspace_manager.ensure_project_for_tenant_root(
+                    workspace.tenant_root,
+                    project_name=execution_context,
+                )
+            except Exception:
+                return workspace
+        if role == LEAD_PROJECT_MANAGER_ROLE:
+            try:
+                return self.workspace_manager.ensure_workspace_at_path(
+                    workspace.tenant_root,
+                    tenant_root=workspace.tenant_root,
+                )
+            except Exception:
+                return workspace
+        return workspace
 
     async def _resolve_workspace(self, tenant) -> Workspace:
         # Project routing is prompt-only. The orchestrator always operates from a
@@ -3272,12 +3420,16 @@ class Orchestrator:
         run_execution_context = self._normalize_execution_context(
             run.get("execution_context") if hasattr(run, "get") else None
         )
+        run_execution_role = self._normalize_execution_role(
+            run.get("run_role") if hasattr(run, "get") else None
+        )
         session_id = payload.get("session_id")
         if status == "completed" and session_id:
             resolved_execution_agent_id = self._resolve_execution_agent_id_for_context(
                 tenant_id=int(tenant.id),
                 execution_agent_id=run_execution_agent_id,
                 execution_context=run_execution_context,
+                role=run_execution_role,
             )
             if resolved_execution_agent_id is not None:
                 run_execution_agent_id = resolved_execution_agent_id
@@ -3292,14 +3444,19 @@ class Orchestrator:
                     )
                 except Exception:
                     pass
-            if run_execution_context == DEFAULT_EXECUTION_CONTEXT:
+            if (
+                run_execution_role == DEFAULT_EXECUTION_ROLE
+                and run_execution_context == DEFAULT_EXECUTION_CONTEXT
+            ):
                 self._set_execution_session_id(tenant.id, session_id)
-            self.db.update_tenant_session(tenant.id, session_id)
+            if run_execution_role == DEFAULT_EXECUTION_ROLE:
+                self.db.update_tenant_session(tenant.id, session_id)
         elif status == "failed" and has_usage_signal and not has_usage_activity:
             resolved_execution_agent_id = self._resolve_execution_agent_id_for_context(
                 tenant_id=int(tenant.id),
                 execution_agent_id=run_execution_agent_id,
                 execution_context=run_execution_context,
+                role=run_execution_role,
             )
             if resolved_execution_agent_id is not None:
                 run_execution_agent_id = resolved_execution_agent_id
@@ -3311,12 +3468,16 @@ class Orchestrator:
                     )
                 except Exception:
                     pass
-            if run_execution_context == DEFAULT_EXECUTION_CONTEXT:
+            if (
+                run_execution_role == DEFAULT_EXECUTION_ROLE
+                and run_execution_context == DEFAULT_EXECUTION_CONTEXT
+            ):
                 self._set_execution_session_id(tenant.id, None)
-            try:
-                self.db.update_tenant_session(tenant.id, "")
-            except Exception:
-                pass
+            if run_execution_role == DEFAULT_EXECUTION_ROLE:
+                try:
+                    self.db.update_tenant_session(tenant.id, "")
+                except Exception:
+                    pass
         message_id = run["message_id"] if hasattr(run, "keys") else run.get("message_id")
         if message_id:
             self.db.update_message_status(
@@ -3339,9 +3500,15 @@ class Orchestrator:
         *,
         tenant_id: int,
         tenant_key: str | None,
+        role: str = DEFAULT_EXECUTION_ROLE,
     ) -> list[dict[str, Any]]:
+        normalized_role = self._normalize_execution_role(role)
         try:
-            inflight_rows = self.db.list_tenant_inflight_runs(int(tenant_id), limit=50)
+            inflight_rows = self.db.list_tenant_inflight_runs(
+                int(tenant_id),
+                limit=50,
+                run_role=normalized_role,
+            )
         except Exception:
             inflight_rows = []
         if not inflight_rows:
@@ -3366,6 +3533,7 @@ class Orchestrator:
                     "execution_context": self._normalize_execution_context(
                         inflight.get("execution_context")
                     ),
+                    "role": self._normalize_execution_role(inflight.get("run_role") or normalized_role),
                     "status": inflight.get("status"),
                     "started_at": inflight.get("started_at"),
                     "lease_expires_at": inflight.get("lease_expires_at"),
@@ -3707,13 +3875,16 @@ class Orchestrator:
         return content or None
 
     @staticmethod
-    def _clear_run_artifacts(tasks_dir: Path) -> None:
+    def _clear_run_artifacts(tasks_dir: Path, *, preserve: set[str] | None = None) -> None:
+        preserved = {str(name).strip() for name in (preserve or set()) if str(name).strip()}
         for name in (
             "deploy_url.txt",
             "user_reply.txt",
             "result_summary.md",
             "tool_runs.jsonl",
         ):
+            if name in preserved:
+                continue
             path = tasks_dir / name
             if path.exists():
                 try:

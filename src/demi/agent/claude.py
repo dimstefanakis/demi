@@ -56,6 +56,14 @@ INTERACTION_SESSION_KEY = "claude_session"
 TOOL_SEARCH_ENV_KEY = "ENABLE_TOOL_SEARCH"
 MEMORY_TOOL_ENABLED_ENV_KEY = "CLAUDE_CODE_ENABLE_MEMORY_TOOL"
 MEMORY_TOOL_PATH_ENV_KEY = "CLAUDE_CODE_MEMORY_FILE_PATH"
+DEFAULT_EXECUTION_ROLE = "execution"
+PROJECT_MANAGER_ROLE = "project_manager"
+LEAD_PROJECT_MANAGER_ROLE = "lead_project_manager"
+SUPPORTED_EXECUTION_ROLES = {
+    DEFAULT_EXECUTION_ROLE,
+    PROJECT_MANAGER_ROLE,
+    LEAD_PROJECT_MANAGER_ROLE,
+}
 
 
 @dataclass
@@ -146,6 +154,8 @@ class ClaudeAgent:
         UNSPLASH_SEARCH_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__should_send_message",
         f"mcp__{CHAT_SERVER_NAME}__check_for_status",
+        f"mcp__{CHAT_SERVER_NAME}__find_project_manager",
+        f"mcp__{CHAT_SERVER_NAME}__trigger_project_manager",
         f"mcp__{CHAT_SERVER_NAME}__ack_inflight_updates",
         SEND_MESSAGE_TOOL,
         f"mcp__{CHAT_SERVER_NAME}__send_payment_link",
@@ -201,6 +211,56 @@ class ClaudeAgent:
             return None
         value = str(raw).strip()
         return value or None
+
+    @staticmethod
+    def _normalize_execution_role(raw: Any | None) -> str:
+        value = str(raw or "").strip().lower()
+        if value in SUPPORTED_EXECUTION_ROLES:
+            return value
+        return DEFAULT_EXECUTION_ROLE
+
+    @classmethod
+    def _resolve_run_execution_role(
+        cls,
+        *,
+        db: Any | None,
+        run_id: int | None,
+    ) -> str:
+        if db is None or run_id is None:
+            return DEFAULT_EXECUTION_ROLE
+        try:
+            run_row = db.get_run(int(run_id))
+        except Exception:
+            run_row = None
+        if not isinstance(run_row, dict):
+            return DEFAULT_EXECUTION_ROLE
+        return cls._normalize_execution_role(run_row.get("run_role"))
+
+    @classmethod
+    def _execution_role_profile(
+        cls,
+        *,
+        settings: Settings,
+        run_role: str,
+    ) -> tuple[Path, str, int | None]:
+        role = cls._normalize_execution_role(run_role)
+        if role == PROJECT_MANAGER_ROLE:
+            return (
+                settings.project_manager_prompt_path,
+                settings.project_manager_model,
+                settings.project_manager_thinking_max_tokens(),
+            )
+        if role == LEAD_PROJECT_MANAGER_ROLE:
+            return (
+                settings.lead_project_manager_prompt_path,
+                settings.lead_project_manager_model,
+                settings.lead_project_manager_thinking_max_tokens(),
+            )
+        return (
+            settings.claude_prompt_path,
+            settings.execution_model,
+            settings.execution_thinking_max_tokens(),
+        )
 
     @classmethod
     def _stop_reason_status(
@@ -688,6 +748,7 @@ class ClaudeAgent:
         runtime_env: dict[str, str] | None = None,
         execution_context: str | None = None,
     ) -> AgentResult:
+        run_execution_role = self._resolve_run_execution_role(db=db, run_id=run_id)
         chat_server = build_chat_server(
             ChatToolContext(
                 messenger=messenger,
@@ -701,9 +762,14 @@ class ClaudeAgent:
                 role="primary",
                 run_id=run_id,
                 execution_context=execution_context,
+                run_role=run_execution_role,
             )
         )
         settings = Settings()
+        prompt_path, execution_model, execution_thinking_tokens = self._execution_role_profile(
+            settings=settings,
+            run_role=run_execution_role,
+        )
         tooling_result = None
         try:
             tooling_result = await asyncio.to_thread(
@@ -761,7 +827,11 @@ class ClaudeAgent:
             runtime_env=runtime_env,
             tooling_bin_path=tooling_result.bin_path if tooling_result is not None else None,
         )
-        prompt = self._build_prompt(task_path=task_path, memory_path=workspace.memory_path)
+        prompt = self._build_prompt(
+            task_path=task_path,
+            memory_path=workspace.memory_path,
+            prompt_path=prompt_path,
+        )
         log_agent_event(
             workspace.tasks_dir,
             "run_start",
@@ -769,6 +839,8 @@ class ClaudeAgent:
                 "task_path": str(task_path),
                 "session_id": session_id,
                 "message": (message.text or "").strip(),
+                "run_role": run_execution_role,
+                "model": execution_model,
             },
         )
 
@@ -780,8 +852,8 @@ class ClaudeAgent:
                 permission_mode=self.permission_mode,
                 system_prompt=self.system_prompt,
                 setting_sources=self.setting_sources,
-                model=settings.execution_model,
-                max_thinking_tokens=settings.execution_thinking_max_tokens(),
+                model=execution_model,
+                max_thinking_tokens=execution_thinking_tokens,
                 resume=resume_session_id or None,
                 cwd=workspace.root,
                 add_dirs=self._execution_add_dirs(workspace),
@@ -804,6 +876,7 @@ class ClaudeAgent:
                     "session_id": resume_session_id or "default",
                     "task_path": str(task_path),
                     "resuming": bool(resume_session_id),
+                    "run_role": run_execution_role,
                 },
             )
             summary = None
@@ -864,7 +937,10 @@ class ClaudeAgent:
                                         )
                                     except Exception:
                                         pass
-                            if tenant_id is not None:
+                            if (
+                                tenant_id is not None
+                                and run_execution_role == DEFAULT_EXECUTION_ROLE
+                            ):
                                 try:
                                     db.update_tenant_session(int(tenant_id), str(new_session_id))
                                 except Exception:
@@ -2014,9 +2090,14 @@ class ClaudeAgent:
         return data if isinstance(data, dict) else None
 
     @staticmethod
-    def _build_prompt(task_path: Path, memory_path: Path) -> str:
+    def _build_prompt(
+        task_path: Path,
+        memory_path: Path,
+        prompt_path: Path | None = None,
+    ) -> str:
         settings = Settings()
-        template = ClaudeAgent._load_prompt_file(settings.claude_prompt_path)
+        resolved_prompt_path = prompt_path or settings.claude_prompt_path
+        template = ClaudeAgent._load_prompt_file(resolved_prompt_path)
         event_url = settings.event_url or "not configured"
         agent_email = str(settings.agent_email or "").strip() or "not configured"
         memory_snapshot = ClaudeAgent._read_memory_snapshot(memory_path)

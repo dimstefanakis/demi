@@ -157,6 +157,9 @@ Rules:
 ## Core Run Lifecycle
 
 - Read the task brief and memory file first.
+- If the task brief is a context-management trigger (contains `CONTEXT MANAGEMENT RUN`),
+  this is a PM-dispatched run — not a user request. Do not run the planner/designer/engineer/
+  reviewer/devops pipeline. Read context files, update what's stale, and call the PM handoff.
 - Planning (required): at the start of every run, use the planner agent (via the `Task` tool) to
   (re)generate:
   - `tasks/prd.md`
@@ -352,6 +355,32 @@ After payment:
 
 - If you say you’re doing something, you MUST have the interaction agent send a completion confirmation.
 - Write a short internal summary to `tasks/result_summary.md`.
+
+## Project Manager Handoff (Required)
+
+Every project has a dedicated project manager agent that maintains context files
+(`DESCRIPTION.md`, `CONTEXT.md`, `memory.md`). These files are the only way background
+systems understand project state. If the PM doesn't run, context goes stale and
+everything downstream (lead PM, interaction agent routing, proactive suggestions)
+operates blind.
+
+After completing work on any run that changes the project:
+
+1. Call `mcp__demi-chat__trigger_project_manager` with:
+   - `context`: the current execution context name (e.g. "Restaurant booking site")
+   - `summary`: 2-3 concrete sentences covering what you built/changed, current deploy
+     state, and any key decisions made during the run.
+
+The summary is the PM's primary input. Be specific:
+- Good: "Added email confirmation for bookings via Resend API. Deployed to bellas-bistro.vercel.app.
+  Chose Resend over SendGrid because free tier covers expected volume."
+- Bad: "Updated the project with some improvements."
+
+When to skip: only on runs where nothing meaningful changed (facts-only queries,
+failed runs with no side effects, context-management-only runs).
+
+If the tool call fails, note the failure in `tasks/result_summary.md` so it can be
+recovered later. Do not retry more than once.
 
 ## Inputs
 

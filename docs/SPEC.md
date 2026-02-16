@@ -47,9 +47,9 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
 │ interaction_sessions,        │   │                                         │
 │ interaction_session_inputs,  │   │                                         │
 │ execution_stream_inputs,     │   │                                         │
+│ execution_agents (role),     │   │                                         │
 │ tenant_state, tenant_events, │   │                                         │
-│ event_jobs, pm_heartbeats,   │   │                                         │
-│ pm_actions                   │   │                                         │
+│ event_jobs                   │   │                                         │
 └───────────────┬──────────────┘   └────────────────────────────────────────┘
                 │
         ┌───────▼────────────────────────────────────────────────────────────┐
@@ -102,7 +102,7 @@ Background workers (poll main DB):
 - PendingWorker -> drains run_inputs into next run
 - OutboxWorker -> sends deferred Telegram messages with retry/backoff and stale-send reclaim
 - SchedulerWorker -> evaluates trigger mesh and enqueues event_jobs
-- PMWorker -> consumes `pm_trigger` jobs for proactive PM triage/actions
+- PMWorker -> consumes `pm_trigger` jobs for PM dispatch and health self-healing
 ```
 
 ### Technology Stack
@@ -190,11 +190,21 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 - `API_EMBEDDED_WORKERS_ENABLED` controls whether API processes run background workers
   in-process; production blue/green deploys should disable this on API and enable workers
   only in the dedicated worker container
-- Model routing defaults to `EXECUTION_MODEL=claude-sonnet-4-5-20250929` and
-  `INTERACTION_MODEL=claude-opus-4-6`; interaction calls can use adaptive thinking via
-  `INTERACTION_MAX_THINKING_TOKENS`
+- Model routing defaults:
+  - `EXECUTION_MODEL=claude-sonnet-4-5-20250929`
+  - `INTERACTION_MODEL=claude-opus-4-6`
+  - `PROJECT_MANAGER_MODEL=claude-sonnet-4-5-20250929`
+  - `LEAD_PROJECT_MANAGER_MODEL=claude-opus-4-6`
+- Interaction calls can use adaptive thinking via `INTERACTION_MAX_THINKING_TOKENS`
 - Execution calls can use adaptive thinking via `EXECUTION_MAX_THINKING_TOKENS`
   (default `2048`; values <=0 disable it, values between 1-1023 are clamped to 1024)
+- PM role runs can use adaptive thinking via:
+  - `PROJECT_MANAGER_MAX_THINKING_TOKENS` (default `10000`)
+  - `LEAD_PROJECT_MANAGER_MAX_THINKING_TOKENS` (default `10000`)
+- Role-specific execution prompts:
+  - `prompts/claude_agent.md` for role `execution`
+  - `prompts/project_manager_agent.md` for role `project_manager`
+  - `prompts/lead_project_manager_agent.md` for role `lead_project_manager`
 - Execution subagents:
   - `planner` runs before implementation to write `tasks/prd.md` and `tasks/test_plan.md`
   - `product-designer` handles Gemini-driven design/application of visual direction
@@ -236,9 +246,6 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
   - `PM_HEALTH_CHECK_CRON`
   - `PM_FIRST_HEARTBEAT_CRON`
   - `PM_TIMEZONE`
-  - `PM_MESSAGE_COOLDOWN_SECONDS`
-  - `PM_IDLE_THRESHOLD_HOURS`
-  - `PM_FIRST_HEARTBEAT_MIN_MESSAGES`
 - Outbox retry controls:
   - `OUTBOX_SEND_TIMEOUT_SECONDS` (default `600`)
   - `OUTBOX_MAX_ATTEMPTS` (default `12`)
@@ -381,6 +388,12 @@ Execution and interaction sessions are tracked separately:
 - Execution session IDs: `tenants.session_id` (used by `prepare_context` runs).
 - Interaction session IDs (routing and instruction unified):
   `tenant_state(namespace='interaction', key='claude_session')`.
+- Execution agents are role-scoped:
+  - `execution_agents.role` is one of `execution`, `project_manager`, `lead_project_manager`
+  - uniqueness is `(tenant_id, context, role)` so each role has an isolated session lane
+- Runs persist their lane in `runs.run_role` and resolve role-specific prompts/models at runtime.
+- Only `run_role='execution'` updates `tenants.session_id`; PM-role runs persist session state on
+  their own execution-agent rows.
 - Execution session cache files are written under `<tenant_root>/.execution_home/` by setting
   `HOME` for execution runs. In Docker, this resolves to `/workspace/.execution_home/` and is
   persisted via the tenant workspace bind mount so SDK `resume` works across fresh containers.
@@ -570,20 +583,20 @@ Background workers poll the main DB and run in the API process or the worker con
   - `state_change` watches tenant state values (`namespace/key/path`)
   - optional time windows (`start/end/timezone`)
   - optional retry windows/backoff metadata attached to event payloads
-- PMWorker: Claims `event_jobs` with `job_type='pm_trigger'`, performs low-cost PM triage,
-  records heartbeats/actions (`pm_heartbeats`, `pm_actions`), updates tenant `pm_state.json`,
-  auto-fixes conversation health issues, and enqueues proactive PM suggestions via outbox.
+- PMWorker: Claims `event_jobs` with `job_type='pm_trigger'` and acts as a thin dispatcher.
+  Non-health triggers are routed into orchestrator event execution with explicit roles:
+  - `role='project_manager'` for per-project PM updates
+  - `role='lead_project_manager'` for tenant-root PM heartbeat analysis
+  - Scheduler `run_completed` PM triggers without an explicit role are skipped to avoid
+    duplicate PM runs when prompt-first project PM handoff already fired.
+  Health checks stay code-level and auto-fix:
+  - stale `received` messages
+  - zombie runs
+  - failed outbox rows (excluding terminal failures)
+  - stale queued run inputs
   API/worker startup also runs an idempotent PM backfill for tenants with existing deploy URLs.
   PM webhook-condition triggers are initialized with the current tenant event cursor so enabling
   PM does not replay historical `tenant_events` backlog.
-  First-heartbeat onboarding does not require a user message-count threshold.
-  Deploy-related triggers always request a QA action; URL/timestamp freshness suppression is not hardcoded.
-  First-heartbeat onboarding trigger is only disabled after successful onboarding actions
-  (for example QA pass and suggestion enqueue), so failed onboarding attempts keep retrying.
-  PM suggestion enqueue failures fail the trigger job so the scheduler retry path can recover.
-  Outbox health requeue skips terminal failures (invalid payload errors and exhausted attempts)
-  to avoid endless retry churn.
-  Health checks are constrained to the PM trigger time window.
 - Worker loop resilience: Event/Pending/Outbox/Scheduler/PM loops treat transient DB/API errors
   as recoverable, log the exception, back off, and continue polling instead of exiting.
 
@@ -603,6 +616,7 @@ MCP servers are registered per agent run.
   `stream_to_execution_agent`, `stop_execution_agent`, `ack_inflight_updates`, `record_deploy`,
   `record_domain_quote`, `record_billing_status`, `send_payment_link`,
   `request_backend_subscription`, `request_assistant_subscription`, `decide_project`,
+  `find_project_manager`, `trigger_project_manager`,
   `set_testing_mode`, `register_scheduler_trigger`, `list_scheduler_triggers`,
   `unregister_scheduler_trigger`
 - `demi-unsplash`: `search_photos` (Unsplash sourcing)

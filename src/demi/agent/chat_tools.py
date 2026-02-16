@@ -26,6 +26,66 @@ SCHEDULER_NAMESPACE = "scheduler"
 SCHEDULER_TRIGGER_PREFIX = "trigger:"
 
 
+def _db_get_inflight_run_with_role(
+    db: Any,
+    tenant_id: int,
+    *,
+    project_name: str | None = None,
+    run_role: str = "execution",
+) -> Any:
+    # Compatibility shim for staggered deploys where DB adapters may not yet
+    # accept the `run_role` keyword.
+    try:
+        return db.get_inflight_run(tenant_id, project_name, run_role=run_role)
+    except TypeError:
+        return db.get_inflight_run(tenant_id, project_name)
+
+
+def _db_list_execution_agents_with_role(
+    db: Any,
+    tenant_id: int,
+    *,
+    include_inactive: bool = False,
+    limit: int = 50,
+    role: str = "execution",
+) -> list[dict[str, Any]]:
+    # Compatibility shim for DB adapters without role-aware list support.
+    try:
+        return db.list_execution_agents(
+            tenant_id,
+            include_inactive=include_inactive,
+            limit=limit,
+            role=role,
+        )
+    except TypeError:
+        return db.list_execution_agents(
+            tenant_id,
+            include_inactive=include_inactive,
+            limit=limit,
+        )
+
+
+def _db_ensure_execution_agent_with_role(
+    db: Any,
+    *,
+    tenant_id: int,
+    context: str | None,
+    role: str,
+) -> dict[str, Any] | None:
+    # Compatibility shim for DB adapters without role-aware ensure support.
+    try:
+        return db.ensure_execution_agent(
+            tenant_id=tenant_id,
+            context=context,
+            role=role,
+        )
+    except TypeError:
+        return db.ensure_execution_agent(
+            tenant_id=tenant_id,
+            context=context,
+        )
+
+
 @dataclass(frozen=True)
 class ChatToolContext:
     messenger: Any
@@ -41,6 +101,7 @@ class ChatToolContext:
     run_id: int | None = None
     message_id: int | None = None
     execution_context: str | None = None
+    run_role: str | None = None
     on_interaction_message_sent: Callable[[], None] | None = None
 
 
@@ -401,7 +462,12 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": json.dumps(payload)}],
                 "is_error": True,
             }
-        run = context.db.get_inflight_run(context.tenant_id, None)
+        run = _db_get_inflight_run_with_role(
+            context.db,
+            int(context.tenant_id),
+            project_name=None,
+            run_role="execution",
+        )
         queued = context.db.count_run_inputs(context.tenant_id, status="queued")
         payload = {
             "ok": True,
@@ -438,10 +504,12 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
         include_inactive = bool(args.get("include_inactive", False))
         try:
-            rows = context.db.list_execution_agents(
-                tenant_id,
+            rows = _db_list_execution_agents_with_role(
+                context.db,
+                int(tenant_id),
                 include_inactive=include_inactive,
                 limit=50,
+                role="execution",
             )
         except Exception as exc:  # noqa: BLE001
             payload = {"ok": False, "status": "error", "error": str(exc)}
@@ -452,9 +520,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
         if not rows:
             try:
-                default_row = context.db.ensure_execution_agent(
-                    tenant_id=tenant_id,
+                default_row = _db_ensure_execution_agent_with_role(
+                    context.db,
+                    tenant_id=int(tenant_id),
                     context="Main project",
+                    role="execution",
                 )
             except Exception:
                 default_row = None
@@ -547,9 +617,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             )
             if wants_context_change and not rename_existing:
                 try:
-                    row = context.db.ensure_execution_agent(
-                        tenant_id=tenant_id,
+                    row = _db_ensure_execution_agent_with_role(
+                        context.db,
+                        tenant_id=int(tenant_id),
                         context=context_text,
+                        role="execution",
                     )
                     if status or archived is not None:
                         row = context.db.update_execution_agent(
@@ -599,9 +671,11 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 }
         else:
             try:
-                row = context.db.ensure_execution_agent(
-                    tenant_id=tenant_id,
+                row = _db_ensure_execution_agent_with_role(
+                    context.db,
+                    tenant_id=int(tenant_id),
                     context=context_text,
+                    role="execution",
                 )
                 if status or archived is not None:
                     row = context.db.update_execution_agent(
@@ -683,6 +757,154 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             }
         payload = {"ok": True, "count": len(agents), "agents": agents}
         _log("find_execution_agent", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "find_project_manager",
+        "Find or create the project manager agent for a project context.",
+        {"context": str},
+    )
+    async def find_project_manager(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("find_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            payload = {"ok": False, "status": "missing_tenant"}
+            _log("find_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        context_text = str(args.get("context") or "").strip()
+        if not context_text:
+            context_text = str(context.execution_context or "").strip() or "Main project"
+        try:
+            row = _db_ensure_execution_agent_with_role(
+                context.db,
+                tenant_id=int(tenant_id),
+                context=context_text,
+                role="project_manager",
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("find_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        if not isinstance(row, dict):
+            payload = {"ok": False, "status": "not_found"}
+            _log("find_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        payload = {
+            "ok": True,
+            "agent": {
+                "execution_agent_id": row.get("id"),
+                "context": row.get("context"),
+                "role": str(row.get("role") or "project_manager"),
+                "status": row.get("status"),
+                "has_session": bool(str(row.get("session_id") or "").strip()),
+                "last_run_id": row.get("last_run_id"),
+                "updated_at": row.get("updated_at"),
+            },
+        }
+        _log("find_project_manager", args, result=payload, start=start)
+        return {
+            "content": [{"type": "text", "text": json.dumps(payload)}],
+            "is_error": False,
+        }
+
+    @tool(
+        "trigger_project_manager",
+        "Trigger a project manager run with a summary of what changed.",
+        {"context": str, "summary": str},
+    )
+    async def trigger_project_manager(args: dict[str, Any]) -> dict[str, Any]:
+        start = time.monotonic()
+        if context.db is None:
+            payload = {"ok": False, "status": "missing_db"}
+            _log("trigger_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            payload = {"ok": False, "status": "missing_tenant"}
+            _log("trigger_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        context_text = str(args.get("context") or "").strip()
+        if not context_text:
+            context_text = str(context.execution_context or "").strip() or "Main project"
+        summary = str(args.get("summary") or "").strip()
+        if not summary:
+            payload = {"ok": False, "status": "missing_summary"}
+            _log("trigger_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        try:
+            pm_agent = _db_ensure_execution_agent_with_role(
+                context.db,
+                tenant_id=int(tenant_id),
+                context=context_text,
+                role="project_manager",
+            )
+            pm_agent_id = int(pm_agent.get("id")) if isinstance(pm_agent, dict) else None
+        except Exception:
+            pm_agent_id = None
+        event_payload = {
+            "intent": "pm_post_execution_update",
+            "event_type": "pm_trigger",
+            "role": "project_manager",
+            "execution_context": context_text,
+            "execution_agent_id": pm_agent_id,
+            "payload": {
+                "trigger": "post_execution_update",
+                "summary": summary,
+                "source_run_id": _current_run_id(context),
+                "source_context": str(context.execution_context or "").strip() or None,
+                "source_run_role": str(context.run_role or "").strip() or None,
+            },
+        }
+        try:
+            job_id = context.db.create_event_job(
+                tenant_id=int(tenant_id),
+                job_type="pm_trigger",
+                payload=event_payload,
+            )
+        except Exception as exc:  # noqa: BLE001
+            payload = {"ok": False, "status": "error", "error": str(exc)}
+            _log("trigger_project_manager", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": True,
+            }
+        payload = {
+            "ok": True,
+            "status": "queued",
+            "job_id": int(job_id),
+            "role": "project_manager",
+            "execution_context": context_text,
+            "execution_agent_id": pm_agent_id,
+        }
+        _log("trigger_project_manager", args, result=payload, start=start)
         return {
             "content": [{"type": "text", "text": json.dumps(payload)}],
             "is_error": False,
@@ -2315,6 +2537,8 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         check_for_status,
         list_execution_contexts,
         upsert_execution_context,
+        find_project_manager,
+        trigger_project_manager,
         find_execution_agent,
         stream_to_execution_agent,
         stop_execution_agent,
@@ -2444,7 +2668,12 @@ def _current_run_id(context: ChatToolContext) -> int | None:
             return None
     if context.db is None or context.tenant_id is None:
         return None
-    inflight = context.db.get_inflight_run(context.tenant_id, None)
+    inflight = _db_get_inflight_run_with_role(
+        context.db,
+        int(context.tenant_id),
+        project_name=None,
+        run_role="execution",
+    )
     if not inflight:
         return None
     try:
