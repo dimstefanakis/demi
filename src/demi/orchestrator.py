@@ -1849,8 +1849,16 @@ class Orchestrator:
             result_total_cost = getattr(agent_result, "total_cost_usd", None)
             result_usage = getattr(agent_result, "usage", None)
             has_usage_signal = result_total_cost is not None or result_usage is not None
-            if has_usage_signal and not self._usage_has_activity(result_total_cost, result_usage):
-                raise RuntimeError("agent_result_no_usage_activity")
+            has_usage_activity = self._usage_has_activity(result_total_cost, result_usage)
+            tool_summary = self._build_tool_summary(workspace.tasks_dir)
+            tool_runs = self._read_tool_runs(workspace.tasks_dir)
+            if has_usage_signal and not has_usage_activity:
+                if not self._run_has_non_usage_activity(
+                    workspace.tasks_dir,
+                    tool_summary=tool_summary,
+                    tool_runs=tool_runs,
+                ):
+                    raise RuntimeError("agent_result_no_usage_activity")
             if agent_result.session_id:
                 resolved_execution_agent_id = self._resolve_execution_agent_id_for_context(
                     tenant_id=int(tenant.id),
@@ -1885,9 +1893,7 @@ class Orchestrator:
                 usage_key="primary",
             )
             self.db.update_run_result_summary(run_id, getattr(agent_result, "summary", None))
-            tool_summary = self._build_tool_summary(workspace.tasks_dir)
             self.db.update_run_tool_summary(run_id, tool_summary)
-            tool_runs = self._read_tool_runs(workspace.tasks_dir)
             self.db.update_run_tool_runs(run_id, tool_runs)
             self._write_run_result(
                 workspace.tasks_dir,
@@ -3519,9 +3525,23 @@ class Orchestrator:
         return 0.0
 
     @classmethod
-    def _usage_has_activity(cls, total_cost: Any, usage: Any) -> bool:
-        if cls._numeric_usage_value(total_cost) > 0:
-            return True
+    def _usage_payload_has_activity(cls, usage: Any, *, _depth: int = 0) -> bool:
+        if _depth > 8 or usage is None:
+            return False
+        if isinstance(usage, str):
+            raw = usage.strip()
+            if not raw:
+                return False
+            try:
+                parsed = json.loads(raw)
+            except json.JSONDecodeError:
+                return False
+            return cls._usage_payload_has_activity(parsed, _depth=_depth + 1)
+        if isinstance(usage, list):
+            for item in usage:
+                if cls._usage_payload_has_activity(item, _depth=_depth + 1):
+                    return True
+            return False
         if not isinstance(usage, dict):
             return False
         token_keys = (
@@ -3529,6 +3549,8 @@ class Orchestrator:
             "output_tokens",
             "cache_creation_input_tokens",
             "cache_read_input_tokens",
+            "total_tokens",
+            "total_cost_usd",
         )
         for key in token_keys:
             if cls._numeric_usage_value(usage.get(key)) > 0:
@@ -3538,6 +3560,45 @@ class Orchestrator:
             for key in ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"):
                 if cls._numeric_usage_value(cache_creation.get(key)) > 0:
                     return True
+        for value in usage.values():
+            if isinstance(value, (dict, list, str)) and cls._usage_payload_has_activity(
+                value, _depth=_depth + 1
+            ):
+                return True
+        return False
+
+    @classmethod
+    def _usage_has_activity(cls, total_cost: Any, usage: Any) -> bool:
+        if cls._numeric_usage_value(total_cost) > 0:
+            return True
+        return cls._usage_payload_has_activity(usage)
+
+    @classmethod
+    def _run_has_non_usage_activity(
+        cls,
+        tasks_dir: Path,
+        *,
+        tool_summary: dict[str, Any] | None,
+        tool_runs: list[dict[str, Any]] | None,
+    ) -> bool:
+        if isinstance(tool_runs, list) and tool_runs:
+            return True
+        if isinstance(tool_summary, dict):
+            if cls._numeric_usage_value(tool_summary.get("count")) > 0:
+                return True
+            tools = tool_summary.get("tools")
+            if isinstance(tools, dict):
+                for entry in tools.values():
+                    if not isinstance(entry, dict):
+                        continue
+                    if cls._numeric_usage_value(entry.get("count")) > 0:
+                        return True
+        outbound_path = tasks_dir / "outbound_messages.jsonl"
+        try:
+            if outbound_path.exists() and outbound_path.stat().st_size > 0:
+                return True
+        except OSError:
+            return False
         return False
 
     def _reconcile_inflight_run(self, tenant: Any, run: Any, workspace: Workspace) -> bool:
@@ -3590,11 +3651,17 @@ class Orchestrator:
         usage = payload.get("usage")
         summary = payload.get("summary")
         tool_summary = payload.get("tool_summary")
+        tool_runs = self._read_tool_runs(workspace.tasks_dir)
         has_usage_signal = total_cost is not None or usage is not None
         has_usage_activity = self._usage_has_activity(total_cost, usage)
         if not error and has_usage_signal and not has_usage_activity:
-            error = "agent_result_no_usage_activity"
-            status = "failed"
+            if not self._run_has_non_usage_activity(
+                workspace.tasks_dir,
+                tool_summary=tool_summary,
+                tool_runs=tool_runs,
+            ):
+                error = "agent_result_no_usage_activity"
+                status = "failed"
         if (total_cost is not None or usage is not None) and not self._primary_usage_recorded(
             run_id, total_cost, usage
         ):
@@ -3608,7 +3675,6 @@ class Orchestrator:
             self.db.update_run_result_summary(run_id, summary)
         if tool_summary is not None:
             self.db.update_run_tool_summary(run_id, tool_summary)
-        tool_runs = self._read_tool_runs(workspace.tasks_dir)
         if tool_runs is not None:
             self.db.update_run_tool_runs(run_id, tool_runs)
         self.db.finish_run(run_id, status=status, error=error)
@@ -3651,7 +3717,7 @@ class Orchestrator:
                 self._set_execution_session_id(tenant.id, session_id)
             if run_execution_role == DEFAULT_EXECUTION_ROLE:
                 self.db.update_tenant_session(tenant.id, session_id)
-        elif status == "failed" and has_usage_signal and not has_usage_activity:
+        elif status == "failed" and error == "agent_result_no_usage_activity":
             resolved_execution_agent_id = self._resolve_execution_agent_id_for_context(
                 tenant_id=int(tenant.id),
                 execution_agent_id=run_execution_agent_id,

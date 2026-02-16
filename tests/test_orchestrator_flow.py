@@ -203,6 +203,43 @@ class EmptyUsageAgent(FakeAgent):
         )()
 
 
+class EmptyUsageWithToolActivityAgent(EmptyUsageAgent):
+    async def prepare_context(
+        self,
+        workspace,
+        task_path,
+        message,
+        messenger=None,
+        inflight_stream=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        run_id=None,
+        runtime_env=None,
+        execution_context=None,
+    ):
+        result = await super().prepare_context(
+            workspace=workspace,
+            task_path=task_path,
+            message=message,
+            messenger=messenger,
+            inflight_stream=inflight_stream,
+            tenant_id=tenant_id,
+            db=db,
+            payments=payments,
+            session_id=session_id,
+            run_id=run_id,
+            runtime_env=runtime_env,
+            execution_context=execution_context,
+        )
+        (workspace.tasks_dir / "tool_runs.jsonl").write_text(
+            json.dumps({"tool": "send_message", "result": {"status": "queued"}}) + "\n",
+            encoding="utf-8",
+        )
+        return result
+
+
 class RetryPolicyFailingAgent(FailingAgent):
     def __init__(self, error: Exception, retry_policy: dict):
         super().__init__(error)
@@ -1085,6 +1122,141 @@ async def test_orchestrator_reconcile_zero_usage_result_marks_failed_and_clears_
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_reconcile_wrapped_usage_payload_marks_completed(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="reconcile-wrapped-usage-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="hello",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id, message_id=message_id, project_name=workspace.project_name
+    )
+
+    payload = {
+        "run_id": run_id,
+        "session_id": "session-wrapped-usage",
+        "summary": "ok",
+        "total_cost_usd": None,
+        "usage": {
+            "primary": [
+                {
+                    "input_tokens": 11,
+                    "output_tokens": 7,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                }
+            ]
+        },
+        "stop_reason": None,
+        "result_subtype": "success",
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(payload))
+
+    new_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="reconcile-wrapped-usage-2",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="continue",
+        images=[],
+        raw={},
+    )
+    result = await orchestrator.handle_message(new_msg)
+
+    assert result.status == "accepted"
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "completed"
+    assert run_row["error"] is None
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_reconcile_zero_usage_with_tool_activity_marks_completed(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="reconcile-tool-activity-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="hello",
+        images=[],
+        raw={},
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    db.update_message_status(message_id, "processing")
+    run_id = db.create_run(
+        tenant.id, message_id=message_id, project_name=workspace.project_name
+    )
+
+    payload = {
+        "run_id": run_id,
+        "session_id": "session-tool-activity",
+        "summary": "ok",
+        "total_cost_usd": 0,
+        "usage": {
+            "input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "output_tokens": 0,
+            "cache_creation": {"ephemeral_1h_input_tokens": 0, "ephemeral_5m_input_tokens": 0},
+        },
+        "stop_reason": None,
+        "result_subtype": "success",
+    }
+    (workspace.tasks_dir / "run_result.json").write_text(json.dumps(payload))
+    (workspace.tasks_dir / "tool_runs.jsonl").write_text(
+        json.dumps({"tool": "send_message", "result": {"sent": True}}) + "\n",
+        encoding="utf-8",
+    )
+
+    new_msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="reconcile-tool-activity-2",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="continue",
+        images=[],
+        raw={},
+    )
+    result = await orchestrator.handle_message(new_msg)
+
+    assert result.status == "accepted"
+    run_row = db.get_run(run_id)
+    assert run_row["status"] == "completed"
+    assert run_row["error"] is None
+
+
+@pytest.mark.asyncio
 async def test_orchestrator_reconcile_does_not_double_count_usage(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
@@ -1758,6 +1930,52 @@ async def test_orchestrator_run_input_zero_usage_result_requeues_and_clears_sess
     stored = db.get_message(message_id)
     assert stored is not None
     assert stored["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_run_input_zero_usage_with_tool_activity_completes(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = EmptyUsageWithToolActivityAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="queued-empty-usage-tool-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Queue this and complete with tool activity",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    await orchestrator._drain_run_inputs(tenant)
+
+    queued = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert not queued
+    runs = db.list_recent_runs(tenant.id, project_name=workspace.project_name, limit=1)
+    assert runs
+    assert runs[0]["status"] == "completed"
+    assert runs[0]["error"] is None
+    stored = db.get_message(message_id)
+    assert stored is not None
+    assert stored["status"] == "processed"
 
 
 @pytest.mark.asyncio

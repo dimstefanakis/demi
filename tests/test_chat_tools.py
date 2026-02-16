@@ -120,6 +120,67 @@ def test_send_message_tool_sends_once_for_new_text(tmp_path):
     assert len(messenger.sent) == 1
 
 
+def test_send_message_dedupes_by_correlation_id(tmp_path):
+    db = build_test_db()
+    tenant = create_test_tenant(db)
+    message_id, _ = create_message(
+        db,
+        tenant.id,
+        provider="telegram",
+        provider_message_id="msg-corr-1",
+        tenant_external_id=tenant.external_id,
+        text="Ship it",
+    )
+    run_id = db.create_run(tenant.id, message_id=message_id, project_name="main")
+    tasks_dir = tmp_path / "tasks"
+    tasks_dir.mkdir(parents=True, exist_ok=True)
+    messenger = FakeMessenger()
+    tools = build_chat_tools(
+        ChatToolContext(
+            messenger=messenger,
+            tenant_external_id=tenant.external_id,
+            tasks_dir=tasks_dir,
+            role="interaction",
+            db=db,
+            tenant_id=tenant.id,
+            provider=tenant.provider,
+            run_id=run_id,
+            message_id=message_id,
+        )
+    )
+    send_tool = next(tool for tool in tools if tool.name == "send_message")
+
+    asyncio.run(
+        send_tool.handler(
+            {
+                "text": "First wording.",
+                "final": True,
+                "correlation_id": "routing-msg-corr-1",
+            }
+        )
+    )
+    asyncio.run(
+        send_tool.handler(
+            {
+                "text": "Second wording should be deduped.",
+                "final": True,
+                "correlation_id": "routing-msg-corr-1",
+            }
+        )
+    )
+
+    assert len(messenger.sent) == 1
+    assert messenger.sent[0][1] == "First wording."
+    events = db.list_message_events(tenant.id, limit=20)
+    matching = [
+        row
+        for row in events
+        if isinstance(row.get("metadata_json"), dict)
+        and row["metadata_json"].get("correlation_id") == "routing-msg-corr-1"
+    ]
+    assert len(matching) == 1
+
+
 def test_send_message_interaction_triggers_stream_close_callback(tmp_path):
     tasks_dir = tmp_path / "tasks"
     messenger = FakeMessenger()

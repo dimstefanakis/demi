@@ -262,6 +262,21 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         except Exception:
             return
 
+    def _has_outbound_correlation(correlation_id: str) -> bool:
+        normalized = str(correlation_id or "").strip()
+        if not normalized or context.db is None:
+            return False
+        tenant_id = _resolve_tenant_id()
+        if tenant_id is None:
+            return False
+        checker = getattr(context.db, "has_outbound_message_event_correlation", None)
+        if not callable(checker):
+            return False
+        try:
+            return bool(checker(int(tenant_id), normalized))
+        except Exception:
+            return False
+
     def _interaction_context_payload() -> dict[str, Any] | None:
         path = context.tasks_dir / "interaction_context.json"
         if not path.exists():
@@ -1278,6 +1293,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
                 "content": [{"type": "text", "text": "Skipped empty message."}],
                 "is_error": False,
             }
+        correlation_id = str(args.get("correlation_id") or "").strip()
+        if not correlation_id and context.message_id is not None:
+            correlation_id = f"routing-{int(context.message_id)}"
+            args["correlation_id"] = correlation_id
+        if correlation_id and _has_outbound_correlation(correlation_id):
+            payload = {"skipped": "duplicate_correlation_id", "correlation_id": correlation_id}
+            _log("send_message", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         run_id = _current_run_id(context)
         if "checkout.stripe.com" in text:
             payload = {
@@ -1318,7 +1344,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             except Exception:
                 pass
         metadata: dict[str, Any] = {"final": final}
-        correlation_id = str(args.get("correlation_id") or "").strip()
         if correlation_id:
             metadata["correlation_id"] = correlation_id
         _record_outbound_event(
@@ -1484,6 +1509,17 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
         if not allowed_reply:
             reply_to_message_id = None
             reply_to_text = None
+        correlation_id = str(args.get("correlation_id") or "").strip()
+        if not correlation_id and context.message_id is not None:
+            correlation_id = f"routing-{int(context.message_id)}:payment"
+            args["correlation_id"] = correlation_id
+        if correlation_id and _has_outbound_correlation(correlation_id):
+            payload = {"skipped": "duplicate_correlation_id", "correlation_id": correlation_id}
+            _log("send_payment_link", args, result=payload, start=start)
+            return {
+                "content": [{"type": "text", "text": json.dumps(payload)}],
+                "is_error": False,
+            }
         order_id = None
         if args.get("order_id") is not None:
             try:
@@ -1565,7 +1601,6 @@ def build_chat_tools(context: ChatToolContext) -> list[SdkMcpTool[Any]]:
             "order_id": order_id,
             "source": source or None,
         }
-        correlation_id = str(args.get("correlation_id") or "").strip()
         if correlation_id:
             metadata["correlation_id"] = correlation_id
         _record_outbound_event(

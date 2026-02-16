@@ -835,6 +835,52 @@ class SupabaseDatabase:
         data = self._execute(query)
         return bool(data)
 
+    def has_outbound_message_event_correlation(
+        self,
+        tenant_id: int,
+        correlation_id: str,
+        *,
+        fallback_scan_limit: int = 200,
+    ) -> bool:
+        normalized = str(correlation_id or "").strip()
+        if not normalized:
+            return False
+        # Primary path: server-side JSON containment filter.
+        try:
+            query = (
+                self._table("message_events")
+                .select("id")
+                .eq("tenant_id", int(tenant_id))
+                .eq("direction", "outbound")
+                .contains("metadata_json", {"correlation_id": normalized})
+                .limit(1)
+            )
+            data = self._execute(query)
+            if data:
+                return True
+        except Exception:
+            pass
+        # Fallback for older PostgREST/query builders without jsonb contains.
+        try:
+            rows = self._execute(
+                self._table("message_events")
+                .select("metadata_json")
+                .eq("tenant_id", int(tenant_id))
+                .eq("direction", "outbound")
+                .order("created_at", desc=True)
+                .limit(max(1, int(fallback_scan_limit)))
+            )
+        except Exception:
+            return False
+        for row in rows or []:
+            metadata = row.get("metadata_json") if isinstance(row, dict) else None
+            if not isinstance(metadata, dict):
+                continue
+            candidate = str(metadata.get("correlation_id") or "").strip()
+            if candidate == normalized:
+                return True
+        return False
+
     def get_latest_message_received_at(self, tenant_id: int) -> str | None:
         query = (
             self._table("messages")

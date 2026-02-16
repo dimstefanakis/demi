@@ -507,6 +507,9 @@ Run selection when streaming to execution:
 8. The interaction agent replies to the user (if needed) and returns a routing decision (run/no-run, queue vs new run).
    - Interaction routing avoids implicit project switching; execution flow performs project-fit checks
      by reading per-project markdown context.
+   - Interaction `send_message`/`send_payment_link` calls are correlation-id idempotent: repeated
+     sends with the same `correlation_id` are skipped to prevent duplicate user messages when
+     routing retries occur.
    - If the decision includes a repo name, the orchestrator stores it in `tasks/repo_name.txt` for GitHub setup.
    - GitHub repo linkage is recovered from `github_repo.json` and, if missing, from local `site/.git` origin
      before creating a new repo name.
@@ -542,7 +545,8 @@ Run selection when streaming to execution:
     - Terminal stop reasons (`end_turn`, `stop_sequence`) are treated as successful completion unless
       `result_subtype` indicates an SDK error.
     - Execution outcomes that provide usage/cost fields but report zero activity are marked failed
-      (`agent_result_no_usage_activity`) instead of successful completion.
+      (`agent_result_no_usage_activity`) only when there is no non-usage run activity
+      (for example tool runs/outbound updates). Wrapped usage payloads are treated as activity.
     - Non-terminal execution stop reasons (for example `max_tokens`, `refusal`, `model_context_window_exceeded`)
       fail the run instead of being treated as successful completion.
 14. Any queued `run_inputs` are drained into the next run.
