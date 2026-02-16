@@ -79,7 +79,9 @@ class DockerAgent:
         session_id=None,
         run_id: int | None = None,
         runtime_env: dict[str, str] | None = None,
+        execution_context: str | None = None,
     ) -> AgentResult:
+        # Keep runtime parity with ClaudeAgent; docker entrypoint reads context from the run row.
         tenant_root = getattr(workspace, "tenant_root", workspace.root)
         result_path = workspace.tasks_dir / "run_result.json"
         outbound_path = workspace.tasks_dir / "outbound_messages.jsonl"
