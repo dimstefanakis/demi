@@ -4,6 +4,7 @@ from dataclasses import dataclass, replace, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any
+import hashlib
 import json
 import re
 import asyncio
@@ -47,6 +48,8 @@ VALID_EXECUTION_ROLES = {
     PROJECT_MANAGER_ROLE,
     LEAD_PROJECT_MANAGER_ROLE,
 }
+RETRY_POLICY_FILENAME = "retry_policy.json"
+RETRY_DEDUPE_KEY_PREFIX = "run_retry"
 
 
 @dataclass(frozen=True)
@@ -1818,6 +1821,7 @@ class Orchestrator:
         inflight_stream = self._ensure_inflight_stream(tenant.key, run_id=run_id)
         monitor = None
         monitor_task = None
+        agent_result: Any | None = None
         try:
             monitor = RunActivityMonitor(
                 db=self.db,
@@ -1923,7 +1927,28 @@ class Orchestrator:
             self._write_request_status(workspace, tenant)
             return OrchestratorResult(status="accepted")
         except Exception as exc:  # noqa: BLE001
-            retry_run_inputs = bool(run_input_ids)
+            retry_policy = self._resolve_retry_policy(
+                tasks_dir=workspace.tasks_dir,
+                agent_result=agent_result,
+            )
+            retry_run_inputs = bool(run_input_ids) and self._retry_requested(
+                provider=msg.provider,
+                retry_policy=retry_policy,
+            )
+            if retry_run_inputs and self._retry_dedupe_enabled(
+                provider=msg.provider,
+                retry_policy=retry_policy,
+            ):
+                retry_run_inputs = self._claim_retry_slot(
+                    tenant_id=int(tenant.id),
+                    run_id=int(run_id),
+                    message_id=int(message_id),
+                    provider=msg.provider,
+                    run_input_ids=run_input_ids or [],
+                    run_role=run_execution_role,
+                    execution_context=run_execution_context,
+                    retry_policy=retry_policy,
+                )
             if not self._primary_usage_recorded(run_id, None, None):
                 resolved_execution_agent_id = self._resolve_execution_agent_id_for_context(
                     tenant_id=int(tenant.id),
@@ -1980,10 +2005,10 @@ class Orchestrator:
                 msg.provider != "event"
                 and manage_message_status
                 and self._should_send_failure_notice(
-                tenant_id=tenant.id,
-                message_id=message_id,
-                retrying=retry_run_inputs,
-            )
+                    tenant_id=tenant.id,
+                    message_id=message_id,
+                    retrying=retry_run_inputs,
+                )
             ):
                 await self._send_interaction_instruction(
                     workspace=workspace,
@@ -2067,6 +2092,181 @@ class Orchestrator:
         except Exception:
             return True
         return failed_runs <= self.MAX_RETRY_FAILURE_NOTICES
+
+    @staticmethod
+    def _coerce_bool(value: Any) -> bool | None:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "y", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "n", "off"}:
+                return False
+        return None
+
+    @staticmethod
+    def _coerce_nonnegative_int(value: Any) -> int | None:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            return None
+        if parsed < 0:
+            return None
+        return parsed
+
+    @staticmethod
+    def _read_retry_policy_file(tasks_dir: Path) -> dict[str, Any] | None:
+        path = tasks_dir / RETRY_POLICY_FILENAME
+        if not path.exists():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        return payload if isinstance(payload, dict) else None
+
+    def _resolve_retry_policy(
+        self,
+        *,
+        tasks_dir: Path,
+        agent_result: Any | None,
+    ) -> dict[str, Any] | None:
+        if agent_result is not None:
+            raw = getattr(agent_result, "retry_policy", None)
+            if isinstance(raw, dict):
+                return dict(raw)
+        return self._read_retry_policy_file(tasks_dir)
+
+    def _retry_requested(
+        self,
+        *,
+        provider: str,
+        retry_policy: dict[str, Any] | None,
+    ) -> bool:
+        normalized_provider = str(provider or "").strip().lower()
+        if not isinstance(retry_policy, dict):
+            return normalized_provider != "event"
+        terminal = self._coerce_bool(retry_policy.get("terminal"))
+        if terminal is True:
+            return False
+        retryable = self._coerce_bool(retry_policy.get("retryable"))
+        if retryable is not None:
+            return retryable
+        if terminal is False:
+            return True
+        return normalized_provider != "event"
+
+    def _retry_dedupe_enabled(
+        self,
+        *,
+        provider: str,
+        retry_policy: dict[str, Any] | None,
+    ) -> bool:
+        if isinstance(retry_policy, dict):
+            explicit = self._coerce_bool(retry_policy.get("dedupe"))
+            if explicit is not None:
+                return explicit
+            key = str(retry_policy.get("dedupe_key") or "").strip()
+            if key:
+                return True
+        return str(provider or "").strip().lower() == "event"
+
+    def _retry_max_requeues(
+        self,
+        *,
+        provider: str,
+        retry_policy: dict[str, Any] | None,
+    ) -> int:
+        if isinstance(retry_policy, dict):
+            for candidate in ("max_requeues", "max_retries"):
+                parsed = self._coerce_nonnegative_int(retry_policy.get(candidate))
+                if parsed is not None:
+                    return parsed
+        if str(provider or "").strip().lower() == "event":
+            return 1
+        return 1
+
+    @staticmethod
+    def _retry_dedupe_key(
+        *,
+        message_id: int,
+        provider: str,
+        run_input_ids: list[str] | None,
+        run_role: str,
+        execution_context: str,
+        retry_policy: dict[str, Any] | None,
+    ) -> str:
+        if isinstance(retry_policy, dict):
+            raw_key = str(retry_policy.get("dedupe_key") or "").strip().lower()
+            if raw_key:
+                safe = re.sub(r"[^a-z0-9:_-]+", "-", raw_key).strip("-")
+                if safe:
+                    return f"{RETRY_DEDUPE_KEY_PREFIX}:{safe[:120]}"
+        seed_payload = {
+            "message_id": int(message_id),
+            "provider": str(provider or "").strip().lower(),
+            "run_input_ids": sorted(str(item) for item in (run_input_ids or []) if item),
+            "run_role": str(run_role or "").strip().lower(),
+            "execution_context": str(execution_context or "").strip().lower(),
+        }
+        seed = json.dumps(seed_payload, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha1(seed.encode("utf-8")).hexdigest()[:24]
+        return f"{RETRY_DEDUPE_KEY_PREFIX}:auto:{digest}"
+
+    def _claim_retry_slot(
+        self,
+        *,
+        tenant_id: int,
+        run_id: int,
+        message_id: int,
+        provider: str,
+        run_input_ids: list[str] | None,
+        run_role: str,
+        execution_context: str,
+        retry_policy: dict[str, Any] | None,
+    ) -> bool:
+        max_requeues = self._retry_max_requeues(provider=provider, retry_policy=retry_policy)
+        if max_requeues <= 0:
+            return False
+        state_key = self._retry_dedupe_key(
+            message_id=message_id,
+            provider=provider,
+            run_input_ids=run_input_ids,
+            run_role=run_role,
+            execution_context=execution_context,
+            retry_policy=retry_policy,
+        )
+        try:
+            payload = self.db.get_tenant_kv(
+                int(tenant_id),
+                EXECUTION_SESSION_NAMESPACE,
+                state_key,
+            ) or {}
+        except Exception:
+            payload = {}
+        requeues = self._coerce_nonnegative_int(payload.get("requeues")) or 0
+        if requeues >= max_requeues:
+            return False
+        next_payload = {
+            "requeues": requeues + 1,
+            "last_run_id": int(run_id),
+            "message_id": int(message_id),
+            "run_role": str(run_role or ""),
+            "execution_context": str(execution_context or ""),
+            "updated_at": self._now().isoformat(),
+        }
+        try:
+            self.db.set_tenant_kv(
+                int(tenant_id),
+                EXECUTION_SESSION_NAMESPACE,
+                state_key,
+                next_payload,
+            )
+        except Exception:
+            # If dedupe persistence is unavailable, fail closed for event retries.
+            return str(provider or "").strip().lower() != "event"
+        return True
 
     @staticmethod
     def _is_run_stale(
@@ -4121,6 +4321,7 @@ class Orchestrator:
             "usage": getattr(result, "usage", None),
             "stop_reason": getattr(result, "stop_reason", None),
             "result_subtype": getattr(result, "result_subtype", None),
+            "retry_policy": getattr(result, "retry_policy", None),
             "tool_summary": tool_summary,
         }
         path = tasks_dir / "run_result.json"

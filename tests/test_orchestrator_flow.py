@@ -203,6 +203,46 @@ class EmptyUsageAgent(FakeAgent):
         )()
 
 
+class RetryPolicyFailingAgent(FailingAgent):
+    def __init__(self, error: Exception, retry_policy: dict):
+        super().__init__(error)
+        self.retry_policy = retry_policy
+
+    async def prepare_context(
+        self,
+        workspace,
+        task_path,
+        message,
+        messenger=None,
+        inflight_stream=None,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        run_id=None,
+        runtime_env=None,
+        execution_context=None,
+    ):
+        del (
+            task_path,
+            message,
+            messenger,
+            inflight_stream,
+            tenant_id,
+            db,
+            payments,
+            session_id,
+            run_id,
+            runtime_env,
+            execution_context,
+        )
+        (workspace.tasks_dir / "retry_policy.json").write_text(
+            json.dumps(self.retry_policy),
+            encoding="utf-8",
+        )
+        raise self.error
+
+
 class FakeMessenger:
     def __init__(self):
         self.sent = []
@@ -1718,6 +1758,106 @@ async def test_orchestrator_run_input_zero_usage_result_requeues_and_clears_sess
     stored = db.get_message(message_id)
     assert stored is not None
     assert stored["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_event_run_input_failure_is_terminal_by_default(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FailingAgent(RuntimeError("event transport failure"))
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    msg = NormalizedMessage(
+        provider="event",
+        provider_message_id="event-queued-fail-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Scheduler event payload",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    with pytest.raises(RuntimeError, match="event transport failure"):
+        await orchestrator._drain_run_inputs(tenant)
+
+    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
+    stored = db.get_message(message_id)
+    assert stored is not None
+    assert stored["status"] == "failed"
+    assert agent.instruction_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_event_retry_policy_requeues_once_with_dedupe(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = RetryPolicyFailingAgent(
+        RuntimeError("transient event failure"),
+        {"retryable": True, "dedupe_key": "pm:post-run"},
+    )
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    workspace = workspace_manager.ensure_workspace(tenant.key)
+    msg = NormalizedMessage(
+        provider="event",
+        provider_message_id="event-queued-retry-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Retryable event payload",
+        images=[],
+        raw={},
+        project_name=workspace.project_name,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    orchestrator._enqueue_run_input(
+        tenant_id=tenant.id,
+        run_id=None,
+        message_id=message_id,
+        msg=msg,
+        status="queued",
+    )
+
+    with pytest.raises(RuntimeError, match="transient event failure"):
+        await orchestrator._drain_run_inputs(tenant)
+    queued_after_first = db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert queued_after_first
+
+    with pytest.raises(RuntimeError, match="transient event failure"):
+        await orchestrator._drain_run_inputs(tenant)
+
+    assert not db.fetch_run_inputs(tenant.id, workspace.project_name, status="queued")
+    assert db.fetch_run_inputs(tenant.id, workspace.project_name, status="failed")
+    dedupe_rows = db.list_tenant_kv_namespace(
+        tenant.id,
+        "execution",
+        key_prefix="run_retry:",
+        limit=10,
+    )
+    assert dedupe_rows
+    assert agent.instruction_calls == 0
 
 
 @pytest.mark.asyncio

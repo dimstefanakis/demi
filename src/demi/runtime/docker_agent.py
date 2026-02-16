@@ -134,6 +134,7 @@ class DockerAgent:
             usage=result.get("usage"),
             stop_reason=result.get("stop_reason"),
             result_subtype=result.get("result_subtype"),
+            retry_policy=result.get("retry_policy"),
         )
 
     async def cancel_run(self, workspace) -> int:

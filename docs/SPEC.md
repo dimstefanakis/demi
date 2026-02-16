@@ -341,6 +341,7 @@ data/<tenant_key>/
         │   ├── billing_status_<run_id>.json
         │   ├── interaction_context.json
         │   ├── interaction_updates.jsonl
+        │   ├── retry_policy.json
         │   ├── repo_name.txt
         │   ├── tool_runs.jsonl
         │   ├── agent_events.jsonl
@@ -527,13 +528,17 @@ Run selection when streaming to execution:
     - Execution completion always enqueues a final interaction update (outbox) as a safety-net so successful runs cannot finish silently even if the model never calls `send_message`.
     - Git versioning is scoped to deployable app files within the project (for example `site/` or another app root);
       orchestration metadata files are excluded from website commits.
-    - If a run fails while draining queued `run_inputs`, the input is re-queued for retry.
+    - If a run fails while draining queued `run_inputs`, retry behavior is policy-driven:
+      - default for `provider='event'`: terminal (do not requeue),
+      - default for non-event providers: requeue,
+      - agents can override by writing `tasks/retry_policy.json` (`retryable`, `terminal`, `dedupe_key`, `max_requeues`).
+    - Retry dedupe is enforced via tenant state keys to prevent re-dispatch loops for the same failing unit of work.
       User-facing "try again shortly" notifications are capped to the first two failed attempts
       for the same message to avoid repeated spam during prolonged failures.
     - The agent can create an assistant subscription order by calling `request_assistant_subscription`
       after delivering value, then sends the payment link via the interaction agent.
 13. Results are persisted (`run_result.json`, `deploy_url.txt`, DB updates).
-    - `run_result.json` includes Claude SDK stop metadata (`stop_reason`, `result_subtype`).
+    - `run_result.json` includes Claude SDK stop metadata (`stop_reason`, `result_subtype`) and optional `retry_policy`.
     - Terminal stop reasons (`end_turn`, `stop_sequence`) are treated as successful completion unless
       `result_subtype` indicates an SDK error.
     - Execution outcomes that provide usage/cost fields but report zero activity are marked failed

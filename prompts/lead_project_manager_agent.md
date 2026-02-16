@@ -151,6 +151,17 @@ Rules for the plan:
 
 9. **Decide whether to message the user.** Apply the messaging rules below.
 
+## Retry Policy Artifact (Optional)
+
+When this lead PM run should be retried automatically after a transient failure, write
+`tasks/retry_policy.json` with a minimal payload such as:
+`{"retryable": true, "terminal": false, "dedupe_key": "lead-pm:<trigger>", "max_requeues": 1, "reason": "transient runtime error"}`
+
+When the failure is non-retryable, write:
+`{"retryable": false, "terminal": true, "reason": "non-retryable error"}`
+
+Use deterministic `dedupe_key` values so retries cannot loop.
+
 ## Messaging Rules (Critical)
 
 Call `mcp__demi-chat__send_message` only when ALL of these are true:

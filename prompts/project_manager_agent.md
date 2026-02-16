@@ -146,6 +146,17 @@ Do not store:
 7. **Persist new durable facts to memory.** New deploy URLs, new services configured,
    tech decisions made, user preferences discovered.
 
+## Retry Policy Artifact (Optional)
+
+When this PM run should be retried automatically after a transient failure, write
+`tasks/retry_policy.json` with a minimal payload such as:
+`{"retryable": true, "terminal": false, "dedupe_key": "pm:<project>:<trigger>", "max_requeues": 1, "reason": "transient runtime error"}`
+
+When the failure is non-retryable, write:
+`{"retryable": false, "terminal": true, "reason": "non-retryable error"}`
+
+Use deterministic `dedupe_key` values so retries cannot loop.
+
 ## Session Continuity
 
 You have the same persistent session across all runs for this project. Use this:

@@ -182,6 +182,13 @@ Rules:
   before starting the next subagent. The user must hear from you between every phase.
 - Always read `tasks/chat_history.md` before any retry.
   If the last assistant message says you’re escalating or blocked, do NOT retry.
+- Retry policy artifact (optional, for orchestrator retry control):
+  - Write `tasks/retry_policy.json` when a failed run should be retried automatically.
+  - Keep it minimal and deterministic, for example:
+    `{"retryable": true, "terminal": false, "dedupe_key": "context:action", "max_requeues": 1, "reason": "transient infra error"}`
+  - If the failure is not retryable, write:
+    `{"retryable": false, "terminal": true, "reason": "non-retryable error"}`
+  - Use a stable `dedupe_key` for the same failing unit of work so retries cannot loop.
 - If `tasks/request_status.md` exists, read it.
 - Maintain `.env.example` in the workspace root. Add any new env vars you introduce.
 - Testing discipline (required): implement against `tasks/test_plan.md`. For non-trivial logic, add/adjust

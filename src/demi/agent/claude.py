@@ -74,6 +74,7 @@ class AgentResult:
     usage: dict[str, Any] | None = None
     stop_reason: str | None = None
     result_subtype: str | None = None
+    retry_policy: dict[str, Any] | None = None
 
 
 @dataclass
@@ -1046,6 +1047,7 @@ class ClaudeAgent:
                 result = await _execute_once(None)
             else:
                 raise
+        result.retry_policy = self._load_retry_policy(workspace.tasks_dir)
 
         # Ensure a completion update is always wired to the interaction agent even if
         # the model didn't explicitly call send_message. The execution agent should
@@ -1162,6 +1164,7 @@ class ClaudeAgent:
         except Exception:
             # Best-effort: never fail the run due to notification wiring.
             pass
+        result.retry_policy = self._load_retry_policy(workspace.tasks_dir)
         return result
 
     @observe(name="claude.send_interaction_message", ignore_input=True)
@@ -2085,6 +2088,17 @@ class ClaudeAgent:
             return None
         try:
             data = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    @staticmethod
+    def _load_retry_policy(tasks_dir: Path) -> dict[str, Any] | None:
+        path = tasks_dir / "retry_policy.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return None
         return data if isinstance(data, dict) else None
