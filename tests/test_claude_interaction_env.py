@@ -22,6 +22,15 @@ def test_execution_thinking_max_tokens_sanitized():
     assert Settings(execution_max_thinking_tokens=0).execution_thinking_max_tokens() is None
 
 
+def test_claude_auth_mode_normalization():
+    assert Settings().normalized_claude_auth_mode() == "token"
+    assert Settings(claude_auth_mode="subscription").normalized_claude_auth_mode() == "subscription"
+    assert Settings(claude_auth_mode="sub").normalized_claude_auth_mode() == "subscription"
+    assert Settings(claude_auth_mode="invalid").normalized_claude_auth_mode() == "token"
+    assert Settings(claude_auth_mode="subscription").use_claude_subscription_auth() is True
+    assert Settings(claude_auth_mode="token").use_claude_subscription_auth() is False
+
+
 def test_base_agent_env_includes_env_file_values(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
     (tmp_path / ".env").write_text(
@@ -49,6 +58,32 @@ def test_base_agent_env_includes_env_file_values(tmp_path, monkeypatch):
     assert env.get("AGENT_EMAIL") == "demi@example.com"
     assert env.get("GIT_AUTHOR_EMAIL") == "demi@example.com"
     assert env.get("GIT_COMMITTER_EMAIL") == "demi@example.com"
+
+
+def test_base_agent_env_subscription_mode_strips_api_keys(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text(
+        "\n".join(
+            [
+                "ANTHROPIC_API_KEY=test-anthropic-key",
+                "CLAUDE_API_KEY=test-claude-key",
+                "CUSTOM_AGENT_VAR=custom-value",
+                "CLAUDE_AUTH_MODE=subscription",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    settings = Settings(root_dir=tmp_path)
+    memory_path = tmp_path / "memory.md"
+    memory_path.write_text("# memory\n", encoding="utf-8")
+    workspace = type("WorkspaceStub", (), {"memory_path": memory_path})()
+
+    env = ClaudeAgent._base_agent_env(settings=settings, workspace=workspace)
+
+    assert env.get("ANTHROPIC_API_KEY") is None
+    assert env.get("CLAUDE_API_KEY") is None
+    assert env.get("CUSTOM_AGENT_VAR") == "custom-value"
 
 
 @pytest.mark.asyncio

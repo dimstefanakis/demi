@@ -11,6 +11,7 @@ import asyncio
 import httpx
 import uuid
 import inspect
+import tempfile
 
 from demi.db.core import Database
 from demi.models import Attachment, NormalizedMessage, OrchestratorResult
@@ -93,6 +94,7 @@ class Orchestrator:
     agent: Any
     messenger: Any
     payments: Any | None = None
+    speech_to_text: Any | None = None
     inflight_text_queues: dict[str, InflightTextStream] | None = None
     workspace_allocator: Any | None = None
     interaction_locks: dict[int, asyncio.Lock] | None = None
@@ -457,6 +459,39 @@ class Orchestrator:
                 activated += 1
         return activated
 
+    # ------------------------------------------------------------------
+    # AgentMail pod provisioning (lazy, on-demand)
+    # ------------------------------------------------------------------
+
+    def ensure_agentmail_pod_sync(self, tenant: Any) -> dict[str, Any] | None:
+        """Ensure the tenant has an AgentMail pod and persist to tenant_state KV.
+
+        Idempotent — returns the existing KV payload if already provisioned.
+        This is a **synchronous** helper safe to call from ``asyncio.to_thread``.
+        """
+        from demi.domains.agentmail import AgentMailManager
+
+        settings = Settings()
+        if not settings.agentmail_api_key:
+            return None
+        tenant_id = int(tenant.id)
+        existing = self.db.get_tenant_kv(tenant_id, "agentmail", "pod")
+        if existing:
+            return existing
+        tenant_key = str(getattr(tenant, "key", "") or f"tenant-{tenant_id}")
+        try:
+            mgr = AgentMailManager(api_key=settings.agentmail_api_key)
+            pod = mgr.ensure_tenant_pod(tenant_id, tenant_key)
+            kv_payload: dict[str, Any] = {"pod_id": pod["pod_id"]}
+            self.db.set_tenant_kv(tenant_id, "agentmail", "pod", kv_payload)
+            return kv_payload
+        except Exception:
+            import logging
+            logging.getLogger("demi.orchestrator").exception(
+                "AgentMail pod provisioning failed for tenant %s", tenant_id,
+            )
+            return None
+
     @staticmethod
     def _normalize_execution_context(context: Any | None) -> str:
         value = str(context or "").strip()
@@ -726,7 +761,10 @@ class Orchestrator:
             return
 
     def _rollback_interaction_processing_messages(self, session: InteractionRouteSession) -> None:
-        for message_id in sorted(session.message_ids):
+        self._rollback_processing_messages(sorted(session.message_ids))
+
+    def _rollback_processing_messages(self, message_ids: list[int]) -> None:
+        for message_id in message_ids:
             row = None
             try:
                 row = self.db.get_message(int(message_id))
@@ -875,6 +913,10 @@ class Orchestrator:
 
         message_id, inserted = self.db.record_message(tenant.id, msg)
         if inserted:
+            msg = await self._maybe_transcribe_audio_message(
+                msg=msg,
+                message_id=int(message_id),
+            )
             try:
                 self.db.record_tenant_event(
                     int(tenant.id),
@@ -911,7 +953,10 @@ class Orchestrator:
                 return OrchestratorResult(status="duplicate", detail="message already handled")
             recovered = self._message_from_message_row(tenant, existing_row)
             if recovered is not None:
-                msg = recovered
+                msg = await self._maybe_transcribe_audio_message(
+                    msg=recovered,
+                    message_id=int(message_id),
+                )
         existing_session = self._interaction_session_for(tenant.id)
         if allow_interaction_stream and existing_session is not None and existing_session.stream.accepting:
             streamed = await self._stream_into_interaction_session(
@@ -939,6 +984,11 @@ class Orchestrator:
                 status = str(row.get("status") or "")
                 if status and status != "received":
                     return OrchestratorResult(status="duplicate", detail="message already handled")
+            # Transition immediately so long routing turns are not mistaken as stale `received`.
+            try:
+                self.db.update_message_status(int(message_id), "processing")
+            except Exception:
+                pass
             existing_session = self._interaction_session_for(tenant.id)
             if (
                 allow_interaction_stream
@@ -978,7 +1028,11 @@ class Orchestrator:
             if not combined_user_payload and combined_msg.images:
                 combined_user_payload = "(attachment)"
 
-            workspace = await self._resolve_workspace(tenant)
+            try:
+                workspace = await self._resolve_workspace(tenant)
+            except Exception:
+                self._rollback_processing_messages([int(message_id)])
+                raise
 
             # Reset should apply for the current interaction turn.
             if any(self._is_reset_command((m.text or "").strip()) for _mid, m in batched_messages):
@@ -1687,6 +1741,111 @@ class Orchestrator:
         except Exception:
             return []
 
+    @staticmethod
+    def _is_audio_placeholder_text(text: str | None) -> bool:
+        normalized = str(text or "").strip().lower()
+        return normalized in {
+            "",
+            "(voice message)",
+            "(audio message)",
+            "(attachment)",
+            "(attachment only)",
+        }
+
+    @staticmethod
+    def _extract_telegram_audio_file_ids(msg: NormalizedMessage) -> list[str]:
+        if msg.provider != "telegram" or not isinstance(msg.raw, dict):
+            return []
+
+        message_payload: dict[str, Any] | None = None
+        for key in ("message", "edited_message"):
+            candidate = msg.raw.get(key)
+            if isinstance(candidate, dict):
+                message_payload = candidate
+                break
+        if message_payload is None:
+            if isinstance(msg.raw.get("voice"), dict) or isinstance(msg.raw.get("audio"), dict):
+                message_payload = msg.raw
+        if message_payload is None:
+            return []
+
+        file_ids: list[str] = []
+        seen: set[str] = set()
+        for key in ("voice", "audio"):
+            payload = message_payload.get(key)
+            if not isinstance(payload, dict):
+                continue
+            file_id = str(payload.get("file_id") or "").strip()
+            if not file_id or file_id in seen:
+                continue
+            seen.add(file_id)
+            file_ids.append(file_id)
+        return file_ids
+
+    async def _maybe_transcribe_audio_message(
+        self,
+        *,
+        msg: NormalizedMessage,
+        message_id: int | None = None,
+    ) -> NormalizedMessage:
+        transcriber = self.speech_to_text
+        if transcriber is None or not hasattr(transcriber, "transcribe_file"):
+            return msg
+        if not self._is_audio_placeholder_text(msg.text):
+            return msg
+
+        audio_file_ids = self._extract_telegram_audio_file_ids(msg)
+        if not audio_file_ids:
+            return msg
+
+        downloader = getattr(self.messenger, "download_images", None)
+        if downloader is None:
+            return msg
+
+        attachments_by_id: dict[str, Attachment] = {}
+        for image in msg.images:
+            file_id = str(getattr(image, "provider_file_id", "") or "").strip()
+            if file_id and file_id not in attachments_by_id:
+                attachments_by_id[file_id] = image
+        audio_attachments = [
+            attachments_by_id.get(file_id) or Attachment(provider_file_id=file_id)
+            for file_id in audio_file_ids
+        ]
+
+        transcripts: list[str] = []
+        try:
+            with tempfile.TemporaryDirectory(prefix="demi-stt-") as temp_dir_name:
+                asset_paths = await downloader(audio_attachments, Path(temp_dir_name))
+                for path in asset_paths:
+                    transcript = None
+                    try:
+                        transcript = await transcriber.transcribe_file(Path(path))
+                    except Exception:
+                        transcript = None
+                    text = str(transcript or "").strip()
+                    if text:
+                        transcripts.append(text)
+        except Exception:
+            return msg
+
+        combined_text = "\n".join(transcripts).strip()
+        if not combined_text:
+            return msg
+
+        transcribed_ids = {file_id for file_id in audio_file_ids}
+        remaining_images = [
+            image
+            for image in msg.images
+            if str(getattr(image, "provider_file_id", "") or "").strip() not in transcribed_ids
+        ]
+        updated_msg = replace(msg, text=combined_text, images=remaining_images)
+        if message_id is not None:
+            try:
+                self.db.update_message_text(int(message_id), combined_text)
+            except Exception:
+                pass
+        return updated_msg
+
     async def _run_message(
         self,
         tenant,
@@ -2333,7 +2492,14 @@ class Orchestrator:
         self, tenant, row: Any, *, notify: bool = True
     ) -> None:
         run_id = row["id"]
-        self.db.finish_run(run_id, status="failed", error="stale_run_timeout")
+        finalized = self.db.finish_run(
+            run_id,
+            status="failed",
+            error="stale_run_timeout",
+            expected_current_status="running",
+        )
+        if not finalized:
+            return
         message_id = row.get("message_id") if hasattr(row, "get") else row["message_id"]
         if message_id:
             self.db.update_message_status(int(message_id), "processed")

@@ -705,6 +705,11 @@ class SupabaseDatabase:
             self._table("messages").update({"status": status}).eq("id", message_id)
         )
 
+    def update_message_text(self, message_id: int, text: str | None) -> None:
+        self._execute(
+            self._table("messages").update({"text": text}).eq("id", message_id)
+        )
+
     def update_message_project(self, message_id: int, project_name: str | None) -> None:
         self._execute(
             self._table("messages")
@@ -2014,13 +2019,22 @@ class SupabaseDatabase:
             raise
         return len(data or [])
 
-    def finish_run(self, run_id: int, status: str = "completed", error: str | None = None) -> None:
+    def finish_run(
+        self,
+        run_id: int,
+        status: str = "completed",
+        error: str | None = None,
+        *,
+        expected_current_status: str | None = None,
+    ) -> bool:
         now = datetime.now(tz=timezone.utc).isoformat()
-        self._execute(
-            self._table("runs")
-            .update({"status": status, "finished_at": now, "error": error})
-            .eq("id", run_id)
+        query = self._table("runs").update({"status": status, "finished_at": now, "error": error}).eq(
+            "id", run_id
         )
+        if expected_current_status:
+            query = query.eq("status", expected_current_status)
+        data = self._execute(query)
+        return bool(data)
 
     def update_run_usage(
         self,
@@ -2488,3 +2502,54 @@ class SupabaseDatabase:
             if self._is_missing_relation(exc, "pm_actions"):
                 return
             raise
+
+    # ------------------------------------------------------------------
+    # AgentMail helpers
+    # ------------------------------------------------------------------
+
+    def get_tenant_by_agentmail_pod(self, pod_id: str) -> Tenant | None:
+        """Look up a tenant by their AgentMail pod_id stored in tenant_state KV."""
+        pod_value = str(pod_id or "").strip()
+        if not pod_value:
+            return None
+        data = self._execute(
+            self._table("tenant_state")
+            .select("tenant_id")
+            .eq("namespace", "agentmail")
+            .eq("key", "pod")
+            .filter("value_json->>pod_id", "eq", pod_value)
+            .order("updated_at", desc=True)
+            .order("tenant_id", desc=True)
+            .limit(1)
+        )
+        if not data:
+            return None
+        tenant_id = data[0].get("tenant_id")
+        if tenant_id is None:
+            return None
+        return self.get_tenant_by_id(int(tenant_id))
+
+    def set_agentmail_thread_tenant(self, thread_id: str, tenant_id: int) -> None:
+        """Map an AgentMail thread to a tenant so inbound replies can be routed."""
+        self.set_tenant_kv(tenant_id, "agentmail", f"thread:{thread_id}", {
+            "thread_id": thread_id,
+        })
+
+    def get_tenant_by_agentmail_thread(self, thread_id: str) -> Tenant | None:
+        """Look up a tenant by an AgentMail thread_id stored in tenant_state KV."""
+        key = f"thread:{thread_id}"
+        data = self._execute(
+            self._table("tenant_state")
+            .select("tenant_id")
+            .eq("namespace", "agentmail")
+            .eq("key", key)
+            .order("updated_at", desc=True)
+            .order("tenant_id", desc=True)
+            .limit(1)
+        )
+        if not data:
+            return None
+        tenant_id = data[0].get("tenant_id")
+        if tenant_id is None:
+            return None
+        return self.get_tenant_by_id(int(tenant_id))

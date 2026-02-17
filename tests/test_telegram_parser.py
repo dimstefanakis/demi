@@ -52,3 +52,22 @@ def test_parse_photo_message_caption():
 def test_ignore_non_message_update():
     update = {"update_id": 10002, "edited_message": {"message_id": 1}}
     assert TelegramUpdateParser.parse(update) is None
+
+
+def test_parse_voice_message_uses_placeholder_and_attachment():
+    update = {
+        "update_id": 10003,
+        "message": {
+            "message_id": 53,
+            "from": {"id": 125, "is_bot": False, "first_name": "Ada"},
+            "chat": {"id": 987654, "type": "private"},
+            "date": 1_700_000_200,
+            "voice": {"file_id": "voice-file-1", "duration": 1, "mime_type": "audio/ogg"},
+        },
+    }
+
+    msg = TelegramUpdateParser.parse(update)
+    assert msg is not None
+    assert msg.text == "(voice message)"
+    assert len(msg.images) == 1
+    assert msg.images[0].provider_file_id == "voice-file-1"

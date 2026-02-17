@@ -16,6 +16,7 @@ dependencies = [
   "claude-agent-sdk>=0.1.0",
   "lmnr[claude-agent-sdk]>=0.7.10",
   "supabase>=2.6",
+  "agentmail>=0.1.0",
 ]
 
 [project.optional-dependencies]

@@ -162,6 +162,7 @@ class _FakeOrchestrator:
         self.dispatch_status = "accepted"
         self.drain_calls = 0
         self.last_drain_max_inputs: int | None = None
+        self.finalize_calls: list[dict[str, Any]] = []
 
     @staticmethod
     def _is_run_stale(row: dict[str, Any], max_age_seconds: int = 900) -> bool:
@@ -180,7 +181,7 @@ class _FakeOrchestrator:
         return SimpleNamespace(status="accepted")
 
     async def _finalize_stale_run(self, _tenant: Any, row: dict[str, Any], *, notify: bool = True):
-        del notify
+        self.finalize_calls.append({"run_id": row.get("id"), "notify": bool(notify)})
         row["finalized"] = True
 
     async def _drain_run_inputs(self, _tenant: Any, *, max_inputs: int | None = None):
@@ -415,6 +416,33 @@ def test_pm_worker_health_check_requeues_failed_outbox(tmp_path: Path):
     assert db.event_jobs[0]["status"] == "completed"
     assert db.outbox_rows[0]["status"] == "queued"
     assert orchestrator.dispatched_jobs == []
+
+
+def test_pm_worker_health_check_finalizes_zombies_without_notify(tmp_path: Path):
+    db = _FakeDB()
+    db.set_tenant_kv(1, "pm", "enabled", {"enabled": True})
+    db.inflight_runs.append({"id": 77, "tenant_id": 1, "stale": True})
+    db.event_jobs.append(
+        {
+            "id": 6,
+            "tenant_id": 1,
+            "job_type": "pm_trigger",
+            "status": "pending",
+            "payload_json": {
+                "event_type": "pm_trigger",
+                "intent": "pm_health_check",
+                "payload": {"trigger": "health_check"},
+            },
+        }
+    )
+    orchestrator = _FakeOrchestrator()
+    worker = _build_worker(tmp_path, db, orchestrator)
+
+    processed = _run(worker)
+
+    assert processed is True
+    assert db.event_jobs[0]["status"] == "completed"
+    assert orchestrator.finalize_calls == [{"run_id": 77, "notify": False}]
 
 
 def test_pm_worker_health_check_skips_terminal_failed_outbox_rows(tmp_path: Path):

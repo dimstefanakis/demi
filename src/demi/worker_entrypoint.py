@@ -15,6 +15,7 @@ from demi.jobs.scheduler_worker import SchedulerWorker, SchedulerWorkerConfig
 from demi.jobs.pm_worker import PMWorker, PMWorkerConfig
 from demi.jobs.worker import EventWorker, EventWorkerConfig
 from demi.messaging.telegram import TelegramClient, TelegramConfig
+from demi.messaging.speech import OpenAISpeechToTextClient, OpenAISpeechToTextConfig
 from demi.observability import initialize_laminar
 from demi.orchestrator import Orchestrator
 from demi.payments.stripe import StripeClient, build_stripe_config
@@ -61,6 +62,17 @@ async def _run_workers() -> None:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
     messenger = TelegramClient(TelegramConfig(bot_token=settings.telegram_bot_token))
+    speech_to_text = None
+    openai_api_key = str(settings.openai_api_key or "").strip()
+    if openai_api_key:
+        speech_to_text = OpenAISpeechToTextClient(
+            OpenAISpeechToTextConfig(
+                api_key=openai_api_key,
+                model=str(settings.speech_to_text_model).strip() or "gpt-4o-transcribe",
+                timeout_seconds=float(settings.speech_to_text_timeout_seconds),
+                language=str(settings.speech_to_text_language or "").strip() or None,
+            )
+        )
 
     stripe_client = None
     stripe_config = build_stripe_config(settings)
@@ -73,6 +85,7 @@ async def _run_workers() -> None:
         agent=agent,
         messenger=messenger,
         payments=stripe_client,
+        speech_to_text=speech_to_text,
         workspace_allocator=workspace_allocator,
     )
     try:

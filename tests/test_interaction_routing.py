@@ -643,6 +643,56 @@ async def test_interaction_streams_messages_arriving_mid_route(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_interaction_marks_seed_message_processing_while_routing(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    decision = {
+        "ok": True,
+        "project_name": "main",
+        "should_run": False,
+        "queue_run": False,
+        "dedupe": True,
+        "ask_questions": [],
+        "purpose": "chat",
+        "plan": None,
+    }
+    agent = BlockingRouteAgent(decision)
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+    tenant_external_id = unique_external_id("tenant")
+    first = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="processing-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Please process this",
+        images=[],
+        raw={},
+    )
+
+    first_task = asyncio.create_task(orchestrator.handle_message(first))
+    await asyncio.sleep(0.05)
+
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    first_row = db.get_message_by_provider_id(tenant.id, "processing-1")
+    assert first_row is not None
+    assert first_row["status"] == "processing"
+
+    agent.release()
+    result = await first_task
+    assert result.status == "accepted"
+
+    first_row = db.get_message_by_provider_id(tenant.id, "processing-1")
+    assert first_row is not None
+    assert first_row["status"] == "processed"
+
+
+@pytest.mark.asyncio
 async def test_interaction_does_not_batch_other_received_messages(tmp_path):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
@@ -921,6 +971,92 @@ async def test_interaction_recomputes_assets_after_merge_and_project_switch(tmp_
         assets_dir.endswith("/assets") and {"img-first", "img-second"} <= set(file_ids)
         for assets_dir, file_ids in messenger.download_calls
     )
+
+
+@pytest.mark.asyncio
+async def test_interaction_transcribes_voice_message_before_routing(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    decision = {
+        "ok": True,
+        "should_run": False,
+        "queue_run": False,
+        "dedupe": True,
+        "reply_sent": True,
+        "ask_questions": [],
+        "purpose": "chat",
+    }
+    agent = FakeAgent(decision)
+
+    class VoiceMessenger(FakeMessenger):
+        def __init__(self):
+            super().__init__()
+            self.download_calls: list[str] = []
+
+        async def download_images(self, images, assets_dir):
+            assets_dir.mkdir(parents=True, exist_ok=True)
+            paths: list[str] = []
+            for image in images:
+                file_id = str(image.provider_file_id)
+                self.download_calls.append(file_id)
+                path = assets_dir / f"{file_id}.ogg"
+                path.write_bytes(b"voice-bytes")
+                paths.append(str(path))
+            return paths
+
+    class FakeSpeechToText:
+        def __init__(self):
+            self.paths: list[Path] = []
+
+        async def transcribe_file(self, file_path: Path):
+            self.paths.append(file_path)
+            return "build me a bakery website"
+
+    messenger = VoiceMessenger()
+    speech_to_text = FakeSpeechToText()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=messenger,
+        speech_to_text=speech_to_text,
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="voice-turn-1",
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="(voice message)",
+        images=[Attachment(provider_file_id="voice-file-1")],
+        raw={
+            "message": {
+                "voice": {
+                    "file_id": "voice-file-1",
+                    "mime_type": "audio/ogg",
+                }
+            }
+        },
+    )
+
+    result = await orchestrator.handle_message(msg)
+
+    assert result.status == "accepted"
+    assert result.detail == "no_run"
+    assert messenger.download_calls
+    assert messenger.download_calls[0] == "voice-file-1"
+    assert messenger.download_calls.count("voice-file-1") == 1
+    assert len(speech_to_text.paths) == 1
+    assert agent.route_calls
+    assert agent.route_calls[0]["message"].text == "build me a bakery website"
+    assert agent.route_calls[0]["message"].images == []
+
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    message_row = db.get_message_by_provider_id(int(tenant.id), "voice-turn-1")
+    assert message_row is not None
+    assert message_row.get("text") == "build me a bakery website"
 
 
 @pytest.mark.asyncio

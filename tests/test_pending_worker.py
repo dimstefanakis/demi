@@ -12,6 +12,7 @@ from tests.utils import build_test_db, create_test_tenant
 class FakeAgent:
     def __init__(self):
         self.calls = []
+        self.interaction_instructions: list[dict[str, object]] = []
 
     async def route_interaction(
         self,
@@ -86,6 +87,43 @@ class FakeAgent:
         message_id=None,
     ) -> None:
         return None
+
+    async def send_interaction_instruction(
+        self,
+        workspace,
+        instruction,
+        messenger,
+        tenant_id=None,
+        db=None,
+        payments=None,
+        session_id=None,
+        provider=None,
+        tenant_external_id=None,
+        run_id=None,
+        message_id=None,
+        asset_paths=None,
+        execution_bridge=None,
+    ):
+        del (
+            workspace,
+            messenger,
+            tenant_id,
+            db,
+            payments,
+            session_id,
+            provider,
+            tenant_external_id,
+            asset_paths,
+            execution_bridge,
+        )
+        self.interaction_instructions.append(
+            {
+                "instruction": str(instruction),
+                "run_id": int(run_id) if run_id is not None else None,
+                "message_id": int(message_id) if message_id is not None else None,
+            }
+        )
+        return type("AgentResult", (), {"session_id": None, "summary": "ok"})()
 
 
 class FakeMessenger:
@@ -489,3 +527,47 @@ async def test_pending_worker_clears_stale_inflight_run(tmp_path):
     assert run["error"] == "lease_expired"
     row = db.get_message(message_id)
     assert row["status"] == "processed"
+
+
+@pytest.mark.asyncio
+async def test_orchestrator_finalize_stale_run_notifies_once(tmp_path):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    agent = FakeAgent()
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=agent,
+        messenger=FakeMessenger(),
+    )
+
+    tenant = create_test_tenant(db)
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id="stale-notify-once-1",
+        tenant_external_id=tenant.external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="hello",
+        images=[],
+        raw={},
+        project_name=None,
+    )
+    message_id, _ = db.record_message(tenant.id, msg)
+    run_id = db.create_run(
+        tenant.id,
+        message_id=message_id,
+        project_name=None,
+        lease_seconds=3600,
+    )
+    run_row = db.get_run(run_id)
+    assert run_row is not None
+    assert str(run_row.get("status")) == "running"
+
+    await orchestrator._finalize_stale_run(tenant, run_row, notify=True)
+    await orchestrator._finalize_stale_run(tenant, run_row, notify=True)
+
+    run = db.get_run(run_id)
+    assert run is not None
+    assert run["status"] == "failed"
+    assert run["error"] == "stale_run_timeout"
+    assert len(agent.interaction_instructions) == 1

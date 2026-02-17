@@ -544,6 +544,45 @@ async def test_orchestrator_can_recover_existing_received_message(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrator_rolls_back_processing_status_when_workspace_resolution_fails(
+    tmp_path, monkeypatch
+):
+    db = build_test_db()
+    workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")
+    orchestrator = Orchestrator(
+        db=db,
+        workspace_manager=workspace_manager,
+        agent=FakeAgent(),
+        messenger=FakeMessenger(),
+    )
+
+    tenant_external_id = unique_external_id("tenant")
+    msg = NormalizedMessage(
+        provider="telegram",
+        provider_message_id=unique_external_id("msg"),
+        tenant_external_id=tenant_external_id,
+        received_at=datetime.now(tz=timezone.utc),
+        text="Trigger workspace resolution failure",
+        images=[],
+        raw={},
+    )
+
+    async def _boom(_tenant):
+        raise RuntimeError("workspace_resolution_failed")
+
+    monkeypatch.setattr(orchestrator, "_resolve_workspace", _boom)
+
+    with pytest.raises(RuntimeError, match="workspace_resolution_failed"):
+        await orchestrator.handle_message(msg)
+
+    tenant = db.get_tenant_by_external("telegram", tenant_external_id)
+    assert tenant is not None
+    stored = db.get_message_by_provider_id(int(tenant.id), msg.provider_message_id)
+    assert stored is not None
+    assert stored["status"] == "received"
+
+
+@pytest.mark.asyncio
 async def test_github_runtime_env_uses_short_lived_token_only(tmp_path, monkeypatch):
     db = build_test_db()
     workspace_manager = WorkspaceManager(root_dir=tmp_path / "data")

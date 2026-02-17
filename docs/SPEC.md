@@ -29,7 +29,8 @@ A Telegram-first (WhatsApp later) chat agent that builds, deploys, and edits SMB
                                                       ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
 │                         API (FastAPI)                                      │
-│  /telegram/webhook, /events, /stripe/webhook, /health, /admin/runs/:id/cancel│
+│  /telegram/webhook, /agentmail/webhook, /events, /stripe/webhook, /health,  │
+│  /admin/runs/:id/cancel                                                      │
 └───────────────────────────────┬───────────────────────────────────────────┘
                                 ▼
 ┌────────────────────────────────────────────────────────────────────────────┐
@@ -166,14 +167,18 @@ Configuration is managed by `src/demi/config.py` (`Settings`). Environment varia
 
 **Core tooling**
 - `ANTHROPIC_API_KEY` or `CLAUDE_API_KEY`
+- `CLAUDE_AUTH_MODE` (`token` default, `subscription` to suppress API-key env injection and
+  rely on Claude Code subscription login state)
 - `GEMINI_API_KEY` / `GOOGLE_API_KEY`
 - `AGENT_EMAIL` (execution-agent identity injected into prompt/env; also used for git author/committer email defaults)
 - `VERCEL_TOKEN` (Vercel CLI auth; non-interactive deploys must pass `--token` or rely on the agent-image wrapper)
 
 **Optional integrations**
 - Unsplash: `UNSPLASH_ACCESS_KEY`, `UNSPLASH_SECRET_KEY`, `UNSPLASH_APP_ID`
+- AgentMail: `AGENTMAIL_API_KEY`, `AGENTMAIL_INBOX_ADDRESS`, `AGENTMAIL_WEBHOOK_SECRET`
 - Stripe: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_SUCCESS_URL`, `STRIPE_CANCEL_URL`
 - Billing gate: `BILLING_STATUS_URL`, `BILLING_STATUS_TOKEN`
+- OpenAI speech-to-text: `OPENAI_API_KEY`, `SPEECH_TO_TEXT_MODEL`, `SPEECH_TO_TEXT_TIMEOUT_SECONDS`, `SPEECH_TO_TEXT_LANGUAGE`
 - Assistant pricing: `ASSISTANT_STRIPE_PRICE_ID` (preferred) or `ASSISTANT_PRICE_USD` + `ASSISTANT_PRODUCT_NAME` + `ASSISTANT_CURRENCY`
 - Supabase main DB: `MAIN_DB_SUPABASE_URL`, `MAIN_DB_SUPABASE_SERVICE_KEY`
 - Supabase managed backend: `SUPABASE_ACCESS_TOKEN`, `SUPABASE_ORG_*`
@@ -499,10 +504,18 @@ Run selection when streaming to execution:
 
 1. Telegram sends an update to `POST /telegram/webhook`.
 2. The webhook parser normalizes the message into a `NormalizedMessage`.
+   Non-text Telegram `voice`/`audio` updates are represented with attachment file ids and placeholder
+   text (`"(voice message)"` / `"(audio message)"`) so they are not treated as empty turns.
 3. The orchestrator records the message (idempotent by `provider_message_id`).
+   If OpenAI speech-to-text is configured and the message is a Telegram `voice`/`audio` turn with
+   placeholder text, the orchestrator downloads the audio attachment, transcribes it with
+   `gpt-4o-transcribe` (or configured model), updates `messages.text`, and removes transcribed
+   audio attachments from the interaction payload before routing.
 4. Interaction routing is serialized per tenant (single interaction loop per tenant).
    Each inbound message starts its own interaction turn unless a turn is already running for the tenant.
    In that case, the new message is streamed into the active interaction turn as an in-flight update.
+   Seed messages are transitioned to `status='processing'` before routing begins so long routing turns
+   are not misclassified as stale `received` rows.
    If an interaction turn crashes before queue/run creation, streamed rows that fall back to
    `status='received'` are automatically re-processed by PendingWorker after a grace window.
 5. Project selection is resolved from explicit directives when provided; otherwise active project is used.
@@ -561,6 +574,15 @@ Run selection when streaming to execution:
       fail the run instead of being treated as successful completion.
 14. Any queued `run_inputs` are drained into the next run.
 15. All outbound user messages are recorded in `message_events` for replay/debugging.
+16. AgentMail inbound webhook (`POST /agentmail/webhook`) routes email events by
+    `thread_id` mapped in `tenant_state(namespace='agentmail', key='thread:<id>')`.
+    - `message.sent` events backfill this mapping by resolving tenant from
+      `message.pod_id` against `tenant_state(namespace='agentmail', key='pod')`.
+      If the pod mapping is missing, the webhook lazily attempts pod sync for existing tenants
+      and retries pod→tenant resolution before deciding to ignore the event.
+    - `message.received` events resolve tenant by thread mapping first, then use
+      the same pod fallback + backfill before enqueuing `event_jobs` with
+      `event_type='email_received'`.
 
 ---
 
@@ -586,6 +608,7 @@ Background workers poll the main DB and run in the API process or the worker con
   in recovery mode so webhook-accepted messages do not get stranded. Recovery bypasses interaction
   stream handoff and terminalizes unresolved rows (`messages.status='failed'`) to avoid repeated
   high-cost routing loops on a single stale row.
+  PendingWorker is the owner of user-facing stale-run timeout notifications.
 - OutboxWorker: Sends deferred messages from the `outbox` table for busy acknowledgments and fallback notifications.
   Also drains `tasks/interaction_updates.jsonl` when execution agents cannot access the main DB.
   Uses bounded retries, stale `sending` reclaim, and throttled fallback file scans to prevent
@@ -613,6 +636,8 @@ Background workers poll the main DB and run in the API process or the worker con
   - zombie runs
   - failed outbox rows (excluding terminal failures)
   - stale queued run inputs
+  PM health-check zombie-run cleanup finalizes stale runs with `notify=False`; this avoids
+  duplicate timeout notices while PendingWorker owns user messaging for stale run recovery.
   API/worker startup also runs an idempotent PM backfill for tenants with existing deploy URLs.
   PM webhook-condition triggers are initialized with the current tenant event cursor so enabling
   PM does not replay historical `tenant_events` backlog.

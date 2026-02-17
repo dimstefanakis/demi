@@ -7,6 +7,22 @@ resolution-markers = [
 ]
 
 [[package]]
+name = "agentmail"
+version = "0.2.15"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+    { name = "pydantic" },
+    { name = "pydantic-core" },
+    { name = "typing-extensions" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6e/53/65346c191abcc407ab2574eed9ef9cbd58bee3434fc1d0bb9b4ce0e2c8ab/agentmail-0.2.15.tar.gz", hash = "sha256:6891b261dcade807c3b650d2efab58f845f7c0c2be03af63f63c57547e879820", size = 87782 }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/76/6b/76f08399ccdbb673cadc9c0757a6a74eb3c709c3bb1c60e95075dc3f8b4a/agentmail-0.2.15-py3-none-any.whl", hash = "sha256:4bcada108a8b7ff65f500c9c46a550d79ee1b6cae25539c2cdf1b5bdc101c975", size = 195889 },
+]
+
+[[package]]
 name = "annotated-doc"
 version = "0.0.4"
 source = { registry = "https://pypi.org/simple" }
@@ -353,6 +369,7 @@ name = "demi"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "agentmail" },
     { name = "claude-agent-sdk" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -375,6 +392,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agentmail", specifier = ">=0.1.0" },
     { name = "claude-agent-sdk", specifier = ">=0.1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "httpx", specifier = ">=0.27" },

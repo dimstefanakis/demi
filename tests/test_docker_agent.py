@@ -150,3 +150,32 @@ def test_docker_agent_prepare_context_rejects_stale_run_result(tmp_path):
         assert str(exc) == "agent_result_stale_run_result"
     else:
         raise AssertionError("expected stale run_result rejection")
+
+
+def test_docker_agent_custom_allowlist_keeps_claude_auth_mode():
+    agent = DockerAgent(
+        pool=object(),
+        settings=Settings(docker_env_allowlist="TELEGRAM_BOT_TOKEN"),
+        mount_path="/workspace",
+    )
+
+    allowlist = agent._env_allowlist()
+    assert "CLAUDE_AUTH_MODE" in allowlist
+    assert "AGENTMAIL_API_KEY" in allowlist
+    assert "AGENTMAIL_INBOX_ADDRESS" in allowlist
+
+
+def test_docker_agent_custom_allowlist_build_env_keeps_agentmail_vars():
+    agent = DockerAgent(
+        pool=object(),
+        settings=Settings(
+            docker_env_allowlist="TELEGRAM_BOT_TOKEN",
+            agentmail_api_key="test-agentmail-key",
+            agentmail_inbox_address="demi@example.com",
+        ),
+        mount_path="/workspace",
+    )
+
+    env = agent._build_env()
+    assert env.get("AGENTMAIL_API_KEY") == "test-agentmail-key"
+    assert env.get("AGENTMAIL_INBOX_ADDRESS") == "demi@example.com"

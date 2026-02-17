@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 import re
 from contextlib import suppress
@@ -11,11 +13,17 @@ from fastapi import FastAPI, Request, HTTPException
 from demi.agent.claude import ClaudeAgent
 from demi.config import Settings
 from demi.db.factory import build_database
+from demi.domains.agentmail_routing import (
+    hydrate_agentmail_tenant_from_pod,
+    is_agentmail_inbound_message_event,
+    resolve_agentmail_tenant_and_thread,
+)
 from demi.messaging.telegram import (
     TelegramClient,
     TelegramConfig,
     TelegramUpdateParser,
 )
+from demi.messaging.speech import OpenAISpeechToTextClient, OpenAISpeechToTextConfig
 from demi.orchestrator import Orchestrator
 from demi.payments.stripe import StripeClient, build_stripe_config, derive_stripe_urls
 from demi.events import normalize_event_type, verify_signature
@@ -49,6 +57,17 @@ def create_app() -> FastAPI:
     if not settings.telegram_bot_token:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is required")
     messenger = TelegramClient(TelegramConfig(bot_token=settings.telegram_bot_token))
+    speech_to_text = None
+    openai_api_key = str(settings.openai_api_key or "").strip()
+    if openai_api_key:
+        speech_to_text = OpenAISpeechToTextClient(
+            OpenAISpeechToTextConfig(
+                api_key=openai_api_key,
+                model=str(settings.speech_to_text_model).strip() or "gpt-4o-transcribe",
+                timeout_seconds=float(settings.speech_to_text_timeout_seconds),
+                language=str(settings.speech_to_text_language or "").strip() or None,
+            )
+        )
 
     stripe_client = None
     stripe_config = build_stripe_config(settings)
@@ -85,6 +104,7 @@ def create_app() -> FastAPI:
         agent=agent,
         messenger=messenger,
         payments=stripe_client,
+        speech_to_text=speech_to_text,
         workspace_allocator=workspace_allocator,
     )
     embedded_workers_enabled = bool(settings.api_embedded_workers_enabled)
@@ -326,6 +346,63 @@ def create_app() -> FastAPI:
         task = asyncio.create_task(orchestrator.handle_message(msg))
         task.add_done_callback(
             lambda t: _log_background_task_result(t, label="telegram_webhook.handle_message")
+        )
+        return {"status": "accepted"}
+
+    @app.post("/agentmail/webhook")
+    async def agentmail_webhook(request: Request):
+        body = await request.body()
+        if settings.agentmail_webhook_secret:
+            signature = request.headers.get("X-AgentMail-Signature", "")
+            expected = hmac.new(
+                settings.agentmail_webhook_secret.encode(),
+                body,
+                hashlib.sha256,
+            ).hexdigest()
+            if not hmac.compare_digest(expected, signature):
+                raise HTTPException(status_code=401, detail="invalid_signature")
+        payload = json.loads(body)
+        event_type = payload.get("event_type") or payload.get("type")
+        message = payload.get("message", {})
+        tenant, thread_id = resolve_agentmail_tenant_and_thread(db=db, message=message)
+        if event_type == "message.sent":
+            if tenant is None:
+                pod_id = message.get("pod_id") if isinstance(message, dict) else None
+                try:
+                    tenants = list(db.list_tenants() or [])
+                except Exception:
+                    tenants = []
+                tenant = await asyncio.to_thread(
+                    hydrate_agentmail_tenant_from_pod,
+                    db=db,
+                    pod_id=pod_id,
+                    thread_id=thread_id,
+                    tenants=tenants,
+                    ensure_pod_sync=orchestrator.ensure_agentmail_pod_sync,
+                )
+            # Outbound send events are used to persist thread->tenant routing state.
+            return {"status": "accepted" if tenant is not None else "ignored"}
+        if not is_agentmail_inbound_message_event(event_type):
+            return {"status": "ignored"}
+        if not thread_id or tenant is None:
+            return {"status": "ignored"}
+        sender = message.get("from_") or message.get("from") or "unknown"
+        db.create_event_job(
+            tenant.id,
+            job_type="event",
+            payload={
+                "event_type": "email_received",
+                "intent": "email_received",
+                "payload": {
+                    "summary": f"New email from {sender}",
+                    "subject": message.get("subject"),
+                    "from": sender,
+                    "inbox_id": message.get("inbox_id"),
+                    "message_id": message.get("message_id"),
+                    "thread_id": thread_id,
+                    "preview": (message.get("preview") or "")[:200],
+                },
+            },
         )
         return {"status": "accepted"}
 

@@ -387,7 +387,9 @@ class PMWorker:
             ):
                 continue
             try:
-                await self.orchestrator._finalize_stale_run(tenant, row, notify=True)
+                # PendingWorker owns user-facing stale-timeout messaging to avoid duplicate
+                # notifications from PM health checks and active-run reconciliation.
+                await self.orchestrator._finalize_stale_run(tenant, row, notify=False)
                 fixed += 1
             except Exception:
                 continue

@@ -71,6 +71,18 @@ class TelegramUpdateParser:
                 )
             )
 
+        voice = message.get("voice")
+        if voice:
+            images.append(Attachment(provider_file_id=voice.get("file_id")))
+            if not text:
+                text = "(voice message)"
+
+        audio = message.get("audio")
+        if audio:
+            images.append(Attachment(provider_file_id=audio.get("file_id")))
+            if not text:
+                text = "(audio message)"
+
         return NormalizedMessage(
             provider="telegram",
             provider_message_id=str(message_id),

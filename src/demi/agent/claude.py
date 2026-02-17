@@ -642,12 +642,17 @@ class ClaudeAgent:
         # Explicitly hydrate SDK subprocess env from .env so interaction/runtime
         # agents do not depend on shell-exported variables.
         env = ClaudeAgent._load_env_file_values(settings)
-        if settings.anthropic_api_key:
-            # Interaction sessions use tenant-scoped HOME, so auth must come from env
-            # instead of relying on per-home Claude CLI login state.
-            env["ANTHROPIC_API_KEY"] = str(settings.anthropic_api_key)
-        if settings.claude_api_key:
-            env["CLAUDE_API_KEY"] = str(settings.claude_api_key)
+        if settings.use_claude_subscription_auth():
+            # Claude Code prioritizes env API keys over subscription login state.
+            env.pop("ANTHROPIC_API_KEY", None)
+            env.pop("CLAUDE_API_KEY", None)
+        else:
+            if settings.anthropic_api_key:
+                # Interaction sessions use tenant-scoped HOME, so auth must come from env
+                # instead of relying on per-home Claude CLI login state.
+                env["ANTHROPIC_API_KEY"] = str(settings.anthropic_api_key)
+            if settings.claude_api_key:
+                env["CLAUDE_API_KEY"] = str(settings.claude_api_key)
         if settings.claude_enable_tool_search:
             # Enables MCP Tool Search in Claude Code / Agent SDK.
             env[TOOL_SEARCH_ENV_KEY] = "1"
@@ -660,6 +665,10 @@ class ClaudeAgent:
             env["AGENT_EMAIL"] = agent_email
             env.setdefault("GIT_AUTHOR_EMAIL", agent_email)
             env.setdefault("GIT_COMMITTER_EMAIL", agent_email)
+        if settings.agentmail_api_key:
+            env["AGENTMAIL_API_KEY"] = settings.agentmail_api_key
+        if settings.agentmail_inbox_address:
+            env["AGENT_EMAIL_ADDRESS"] = settings.agentmail_inbox_address
         return env
 
     @classmethod
@@ -1187,7 +1196,9 @@ class ClaudeAgent:
         execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         settings = Settings()
-        interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
+        interaction_prompt = self._apply_interaction_substitutions(
+            self._load_prompt_file(settings.interaction_prompt_path)
+        )
         interaction_env = self._interaction_runtime_env(
             settings=settings,
             workspace=workspace,
@@ -1382,8 +1393,8 @@ class ClaudeAgent:
         inflight_stream: InflightTextStream | None = None,
     ) -> InteractionRouteResult:
         settings = Settings()
-        interaction_prompt = self._load_prompt_file(
-            settings.resolved_interaction_routing_prompt_path()
+        interaction_prompt = self._apply_interaction_substitutions(
+            self._load_prompt_file(settings.resolved_interaction_routing_prompt_path())
         )
         interaction_env = self._interaction_runtime_env(
             settings=settings,
@@ -1784,7 +1795,9 @@ class ClaudeAgent:
         execution_bridge: Any | None = None,
     ) -> AgentResult | None:
         settings = Settings()
-        interaction_prompt = self._load_prompt_file(settings.interaction_prompt_path)
+        interaction_prompt = self._apply_interaction_substitutions(
+            self._load_prompt_file(settings.interaction_prompt_path)
+        )
         interaction_env = self._interaction_runtime_env(
             settings=settings,
             workspace=workspace,
@@ -2114,6 +2127,7 @@ class ClaudeAgent:
         template = ClaudeAgent._load_prompt_file(resolved_prompt_path)
         event_url = settings.event_url or "not configured"
         agent_email = str(settings.agent_email or "").strip() or "not configured"
+        agent_email_address = str(settings.agentmail_inbox_address or "").strip() or "not configured"
         memory_snapshot = ClaudeAgent._read_memory_snapshot(memory_path)
         return (
             template.replace("<<TASK_PATH>>", str(task_path))
@@ -2121,9 +2135,19 @@ class ClaudeAgent:
             .replace("<<MEMORY_SNAPSHOT>>", memory_snapshot)
             .replace("<<EVENT_URL>>", event_url)
             .replace("<<AGENT_EMAIL>>", agent_email)
+            .replace("<<AGENT_EMAIL_ADDRESS>>", agent_email_address)
             .rstrip()
             + "\n"
         )
+
+    @staticmethod
+    def _apply_interaction_substitutions(template: str) -> str:
+        """Apply lightweight placeholder substitutions to interaction prompts."""
+        settings = Settings()
+        agent_email_address = str(settings.agentmail_inbox_address or "").strip()
+        if agent_email_address:
+            template = template.replace("<<AGENT_EMAIL_ADDRESS>>", agent_email_address)
+        return template
 
     @staticmethod
     def _read_memory_snapshot(memory_path: Path, max_bytes: int = 8000) -> str:
@@ -2282,7 +2306,9 @@ class ClaudeAgent:
     @staticmethod
     def _default_agents() -> dict[str, AgentDefinition]:
         settings = Settings()
-        interaction_prompt = ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
+        interaction_prompt = ClaudeAgent._apply_interaction_substitutions(
+            ClaudeAgent._load_prompt_file(settings.interaction_prompt_path)
+        )
         interaction_helper_prompt = ClaudeAgent._load_prompt_file(
             settings.interaction_helper_prompt_path
         )

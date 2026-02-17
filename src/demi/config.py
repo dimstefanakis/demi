@@ -48,12 +48,15 @@ class Settings(BaseSettings):
     interaction_session_cache_dir: Path = Path("data/interaction_sessions")
     claude_enable_tool_search: bool = True
     claude_enable_memory_tool: bool = True
+    # token (default): inject API-key env vars.
+    # subscription: remove API-key env vars and rely on Claude Code login state.
+    claude_auth_mode: str = "token"
     chat_history_max_entry_chars: int = 1200
     interaction_context_recent_runs_limit: int = 5
     interaction_context_result_summary_max_chars: int = 500
     interaction_context_error_max_chars: int = 300
     interaction_context_tool_summary_max_tools: int = 12
-    agent_email: str | None = None
+    agent_email: str = "demi@hiredemi.com"
 
     chrome_devtools_mcp_enabled: bool = False
     chrome_devtools_mcp_profile_dir: Path = Path("chrome_profiles")
@@ -111,6 +114,10 @@ class Settings(BaseSettings):
     claude_api_key: str | None = None
     gemini_api_key: str | None = None
     google_api_key: str | None = None
+    openai_api_key: str | None = None
+    speech_to_text_model: str = "gpt-4o-transcribe"
+    speech_to_text_timeout_seconds: float = 45.0
+    speech_to_text_language: str | None = None
     lmnr_project_api_key: str | None = None
 
     events_signing_secret: str | None = None
@@ -157,6 +164,10 @@ class Settings(BaseSettings):
     run_activity_poll_interval: float = 2.5
     execution_stream_realtime_enabled: bool = True
     execution_stream_poll_interval: float = 5.0
+
+    agentmail_api_key: str | None = None
+    agentmail_inbox_address: str = "demi@agentmail.to"
+    agentmail_webhook_secret: str | None = None
 
     unsplash_app_id: str | None = None
     unsplash_access_key: str | None = None
@@ -295,3 +306,12 @@ class Settings(BaseSettings):
     def resolved_firecrawl_cmd(self) -> str:
         local_cmd = (self.root_dir / "node_modules" / ".bin" / "firecrawl").resolve()
         return str(local_cmd) if local_cmd.exists() else self.firecrawl_cmd
+
+    def normalized_claude_auth_mode(self) -> str:
+        raw = str(self.claude_auth_mode or "").strip().lower()
+        if raw in {"subscription", "sub", "claudeai", "claude.ai", "oauth"}:
+            return "subscription"
+        return "token"
+
+    def use_claude_subscription_auth(self) -> bool:
+        return self.normalized_claude_auth_mode() == "subscription"
